@@ -2297,11 +2297,15 @@ def build_correction_docx(result):
         # Label
         cells[0].text = ""
         run_label = cells[0].paragraphs[0].add_run(label)
-        _set_run_font(run_label, size_pt=10, bold=is_warning, red=is_warning)
+        _set_run_font(run_label, size_pt=10,
+                      bold=is_warning,
+                      color=RED if is_warning else None)
         # Value
         cells[1].text = ""
         run_val = cells[1].paragraphs[0].add_run(value)
-        _set_run_font(run_val, size_pt=10, bold=is_warning, red=is_warning)
+        _set_run_font(run_val, size_pt=10,
+                      bold=is_warning,
+                      color=RED if is_warning else None)
 
     # Optional: keep sub-bullets visually indented inside the cell
     for row in summary_table.rows[1:]:
