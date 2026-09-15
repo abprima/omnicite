@@ -2257,29 +2257,57 @@ def build_correction_docx(result):
         if (r.get("Placeholders") or {}).get("missing_pp")
     )
 
-    summary_lines = [
-        f"Total references: {total_refs_now}",
-        f"Total in-text citations: {stats.get('total', 0)}",
-        f"  • Narrative: {stats.get('narrative', 0)}",
-        f"  • Parenthetical: {stats.get('parenthetical', 0)}",
-        f"Citations missing from references: {len(result.get('missing_references', []))}",
-        f"References missing from citations: {len(uncited_ref_nos)}",
-        f"DOI checked via OpenAlex: {doi_checked}",
-        f"DOI suspicious (possible fabricated references): "
-        f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
-        f"Corrections withheld due to DOI mismatch: {doi_suspicious}",
-        f"References with incomplete page range: {single_page_count}",
-        f"% references within last 10 years "
-        f"({recency.get('start_year')}-{recency.get('end_year')}): "
-        f"{recency.get('recent_percentage', 0):.1f}%",
+    # ---------- Section 3: Summary (as table) ----------
+    summary_rows = [
+        ("Total references", str(total_refs_now), False),
+        ("Total in-text citations", str(stats.get("total", 0)), False),
+        ("  • Narrative", str(stats.get("narrative", 0)), False),
+        ("  • Parenthetical", str(stats.get("parenthetical", 0)), False),
+        ("Citations missing from references",
+         str(len(result.get("missing_references", []))), False),
+        ("References missing from citations",
+         str(len(uncited_ref_nos)), False),
+        ("DOI checked via OpenAlex", str(doi_checked), False),
+        ("DOI suspicious (possible fabricated references)",
+         f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
+         doi_suspicious > 0),
+        ("Corrections withheld due to DOI mismatch",
+         str(doi_suspicious), doi_suspicious > 0),
+        ("References with incomplete page range",
+         str(single_page_count), False),
+        ("% references within last 10 years "
+         f"({recency.get('start_year')}-{recency.get('end_year')})",
+         f"{recency.get('recent_percentage', 0):.1f}%", False),
     ]
-    for line in summary_lines:
-        is_warning = (
-            line.startswith("DOI suspicious")
-            or line.startswith("Corrections withheld")
-        )
-        _add_run(doc.add_paragraph(), line, size_pt=11,
-                 bold=is_warning, red=is_warning)
+
+    summary_table = doc.add_table(rows=1, cols=2)
+    summary_table.style = "Light Grid Accent 1"
+    summary_table.autofit = True
+
+    # Header
+    hdr_cells = summary_table.rows[0].cells
+    for cell, text in zip(hdr_cells, ["Metric", "Value"]):
+        cell.text = ""
+        run = cell.paragraphs[0].add_run(text)
+        _set_run_font(run, size_pt=10, bold=True)
+
+    # Data rows
+    for label, value, is_warning in summary_rows:
+        cells = summary_table.add_row().cells
+        # Label
+        cells[0].text = ""
+        run_label = cells[0].paragraphs[0].add_run(label)
+        _set_run_font(run_label, size_pt=10, bold=is_warning, red=is_warning)
+        # Value
+        cells[1].text = ""
+        run_val = cells[1].paragraphs[0].add_run(value)
+        _set_run_font(run_val, size_pt=10, bold=is_warning, red=is_warning)
+
+    # Optional: keep sub-bullets visually indented inside the cell
+    for row in summary_table.rows[1:]:
+        label_run = row.cells[0].paragraphs[0].runs[0]
+        if label_run.text.startswith("  •"):
+            row.cells[0].paragraphs[0].paragraph_format.left_indent = Inches(0.25)
 
     # ---------- Section 3.1: Source Type Distribution ----------
     h31 = doc.add_heading(level=2)
