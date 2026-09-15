@@ -2281,6 +2281,63 @@ def build_correction_docx(result):
         _add_run(doc.add_paragraph(), line, size_pt=11,
                  bold=is_warning, red=is_warning)
 
+    # ---------- Section 3.1: Source Type Distribution ----------
+    h31 = doc.add_heading(level=2)
+    hr31 = h31.add_run("3.1 Source Type Distribution")
+    _set_run_font(hr31, size_pt=12, bold=True)
+
+    # Tally using the same canonical ordering as the Streamlit UI
+    source_counts = Counter(
+        (row.get("Source Type") or "Other") for row in reference_rows
+    )
+    source_order = CANONICAL_SOURCE_TYPES
+    extra_source_types = sorted(x for x in source_counts if x not in source_order)
+    ordered_sources = source_order + extra_source_types
+
+    if total_refs_now == 0:
+        p = doc.add_paragraph()
+        _set_run_font(p.add_run("No references were detected."), italic=True)
+    else:
+        # Build a 3-column table: Source Type | Count | Percentage
+        table = doc.add_table(rows=1, cols=3)
+        table.style = "Light Grid Accent 1"
+        table.autofit = True
+
+        # Header row
+        hdr = table.rows[0].cells
+        for cell, text in zip(hdr, ["Source Type", "Count", "Percentage"]):
+            cell.text = ""
+            run = cell.paragraphs[0].add_run(text)
+            _set_run_font(run, size_pt=10, bold=True)
+
+        # Data rows
+        for source_type in ordered_sources:
+            count = source_counts.get(source_type, 0)
+            if count == 0 and source_type not in source_order:
+                continue  # skip empty non-canonical types
+            pct = count / total_refs_now * 100 if total_refs_now else 0
+            cells = table.add_row().cells
+            for cell, val in zip(
+                cells,
+                [source_type, str(count), f"{pct:.1f}%"],
+            ):
+                cell.text = ""
+                run = cell.paragraphs[0].add_run(val)
+                _set_run_font(run, size_pt=10)
+
+        # Total row (bold)
+        cells = table.add_row().cells
+        for cell, val in zip(cells, ["Total", str(total_refs_now), "100.0%"]):
+            cell.text = ""
+            run = cell.paragraphs[0].add_run(val)
+            _set_run_font(run, size_pt=10, bold=True)
+
+        # Optional: indent the table slightly for readability
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    paragraph.paragraph_format.space_after = Pt(2)
+
     bio = io.BytesIO()
     doc.save(bio)
     bio.seek(0)
