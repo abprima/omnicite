@@ -405,7 +405,16 @@ def strip_markdown_markers(text):
 # REFERENCE SECTION DETECTION
 # =========================================================
 
-REFERENCE_HEADINGS = ["references", "reference", "daftar pustaka", "bibliography"]
+REFERENCE_HEADINGS = [
+    "references",
+    "reference",
+    "daftar pustaka",
+    "daftar rujukan",
+    "rujukan",
+    "bibliografi",
+    "bibliography",
+    "referensi",
+]
 
 POST_REFERENCE_HEADINGS = {
     "acknowledgement", "acknowledgements", "acknowledgment", "acknowledgments",
