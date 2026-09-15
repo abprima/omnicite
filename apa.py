@@ -809,10 +809,23 @@ def extract_parenthetical_citations(text):
     return citations
 
 
+def _inside_parentheses(text, pos):
+    """Return True if character index `pos` sits inside a ( … ) span."""
+    depth = 0
+    for i in range(pos):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+    return depth > 0
+
+
 def extract_narrative_citations(text):
     citations = []
     occupied = []
 
+    # ── Pattern A — "Author, Author et al. (2024)" ──────────────────
     for m in re.finditer(
         r"\b("
         r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
@@ -828,10 +841,12 @@ def extract_narrative_citations(text):
             continue
         citations.append({
             "author": authors[0], "authors": authors,
-            "year": m.group(2), "type": "narrative", "et_al": True, "raw": m.group(0),
+            "year": m.group(2), "type": "narrative",
+            "et_al": True, "raw": m.group(0),
         })
         occupied.append((m.start(), m.end()))
 
+    # ── Pattern B — "Author et al. (2024)" ─────────────────────────
     for m in re.finditer(
         r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s+et\s+al\.\s*"
         r"\(((?:19|20)\d{2})[a-z]?\)",
@@ -841,10 +856,12 @@ def extract_narrative_citations(text):
             continue
         citations.append({
             "author": m.group(1), "authors": [m.group(1)],
-            "year": m.group(2), "type": "narrative", "et_al": True, "raw": m.group(0),
+            "year": m.group(2), "type": "narrative",
+            "et_al": True, "raw": m.group(0),
         })
         occupied.append((m.start(), m.end()))
 
+    # ── Pattern C — "Author (2024)" ────────────────────────────────
     for m in re.finditer(
         r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s+"
         r"\(((?:19|20)\d{2})[a-z]?\)",
@@ -854,8 +871,74 @@ def extract_narrative_citations(text):
             continue
         citations.append({
             "author": m.group(1), "authors": [m.group(1)],
-            "year": m.group(2), "type": "narrative", "et_al": False, "raw": m.group(0),
+            "year": m.group(2), "type": "narrative",
+            "et_al": False, "raw": m.group(0),
         })
+        occupied.append((m.start(), m.end()))
+
+    # ── Pattern D — "Author et al., 2024"  (MALFORMED: year not in parens)
+    for m in re.finditer(
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+        r"\s+et\s+al\.\s*,\s*"
+        r"((?:19|20)\d{2})[a-z]?\b",
+        text
+    ):
+        if any(m.start() >= s and m.end() <= e for s, e in occupied):
+            continue
+        if _inside_parentheses(text, m.start()):
+            continue
+        citations.append({
+            "author": m.group(1), "authors": [m.group(1)],
+            "year": m.group(2), "type": "narrative",
+            "et_al": True, "raw": m.group(0),
+            "malformed": True,
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ── Pattern E — "Author and Author, 2024" / "Author & Author, 2024"
+    for m in re.finditer(
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+        r"\s+(?:and|&)\s+"
+        r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*"
+        r"((?:19|20)\d{2})[a-z]?\b",
+        text
+    ):
+        if any(m.start() >= s and m.end() <= e for s, e in occupied):
+            continue
+        if _inside_parentheses(text, m.start()):
+            continue
+        citations.append({
+            "author": m.group(1),
+            "authors": [m.group(1), m.group(2)],
+            "year": m.group(3), "type": "narrative",
+            "et_al": False, "raw": m.group(0),
+            "malformed": True,
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ── Pattern F — "Author, 2024"  (single-author malformed) ──────
+    # Only used when the surname is capitalised and NOT preceded by a comma
+    # (so "In Smith, 2024, ..." and reference-list-style lines don't match).
+    for m in re.finditer(
+        r"(?<![,\.])\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*"
+        r"((?:19|20)\d{2})[a-z]?\b",
+        text
+    ):
+        if any(m.start() >= s and m.end() <= e for s, e in occupied):
+            continue
+        if _inside_parentheses(text, m.start()):
+            continue
+        # Skip if preceded by a comma (looks like part of an author list)
+        if m.start() > 0 and text[m.start() - 1] == ",":
+            continue
+        citations.append({
+            "author": m.group(1), "authors": [m.group(1)],
+            "year": m.group(2), "type": "narrative",
+            "et_al": False, "raw": m.group(0),
+            "malformed": True,
+        })
+        occupied.append((m.start(), m.end()))
+
     return citations
 
 
