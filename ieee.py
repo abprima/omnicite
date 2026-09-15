@@ -1873,7 +1873,8 @@ def build_ieee_docx(result):
 
     if orphan:
         sub = doc.add_heading(level=2)
-        _add_run(sub.add_run("Citations Missing from References"), bold=True, size_pt=12)
+        run = sub.add_run("Citations Missing from References")
+        _set_run_font(run, size_pt=12, bold=True)
         for o in orphan:
             p = doc.add_paragraph()
             _add_run(p, f"{o.get('Citation','')}  ", size_pt=11, red=True)
@@ -1881,7 +1882,8 @@ def build_ieee_docx(result):
 
     if uncited:
         sub = doc.add_heading(level=2)
-        _add_run(sub.add_run("References Missing from Citations"), bold=True, size_pt=12)
+        run = sub.add_run("References Missing from Citations")
+        _set_run_font(run, size_pt=12, bold=True)
         for u in uncited:
             p = doc.add_paragraph()
             _add_run(p, f"[{u.get('Reference #')}] {u.get('Reference','')}  ",
