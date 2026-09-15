@@ -1183,6 +1183,10 @@ def _normalize_doi_for_lookup(doi):
 
 
 def _fetch_openalex_metadata(doi):
+    """
+    Fetch full APA-relevant metadata from OpenAlex.
+    Returns dict with bibliographic fields, or {'_not_found': True}, or None on error.
+    """
     if not doi:
         return None
     try:
@@ -1209,16 +1213,127 @@ def _fetch_openalex_metadata(doi):
     except Exception:
         return None
 
-    title = data.get("title") or ""
-    year = data.get("publication_year")
+    # ── Authors ─────────────────────────────────────────────
     authors = []
     for a in data.get("authorships", []) or []:
         name = (a.get("author") or {}).get("display_name")
         if name:
             authors.append(name)
 
-    return {"title": title, "authors": authors, "year": year}
+    # ── Source (journal / book / repository) ────────────────
+    primary = data.get("primary_location") or {}
+    source = primary.get("source") or {}
 
+    biblio = data.get("biblio") or {}
+
+    return {
+        "_not_found": False,
+        # Core
+        "title": data.get("title") or "",
+        "year": data.get("publication_year"),
+        "authors": authors,
+        "doi": data.get("doi") or f"https://doi.org/{clean}",
+        # APA-specific
+        "journal": source.get("display_name"),
+        "source_type": source.get("type"),           # journal, book, repository…
+        "volume": biblio.get("volume"),
+        "issue": biblio.get("issue"),
+        "first_page": biblio.get("first_page"),
+        "last_page": biblio.get("last_page"),
+        # Extra
+        "publisher": source.get("host_organization_name"),
+        "is_oa": data.get("open_access", {}).get("is_oa"),
+    }
+
+def _format_apa_authors_from_openalex(authors_full, reference_authors):
+    """
+    Prefer surnames extracted from the manuscript; fall back to OpenAlex names.
+    Returns an APA-formatted author string.
+    """
+    def to_surname(name):
+        if not name:
+            return ""
+        if "," in name:                       # "Rosa, E."
+            return name.split(",")[0].strip()
+        parts = name.split()
+        return parts[-1] if parts else name
+
+    # Prefer manuscript surnames — they match what the user wrote
+    if reference_authors:
+        surnames = reference_authors
+    else:
+        surnames = [to_surname(n) for n in authors_full if n]
+        surnames = [s for s in surnames if s]
+
+    if not surnames:
+        return ""
+    if len(surnames) == 1:
+        return surnames[0]
+    if len(surnames) == 2:
+        return f"{surnames[0]}, & {surnames[1]}"
+    if len(surnames) <= 20:
+        return ", ".join(surnames[:-1]) + f", & {surnames[-1]}"
+    # 21+ authors: first 19, ellipsis, final author (APA 7 rule)
+    return ", ".join(surnames[:19]) + ", ... " + surnames[-1]
+
+
+def build_apa_reference_from_openalex(meta, parsed_reference, original_reference):
+    """
+    Build an APA 7 reference string from OpenAlex metadata.
+    Returns (reference_string, note) — note is a human-readable summary
+    of what was taken from OpenAlex.
+    """
+    if not meta or meta.get("_not_found"):
+        return None, ""
+
+    authors_str = _format_apa_authors_from_openalex(
+        meta.get("authors") or [],
+        parsed_reference.get("authors") or [],
+    )
+    year = meta.get("year")
+    title = meta.get("title") or ""
+    journal = meta.get("journal") or ""
+    volume = meta.get("volume") or ""
+    issue = meta.get("issue") or ""
+    first_page = meta.get("first_page") or ""
+    last_page = meta.get("last_page") or ""
+    doi = meta.get("doi") or ""
+
+    parts = []
+    if authors_str:
+        parts.append(f"{authors_str} ({year})." if year else f"{authors_str}.")
+    else:
+        parts.append(f"({year})." if year else "")
+
+    if title:
+        # OpenAlex titles are sentence-case already; strip trailing period
+        parts.append(f"{title.rstrip('.')}.")
+
+    # Journal + volume(issue) + pages
+    if journal:
+        loc = journal
+        if volume:
+            loc += f", {volume}"
+        if issue:
+            loc += f"({issue})"
+        if first_page:
+            if last_page and last_page != first_page:
+                loc += f", {first_page}–{last_page}"
+            else:
+                loc += f", {first_page}"
+        parts.append(f"{loc}.")
+
+    if doi:
+        parts.append(doi if doi.startswith("http") else f"https://doi.org/{doi}")
+
+    reconstructed = " ".join(p.strip() for p in parts if p.strip())
+    reconstructed = re.sub(r"\s+", " ", reconstructed).strip()
+
+    note = (
+        "Corrected using OpenAlex bibliographic record "
+        f"(title, year, journal, volume/issue/pages verified)."
+    )
+    return reconstructed, note
 
 def _normalize_for_compare(s):
     if not s:
@@ -1790,6 +1905,73 @@ def fallback_italic_elements(source_type):
         "Other": "",
     }.get(source_type, "")
 
+def derive_italic_elements_from_reference(reference, source_type):
+    """
+    Return a comma-separated string of LITERAL substrings that should be
+    italicized in the given APA 7 reference, based on its detected structure.
+
+    Used by _add_styled_reference() in the DOCX writer, which performs
+    literal substring matching. So the tokens we return MUST appear
+    verbatim in `reference`.
+
+    Covers:
+      - Journal Article      → journal title, volume
+      - Book                 → book title
+      - Book Chapter         → book title (after "In ... (pp. ...)")
+      - Report / Webpage /
+        Conference           → first sentence after the year
+    """
+    if not reference:
+        return ""
+
+    try:
+        if source_type == "Journal Article":
+            parts = extract_journal_format_parts(reference)
+            if parts.get("is_journal"):
+                tokens = []
+                if parts.get("journal"):
+                    tokens.append(parts["journal"])
+                if parts.get("volume"):
+                    tokens.append(parts["volume"])
+                return ", ".join(tokens)
+
+        elif source_type == "Book":
+            parts = extract_book_format_parts(reference)
+            if parts.get("is_book") and parts.get("title"):
+                return parts["title"]
+
+        elif source_type == "Book Chapter":
+            # "In A. Editor (Ed.), Book title (pp. xx–yy). Publisher."
+            m = re.search(
+                r"\bIn\s+[^()]+\(eds?\.\)\s*,?\s*(.+?)\s*\(pp?\.",
+                reference,
+                re.I,
+            )
+            if not m:
+                m = re.search(r"\bIn\s+(.+?)\s*\(pp?\.", reference, re.I)
+            if m:
+                return m.group(1).strip(" ,.")
+
+        elif source_type in (
+            "Report",
+            "Webpage / Online Document",
+            "Conference Proceeding",
+        ):
+            # Title is the first sentence after the (year).
+            ym = re.search(
+                r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)\.\s*",
+                reference,
+            )
+            if ym:
+                tail = reference[ym.end():]
+                m = re.match(r"^(.+?)\.\s", tail)
+                if m:
+                    return m.group(1).strip()
+
+    except Exception:
+        return ""
+
+    return ""
 
 def build_apa_reference_comparison(references, ai_results, manuscript_year):
     by_no = {
@@ -1802,33 +1984,130 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
         ai = by_no.get(i, {})
         original_clean = strip_markdown_markers(clean_text(original))
 
-        corrected = strip_markdown_markers(
+        # ---- Step 1: base text (AI if safe, else original) ----
+        ai_corrected = strip_markdown_markers(
             clean_text(ai.get("revised_reference", ""))
-        ) or original_clean
-        if corrected != original_clean and _reference_is_hallucinated(original_clean, corrected):
-            corrected = original_clean
+        ) if ai else ""
+        base_text = original_clean
+        if ai_corrected and ai_corrected != original_clean:
+            if not _reference_is_hallucinated(original_clean, ai_corrected):
+                base_text = ai_corrected
 
-        local = build_local_apa_reference_correction(corrected)
-        corrected = local["Corrected"]
+        # ---- Step 2: parse + look up DOI in OpenAlex ----
+        parsed = parse_reference(base_text)
+        doi_present = bool(parsed.get("doi"))
 
-        parsed = parse_reference(corrected)
-        verification = verify_reference_against_openalex(original_clean, parsed)
+        meta = None
+        verification = {
+            "checked": False, "suspicious": False, "reasons": [],
+            "crossref_title": None, "crossref_authors": [],
+            "title_similarity": None, "author_overlap": None,
+        }
+        if doi_present:
+            meta = _fetch_openalex_metadata(parsed["doi"])
+            if meta is not None and not meta.get("_not_found"):
+                verification["checked"] = True
+                verification["crossref_title"] = meta.get("title")
+                verification["crossref_authors"] = meta.get("authors", [])
 
-        source_type = normalize_source_type(ai.get("source_type"))
-        if source_type == "Other" and not ai.get("source_type"):
+                # Title similarity check
+                ref_title = _extract_apa_title(base_text)
+                oa_title = meta.get("title") or ""
+                if ref_title and oa_title:
+                    sim = _title_similarity(ref_title, oa_title)
+                    verification["title_similarity"] = sim
+                    if sim < 0.60:
+                        verification["suspicious"] = True
+                        verification["reasons"].append(
+                            f"DOI resolves to a different title "
+                            f"(similarity {sim:.0%})."
+                        )
+
+                # Author overlap check
+                ref_surnames = {
+                    s.lower() for s in (parsed.get("authors") or []) if s
+                }
+                oa_surnames = {
+                    _surname_from_full_name(n)
+                    for n in meta.get("authors", []) if n
+                }
+                oa_surnames.discard("")
+                if oa_surnames and ref_surnames:
+                    overlap = len(ref_surnames & oa_surnames) / max(
+                        1, len(oa_surnames)
+                    )
+                    verification["author_overlap"] = overlap
+                    if overlap < 0.50:
+                        verification["suspicious"] = True
+                        verification["reasons"].append(
+                            f"DOI author list does not match the manuscript "
+                            f"(only {overlap:.0%} of DOI surnames found)."
+                        )
+            elif meta is not None and meta.get("_not_found"):
+                verification["checked"] = True
+                verification["suspicious"] = True
+                verification["reasons"].append(
+                    "DOI does not resolve in OpenAlex (possible fake DOI)."
+                )
+
+        doi_suspicious = verification["suspicious"]
+
+        # ---- Step 3: decide which corrected version to produce ----
+        if doi_present and doi_suspicious:
+            # WITHHOLD — do not show corrected text
+            corrected = "— WITHHELD (DOI mismatch) —"
+            correction_note = (
+                "Correction withheld: the DOI in this reference does not "
+                "match the claimed title/authors in OpenAlex. Manual "
+                "verification required before any correction is applied."
+            )
+            italic_elements = ""
+            placeholders = {}
+
+        elif doi_present and meta and not meta.get("_not_found"):
+            # VALID DOI → rebuild from OpenAlex
+            oa_ref, oa_note = build_apa_reference_from_openalex(
+                meta, parsed, original_clean
+            )
+            if oa_ref:
+                corrected = oa_ref
+                correction_note = oa_note
+            else:
+                local = build_local_apa_reference_correction(base_text)
+                corrected = local["Corrected"]
+                correction_note = local.get("Note", "")
+                placeholders = local.get("Placeholders", {})
+            source_type = normalize_source_type(
+                ai.get("source_type") or _source_type_from_openalex(meta)
+            )
+            italic_elements = derive_italic_elements_from_reference(
+                corrected, source_type
+            )
+            placeholders = {}
+
+        else:
+            # NO DOI → deterministic APA tidy-up
+            local = build_local_apa_reference_correction(base_text)
+            corrected = local["Corrected"]
+            correction_note = local.get("Note", "")
+            placeholders = local.get("Placeholders", {})
+            source_type = normalize_source_type(ai.get("source_type"))
+            if source_type == "Other" and not ai.get("source_type"):
+                source_type = detect_apa_source_type(corrected)
+            italic_elements = (
+                derive_italic_elements_from_reference(corrected, source_type)
+                or (ai.get("italic_elements") or "").strip()
+                or fallback_italic_elements(source_type)
+            )
+
+        # Ensure source_type is defined in every branch
+        if "source_type" not in dir():
             source_type = detect_apa_source_type(corrected)
 
-        italic_elements = (ai.get("italic_elements") or "").strip()
-        if not italic_elements:
-            italic_elements = fallback_italic_elements(source_type)
-
+        # ---- Step 4: year (AI → reference text) ----
         year = ai.get("year")
         if not isinstance(year, int):
             year = extract_reference_year(corrected)
-
-        missing = ai.get("missing_required_elements", []) or []
-        if isinstance(missing, str):
-            missing = [missing]
 
         rows.append({
             "No.": i,
@@ -1837,20 +2116,54 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
             "Original Reference": original_clean,
             "Corrected Version": corrected,
             "Italicized in APA": italic_elements,
-            "Status": _apa_status_label(ai.get("status")) if ai else "NOT AI CHECKED",
-            "Missing Required Elements": ", ".join(str(x) for x in missing),
+            "Status": (
+                "WITHHELD" if doi_suspicious
+                else _apa_status_label(ai.get("status")) if ai
+                else "NOT AI CHECKED"
+            ),
+            "Missing Required Elements": ", ".join(
+                str(x) for x in (ai.get("missing_required_elements") or [])
+            ),
             "AI Explanation": ai.get("explanation", ""),
-            "Correction Note": local.get("Note", ""),
-            "Placeholders": local.get("Placeholders", {}),
+            "Correction Note": correction_note,
+            "Placeholders": placeholders,
             "DOI Verified": verification["checked"],
-            "DOI Suspicious": verification["suspicious"],
+            "DOI Suspicious": doi_suspicious,
             "DOI Verification Reasons": " | ".join(verification["reasons"]),
             "Title Similarity": verification.get("title_similarity"),
             "Author Overlap": verification.get("author_overlap"),
             "OpenAlex Title": verification.get("crossref_title"),
-            "OpenAlex Authors": ", ".join(verification.get("crossref_authors", [])[:5]),
+            "OpenAlex Authors": ", ".join(
+                verification.get("crossref_authors", [])[:5]
+            ),
+            # NEW — expose OpenAlex fields for the UI/DOCX to show
+            "OpenAlex Journal": meta.get("journal") if meta else None,
+            "OpenAlex Volume": meta.get("volume") if meta else None,
+            "OpenAlex Issue": meta.get("issue") if meta else None,
+            "OpenAlex Pages": (
+                f"{meta.get('first_page')}–{meta.get('last_page')}"
+                if meta and meta.get("first_page") else None
+            ),
         })
     return rows
+
+
+def _source_type_from_openalex(meta):
+    """Map OpenAlex source.type → our canonical source type."""
+    if not meta:
+        return "Other"
+    t = (meta.get("source_type") or "").lower()
+    if t == "journal":
+        return "Journal Article"
+    if t == "book":
+        return "Book"
+    if t in ("book series", "ebook platform"):
+        return "Book Chapter"
+    if t == "conference":
+        return "Conference Proceeding"
+    if t == "repository":
+        return "Webpage / Online Document"
+    return "Other"
 
 
 def _citation_breaks_apa_connector_rules(original, corrected, ctype):
@@ -2200,6 +2513,15 @@ def build_correction_docx(result):
                 corrected = row.get("Corrected Version", "")
                 italic_elements = row.get("Italicized in APA", "")
                 _add_styled_reference(p2, corrected, italic_elements)
+
+                # ── NEW: source tag right after the corrected reference ──
+                if not row.get("DOI Suspicious"):
+                    source_tag = (
+                        "  [corrected from OpenAlex]"
+                        if row.get("DOI Verified") and row.get("OpenAlex Journal")
+                        else "  [APA tidy-up]"
+                    )
+                    _add_run(p2, source_tag, size_pt=9, italic=True)
 
                 correction_note = row.get("Correction Note", "")
                 if correction_note:
@@ -2700,6 +3022,16 @@ def render():
                                 "DOI Checked": "YES" if row.get("DOI Verified") else "NO",
                                 "DOI Suspicious": "⚠️ YES" if row.get("DOI Suspicious") else "—",
                                 "OpenAlex Title": (row.get("OpenAlex Title") or "")[:60],
+                                "OpenAlex Journal": row.get("OpenAlex Journal") or "—",
+                                "OpenAlex Vol/Issue/Pages": " / ".join(
+                                    str(x) for x in [
+                                        row.get("OpenAlex Volume") or "—",
+                                        row.get("OpenAlex Issue") or "—",
+                                        row.get("OpenAlex Pages") or "—",
+                                    ]
+                                ),
+                                "DOI Issues": row.get("DOI Verification Reasons", ""),
+                                "Status": row.get("Status", "MANUAL CHECK"),
                                 "DOI Issues": row.get("DOI Verification Reasons", ""),
                                 "Status": row.get("Status", "MANUAL CHECK"),
                             }
