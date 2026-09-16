@@ -7,6 +7,7 @@ import json
 import hashlib
 import traceback
 import difflib
+import shutil
 
 import streamlit as st
 import pandas as pd
@@ -44,36 +45,37 @@ TITLE_SEARCH_YEAR_BONUS = 0.3
 DOI_RESOLVER_URL     = "https://doi.org"
 DOI_RESOLVER_TIMEOUT = 10
 
-# ── FIX: large token budget so long reference lists don't get truncated
-EXTRACTION_MAX_TOKENS = 16000
+# ── Max output tokens for extraction (gpt-4o max is 16384)
+EXTRACTION_MAX_TOKENS = 16384
+
+# ── Long manuscripts (chars) get split into two calls
+SPLIT_EXTRACTION_THRESHOLD = 25000
 
 CACHE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".cache", "apa_v3"
 )
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# ── Diagnostic dump location
+DEBUG_DUMP_PATH = "/tmp/ai_raw_response.txt"
+
 
 # =========================================================
 # REFERENCE SECTION DETECTION HEADINGS
 # =========================================================
 
-# Section headings that START the reference list.
 REFERENCE_HEADINGS = [
-    # English
     "references", "reference", "reference list", "reference section",
     "literature cited", "literature", "works cited", "works consulted",
     "bibliography", "bibliographies", "cited references",
-    # Indonesian / Malay
     "daftar pustaka", "daftar rujukan", "daftar bacaan",
     "rujukan", "rujukan pustaka", "bahan rujukan",
     "bibliografi", "referensi", "kepustakaan",
     "sumber rujukan", "sumber pustaka", "sumber referensi",
-    # Short forms
     "ref", "refs",
 ]
 
 
-# Headings that TERMINATE the reference list.
 POST_REFERENCE_HEADINGS = {
     # Acknowledgments
     "acknowledgement", "acknowledgements",
@@ -94,8 +96,7 @@ POST_REFERENCE_HEADINGS = {
     "credit author statement", "credit authorship contribution statement",
     "author contribution statement", "authorship statement",
     "kontribusi penulis", "kontribusi author",
-    "pernyataan kontribusi penulis",
-    "pernyataan kontribusi",
+    "pernyataan kontribusi penulis", "pernyataan kontribusi",
 
     # Author profile / bios
     "author profile", "authors profile",
@@ -107,7 +108,7 @@ POST_REFERENCE_HEADINGS = {
     "author bio", "authors bio",
     "biodata penulis", "profil penulis",
 
-    # Conflicts / competing interests
+    # Conflicts
     "conflict of interest", "conflicts of interest",
     "conflict of interests", "conflicts of interests",
     "competing interest", "competing interests",
@@ -127,14 +128,14 @@ POST_REFERENCE_HEADINGS = {
     "pendanaan", "pernyataan pendanaan",
     "sumber pendanaan", "sumber dana",
 
-    # Data / code availability
+    # Data
     "data availability", "data availability statement",
     "availability of data", "availability of data and materials",
     "data and code availability", "data sharing statement",
     "code availability", "supplementary data",
     "ketersediaan data",
 
-    # Ethics / consent
+    # Ethics
     "ethical approval", "ethics approval",
     "ethics statement", "ethical statement",
     "ethics declarations", "ethical declarations",
@@ -144,7 +145,7 @@ POST_REFERENCE_HEADINGS = {
     "pernyataan etik", "keterangan etik",
     "informed consent statement",
 
-    # Disclosures / AI use
+    # Disclosures / AI
     "disclosure", "disclosures", "disclosure statement",
     "declaration of generative ai",
     "declaration of generative ai use",
@@ -160,7 +161,7 @@ POST_REFERENCE_HEADINGS = {
     "supporting information file",
     "lampiran", "lampiran a", "lampiran b",
 
-    # Notes / misc
+    # Notes
     "notes", "note",
     "author note", "author notes",
     "endnotes", "endnote",
@@ -275,41 +276,60 @@ def _esc(value):
 
 
 # =========================================================
-# ROBUST JSON PARSER
+# AGGRESSIVE JSON RECOVERY
 # =========================================================
 
 def _safe_json_loads(text):
     """
-    Parse JSON from an AI response, with multiple recovery strategies:
-      1. Strip markdown fences
-      2. Try straight parse
-      3. Extract first balanced {...} object
-      4. Repair common issues (trailing commas, BOM)
-      5. Raise a clear ValueError with a preview
+    Aggressive JSON recovery for AI responses.
+    Handles: markdown fences, leading/trailing prose, concatenated objects,
+    trailing commas, unescaped control chars, BOM.
     """
     if text is None:
         raise ValueError("Empty AI response (None).")
 
-    text = str(text).strip()
+    text = str(text)
 
     if text.startswith("\ufeff"):
         text = text[1:]
 
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-        text = re.sub(r"\s*```\s*$", "", text)
-        text = text.strip()
+    # Strip markdown fences anywhere
+    text = re.sub(r"```(?:json)?", "", text, flags=re.I)
 
+    # Trim to first { and last }
+    first = text.find("{")
+    last = text.rfind("}")
+    if first >= 0 and last > first:
+        text = text[first:last + 1]
+
+    text = text.strip()
+
+    # 1. Straight parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
+    # 2. Remove control chars
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Fix trailing commas
+    repaired = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Brace-counting extraction
     depth = 0
     start = None
     in_string = False
     escape = False
-    for i, ch in enumerate(text):
+    for i, ch in enumerate(cleaned):
         if in_string:
             if escape:
                 escape = False
@@ -327,23 +347,23 @@ def _safe_json_loads(text):
         elif ch == "}":
             depth -= 1
             if depth == 0 and start is not None:
-                candidate = text[start:i + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    start = None
-                    depth = 0
+                candidate = cleaned[start:i + 1]
+                for repair_fn in (
+                    lambda s: s,
+                    lambda s: re.sub(r",(\s*[}\]])", r"\1", s),
+                    lambda s: re.sub(r"[\x00-\x1f]", " ", s),
+                ):
+                    try:
+                        return json.loads(repair_fn(candidate))
+                    except json.JSONDecodeError:
+                        continue
+                start = None
+                depth = 0
 
-    repaired = re.sub(r",(\s*[}\]])", r"\1", text)
-    try:
-        return json.loads(repaired)
-    except json.JSONDecodeError:
-        pass
-
-    preview = text[:300].replace("\n", "\\n")
+    preview = text[:500].replace("\n", "\\n")
     raise ValueError(
         f"Could not parse JSON from AI response. "
-        f"Length={len(text)} chars. Preview: {preview!r}"
+        f"Length={len(text)}. First 500 chars: {preview!r}"
     )
 
 
@@ -428,10 +448,31 @@ def _cache_set(path, value):
         pass
 
 
+def _clear_cache():
+    try:
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _debug_dump(label, content):
+    """Write raw AI output to disk for debugging."""
+    try:
+        with open(DEBUG_DUMP_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n\n===== {label} @ {datetime.now().isoformat()} =====\n")
+            f.write(content or "<empty>")
+        print(f"[DEBUG] Wrote {label} to {DEBUG_DUMP_PATH} "
+              f"({len(content or '')} chars)")
+    except Exception as exc:
+        print(f"[DEBUG] Could not write dump: {exc}")
+
+
 # =========================================================
-# STAGE 1 — AI EXTRACTION OF REFERENCE SECTION + CITATIONS
+# STAGE 1 — AI EXTRACTION
 # =========================================================
 
+# ── Single-call prompt (short PDFs)
 EXTRACTION_PROMPT = """You are analyzing the full text of an academic manuscript.
 
 TASK
@@ -457,11 +498,7 @@ IN-TEXT CITATION RULES
 - Report "type" as "parenthetical" or "narrative".
 
 OUTPUT FORMAT (JSON only, no markdown, no indentation)
-{
-  "references": ["...", "..."],
-  "citations": [{"raw": "...", "type": "parenthetical"}, {"raw": "...", "type": "narrative"}],
-  "uncertain": [{"text": "...", "reason": "..."}]
-}
+{"references": ["...", "..."], "citations": [{"raw": "...", "type": "parenthetical"}], "uncertain": []}
 
 FULL MANUSCRIPT TEXT
 ====================
@@ -470,9 +507,129 @@ FULL MANUSCRIPT TEXT
 """
 
 
+# ── Split prompts (long PDFs, called twice)
+EXTRACTION_PROMPT_REFS = """You are extracting the REFERENCE LIST ONLY.
+
+RULES
+- Output every reference entry as a single string.
+- Preserve original text exactly (typos included).
+- Join multi-line references into one string.
+- Do NOT merge two references, do NOT split one reference.
+- Do NOT include headings, acknowledgments, funding, author bios.
+- Do NOT include in-text citations.
+- Do NOT invent entries.
+
+OUTPUT (JSON only, no markdown)
+{"references": ["...", "..."]}
+
+FULL MANUSCRIPT TEXT
+====================
+{manuscript_text}
+====================
+"""
+
+
+EXTRACTION_PROMPT_CITS = """You are extracting IN-TEXT CITATIONS ONLY.
+
+RULES
+- Include parenthetical "(Author, 2020)" and narrative "Author (2020)".
+- Exclude anything inside the reference list itself.
+- Preserve exact text of each citation.
+- Multiple sources inside one pair of parentheses = ONE citation string.
+
+OUTPUT (JSON only, no markdown)
+{"citations": [{"raw": "...", "type": "parenthetical"}, {"raw": "...", "type": "narrative"}]}
+
+FULL MANUSCRIPT TEXT
+====================
+{manuscript_text}
+====================
+"""
+
+
+def _call_openai_for_json(prompt, label="extraction"):
+    """Single OpenAI call → parsed JSON dict, or {"error": "..."}."""
+    client = _get_openai_client()
+    if client is None:
+        return {"error": "OpenAI client unavailable (missing key)."}
+
+    try:
+        response = client.chat.completions.create(
+            model=_openai_model(),
+            messages=[
+                {"role": "system",
+                 "content": "Return compact JSON only. No markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            seed=42,
+            max_tokens=EXTRACTION_MAX_TOKENS,
+        )
+        raw_content = response.choices[0].message.content
+    except Exception as exc:
+        return {"error": f"API call failed: {exc}"}
+
+    # Dump for debugging
+    _debug_dump(label, raw_content)
+
+    try:
+        data = _safe_json_loads(raw_content)
+    except ValueError as exc:
+        preview = (raw_content or "")[:200].replace("\n", "\\n")
+        return {
+            "error": (
+                f"AI returned non-JSON output for {label}. "
+                f"Preview: {preview!r} | parse error: {exc}"
+            )
+        }
+
+    if not isinstance(data, dict):
+        return {"error": f"AI returned JSON but not an object ({label})."}
+
+    return data
+
+
+def _extract_split(manuscript_text):
+    """Two smaller calls for long PDFs."""
+    refs_resp = _call_openai_for_json(
+        EXTRACTION_PROMPT_REFS.format(manuscript_text=manuscript_text),
+        label="references",
+    )
+    if "error" in refs_resp:
+        return {"error": f"Reference extraction failed: {refs_resp['error']}"}
+
+    cits_resp = _call_openai_for_json(
+        EXTRACTION_PROMPT_CITS.format(manuscript_text=manuscript_text),
+        label="citations",
+    )
+    if "error" in cits_resp:
+        return {"error": f"Citation extraction failed: {cits_resp['error']}"}
+
+    references = [
+        r.strip() for r in refs_resp.get("references", [])
+        if isinstance(r, str) and r.strip() and len(r) > 15
+    ]
+
+    citations = []
+    for c in cits_resp.get("citations", []) or []:
+        if not isinstance(c, dict):
+            continue
+        raw = (c.get("raw") or "").strip()
+        ctype = (c.get("type") or "").lower().strip()
+        if not raw:
+            continue
+        if ctype not in ("parenthetical", "narrative"):
+            ctype = "parenthetical" if raw.startswith("(") else "narrative"
+        citations.append({"raw": raw, "type": ctype})
+
+    return {"references": references, "citations": citations, "uncertain": []}
+
+
 def _extract_with_ai(manuscript_text):
     """
-    Stage 1: AI extracts references + in-text citations from the full manuscript.
+    Stage 1: AI extracts references + in-text citations.
+    Uses split calls for long PDFs, single call for short ones.
     Cached by content hash. Returns dict or {"error": "..."} on failure.
     """
     client = _get_openai_client()
@@ -487,40 +644,18 @@ def _extract_with_ai(manuscript_text):
     if cached and isinstance(cached, dict) and "references" in cached:
         return cached
 
+    # ── Long PDF → two calls
+    if len(manuscript_text) > SPLIT_EXTRACTION_THRESHOLD:
+        result = _extract_split(manuscript_text)
+        if "error" not in result and result.get("references"):
+            _cache_set(path, result)
+        return result
+
+    # ── Short PDF → single call
     prompt = EXTRACTION_PROMPT.format(manuscript_text=manuscript_text)
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system",
-                 "content": "You extract references and in-text citations "
-                            "from academic manuscripts. "
-                            "Return compact JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-            seed=42,
-            max_tokens=EXTRACTION_MAX_TOKENS,
-        )
-        raw_content = response.choices[0].message.content
-    except Exception as exc:
-        return {"error": f"Extraction API call failed: {exc}"}
-
-    try:
-        data = _safe_json_loads(raw_content)
-    except ValueError as exc:
-        preview = (raw_content or "")[:200].replace("\n", "\\n")
-        return {
-            "error": (
-                f"AI returned non-JSON output. "
-                f"Preview: {preview!r} | parse error: {exc}"
-            )
-        }
-
-    if not isinstance(data, dict):
-        return {"error": "AI returned JSON but not an object at the top level."}
+    data = _call_openai_for_json(prompt, label="extraction")
+    if "error" in data:
+        return data
 
     references = data.get("references", []) or []
     citations  = data.get("citations", []) or []
@@ -558,7 +693,6 @@ def _extract_with_ai(manuscript_text):
 # =========================================================
 
 def parse_reference(reference):
-    """Local parse of a reference string for author/year/DOI."""
     result = {
         "raw": reference, "year": None, "first_author": None,
         "authors": [], "doi": None, "url": None,
@@ -631,7 +765,6 @@ def normalize_doi_or_url(value):
 
 
 def parse_citation(citation):
-    """Enrich an AI-extracted citation dict with author/year."""
     raw = citation.get("raw", "")
     ctype = citation.get("type", "parenthetical")
 
@@ -653,12 +786,7 @@ def parse_citation(citation):
         if m:
             author = m.group(1)
 
-    return {
-        "raw": raw,
-        "type": ctype,
-        "author": author,
-        "year": year,
-    }
+    return {"raw": raw, "type": ctype, "author": author, "year": year}
 
 
 def calculate_citation_statistics(citations):
@@ -907,8 +1035,7 @@ def _verify_doi_resolution(doi):
     except Exception as exc:
         return {"resolves": None, "reason": f"resolver unavailable: {exc}"}
     if 200 <= r.status_code < 400:
-        return {"resolves": True, "reason": "DOI resolves",
-                "final_url": r.url}
+        return {"resolves": True, "reason": "DOI resolves", "final_url": r.url}
     if r.status_code in (404, 410):
         return {"resolves": False, "reason": f"HTTP {r.status_code}"}
     return {"resolves": None, "reason": f"Inconclusive HTTP {r.status_code}"}
@@ -989,11 +1116,7 @@ def _compare_metadata_advanced(submitted, external):
     sy = str(submitted.get("year") or "").strip()
     ey = str(external.get("year") or "").strip()
     year_match = (sy == ey) if sy and ey else None
-    return {
-        "title_similarity": t,
-        "author_similarity": a,
-        "year_match": year_match,
-    }
+    return {"title_similarity": t, "author_similarity": a, "year_match": year_match}
 
 
 def _decide_doi_status_advanced(comparison):
@@ -1012,8 +1135,7 @@ def _decide_doi_status_advanced(comparison):
     author_good = a is None or a >= AUTHOR_STRONG_MATCH
     year_good   = y is None or y is True
     if title_good and author_good and year_good:
-        return ("VERIFIED",
-                "DOI exists and matches external metadata.")
+        return ("VERIFIED", "DOI exists and matches external metadata.")
     title_review  = t is None or t >= TITLE_REVIEW_MATCH
     author_review = a is None or a >= AUTHOR_REVIEW_MATCH
     if title_review and author_review:
@@ -1059,15 +1181,11 @@ def verify_reference_against_openalex(reference, parsed):
         if resolution["resolves"] is True:
             result["checked"] = True
             result["status"] = "UNVERIFIED"
-            result["reasons"].append(
-                "DOI resolves but not in OpenAlex."
-            )
+            result["reasons"].append("DOI resolves but not in OpenAlex.")
             return result
         result["checked"] = True
         result["status"] = "MANUAL_CHECK"
-        result["reasons"].append(
-            "DOI verification inconclusive."
-        )
+        result["reasons"].append("DOI verification inconclusive.")
         return result
 
     result["checked"] = True
@@ -1094,10 +1212,6 @@ def verify_reference_against_openalex(reference, parsed):
 
 
 def resolve_canonical_metadata(reference, parsed):
-    """
-    Try to find canonical metadata for a reference.
-    Order: (1) DOI -> OpenAlex (2) title -> OpenAlex search (3) give up.
-    """
     result = {
         "found": False, "source": None, "confidence": "unverified",
         "meta": None, "verification": None,
@@ -1209,8 +1323,6 @@ APA 7 ITALIC RULES:
 
 CRITICAL — `italic_elements` MUST be a comma-separated list of LITERAL
 substrings appearing VERBATIM inside `corrected_reference`.
-For a journal article, the value should look like:
-  "Journal of Education Research, 5"
 
 Return JSON ONLY:
 {{
@@ -1229,10 +1341,6 @@ ORIGINAL REFERENCE (for reference only — do NOT copy its errors):
 
 
 def format_reference_with_ai(openalex_meta, original_reference, source_type):
-    """
-    Stage 3: AI formats APA 7 from VERIFIED OpenAlex metadata.
-    Rejects AI output that invented any numbers/DOIs/URLs.
-    """
     client = _get_openai_client()
     if client is None:
         return {
@@ -1510,12 +1618,6 @@ def _apa_status_label(status):
 # =========================================================
 
 def build_reference_comparison(references, manuscript_year):
-    """
-    Build the corrected reference list by:
-      1. Parsing each reference
-      2. Resolving canonical metadata (OpenAlex DOI or title search)
-      3. Formatting via AI from canonical metadata (or local fallback)
-    """
     rows = []
     for i, original in enumerate(references, start=1):
         original_clean = strip_markdown_markers(clean_text(original))
@@ -1891,14 +1993,6 @@ def build_correction_docx(result):
 # =========================================================
 
 def analyze_manuscript(uploaded_file, manuscript_year):
-    """
-    Full pipeline:
-      1. Extract PDF text
-      2. AI extracts references + in-text citations (single call)
-      3. Parse + verify each reference against OpenAlex
-      4. AI formats each verified reference in APA 7
-      5. Build comparison tables
-    """
     uploaded_file.seek(0)
     full_text, _pages = extract_pdf_text(uploaded_file)
     full_text = clean_text(full_text)
@@ -1919,7 +2013,6 @@ def analyze_manuscript(uploaded_file, manuscript_year):
         raise ValueError("OpenAI found 0 references in the manuscript.")
 
     citations = [parse_citation(c) for c in raw_citations]
-
     reference_rows = build_reference_comparison(references, manuscript_year)
     citation_ai = review_citations_with_ai(citations)
     citation_rows = build_citation_comparison(citations, citation_ai)
@@ -1950,6 +2043,21 @@ def analyze_manuscript(uploaded_file, manuscript_year):
 # UI RENDER
 # =========================================================
 
+def _sanitize_error(err):
+    """Never leak more than 200 chars of raw AI output."""
+    if not err:
+        return "Unknown error."
+    err = str(err)
+    # Trim raw dumps from the error string
+    for marker in ("Preview:", "First 500 chars:"):
+        if marker in err:
+            err = err.split(marker)[0].strip()
+            err += " (see server logs / /tmp/ai_raw_response.txt for full raw response)"
+    if len(err) > 400:
+        err = err[:400] + "..."
+    return err
+
+
 def render():
     st.title("OmniCite Auditor - APA 7th Edition")
     st.caption("AI extraction → OpenAlex verification → AI formatting")
@@ -1971,6 +2079,26 @@ def render():
 
     if "apa_batch_results" not in st.session_state:
         st.session_state["apa_batch_results"] = {}
+
+    # ── Cache management (always visible)
+    with st.expander("🔧 Cache & Debug", expanded=False):
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("🗑 Clear AI cache", use_container_width=True):
+                _clear_cache()
+                st.success("Cache cleared. Re-run extraction.")
+        with colB:
+            if st.button("📄 Show debug dump", use_container_width=True):
+                if os.path.exists(DEBUG_DUMP_PATH):
+                    try:
+                        with open(DEBUG_DUMP_PATH, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        st.text_area("Raw AI responses",
+                                     content[-8000:], height=300)
+                    except Exception as exc:
+                        st.error(f"Could not read debug dump: {exc}")
+                else:
+                    st.info("No debug dump yet. Run extraction first.")
 
     if not uploaded_files:
         return
@@ -2002,7 +2130,7 @@ def render():
             except Exception as exc:
                 results[key] = {
                     "filename": uf.name,
-                    "error": str(exc),
+                    "error": _sanitize_error(str(exc)),
                     "manuscript_year": int(manuscript_year),
                 }
         progress.empty()
