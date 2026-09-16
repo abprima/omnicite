@@ -582,6 +582,37 @@ def is_strong_reference_start(line: str) -> bool:
 
     return False
 
+def _looks_like_reference_tail(text):
+    """
+    Return True if `text` ends like a completed APA reference entry.
+
+    Used as a second-layer guard before cutting a glued line:
+    the text BEFORE a candidate start must look like it actually
+    finished a reference (DOI, URL, page range, or a trailing period
+    after a page number).
+    """
+    t = (text or "").rstrip()
+    if not t:
+        return False
+
+    # Ends with a DOI URL
+    if re.search(r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/\S+$", t, re.I):
+        return True
+
+    # Ends with any URL
+    if re.search(r"https?://\S+$", t, re.I):
+        return True
+
+    # Ends with a page range followed by a period:  "123–130."
+    if re.search(r"\b\d+\s*[–-]\s*\d+\.\s*$", t):
+        return True
+
+    # Ends with a bare page number followed by a period:  "130."
+    if re.search(r"\b\d+\.\s*$", t):
+        return True
+
+    return False
+
 def split_glued_reference_line(line):
     """
     Split a PDF-extracted physical line when two or more APA references
@@ -637,16 +668,19 @@ def split_glued_reference_line(line):
     if not candidates:
         return [line]
 
-    # 3. Keep only candidates that start at (or immediately after)
-    #    a boundary anchor, allowing whitespace in between.
+    # 3. Keep only candidates that:
+    #    (a) sit right after a boundary anchor (DOI/URL/page-range),
+    #    (b) look like a strong reference start, AND
+    #    (c) have preceding text that looks like a completed reference.
     valid_cuts = []
     for cand in candidates:
-        # Is there a boundary anchor ending just before this candidate?
         for anchor in anchors:
             gap = line[anchor:cand]
             if len(gap) <= 3 and gap.strip() == "":
+                before_text = line[:cand].rstrip()
                 candidate_text = line[cand:].strip()
-                if is_strong_reference_start(candidate_text):
+                if (is_strong_reference_start(candidate_text)
+                        and _looks_like_reference_tail(before_text)):
                     valid_cuts.append(cand)
                     break
 
