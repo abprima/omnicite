@@ -486,6 +486,37 @@ def detect_apa_source_type(reference):
 
 
 # ============================================================
+# NEW — DOI / PAGE RANGE PRESENCE HELPERS
+# ============================================================
+
+def _reference_has_doi(reference: str) -> bool:
+    """True if the reference string contains a DOI (10.xxxx/...)."""
+    if not reference:
+        return False
+    return bool(re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", reference, re.I))
+
+
+def _reference_has_page_range(reference: str) -> bool:
+    """
+    True if the reference contains a page range like 2209-2216, 45–52,
+    or 12—19 (APA journal article shape: '..., 15(2), 2209-2216').
+    A single page number (e.g. '15(2), 45.') does NOT count.
+    A year range inside parentheses (e.g. '(2015-2020)') does NOT count.
+    """
+    if not reference:
+        return False
+    # Pattern A: ", 2209-2216"  (page range after a comma)
+    if re.search(r",\s*\d{1,5}\s*[–—\-]\s*\d{1,5}\b", reference):
+        return True
+    # Pattern B: "(5), 2209-2216"  (issue + page range)
+    if re.search(
+        r"\(\d+\)\s*,\s*\d{1,5}\s*[–—\-]\s*\d{1,5}\b", reference
+    ):
+        return True
+    return False
+
+
+# ============================================================
 # OPENALEX DOI VERIFICATION
 # ============================================================
 
@@ -1139,7 +1170,23 @@ def build_apa_report_docx(result):
         1 for r in reference_rows if r.get("Source") == "OpenAlex"
     )
 
-    # --- Revised: last-10-year window now anchored to manuscript_year ---
+    # --- NEW: count journal articles missing DOI / page range ---
+    journal_rows = [
+        r for r in reference_rows
+        if r.get("Source Type") == "Journal Article"
+    ]
+    journals_missing_doi = sum(
+        1 for r in journal_rows
+        if not _reference_has_doi(r.get("Corrected Version", ""))
+        and not r.get("Corrected Version", "").startswith("— WITHHELD")
+    )
+    journals_missing_pages = sum(
+        1 for r in journal_rows
+        if not _reference_has_page_range(r.get("Corrected Version", ""))
+        and not r.get("Corrected Version", "").startswith("— WITHHELD")
+    )
+
+    # --- last-10-year window anchored to manuscript_year (inclusive) ---
     window_start = manuscript_year - 9
     window_end = manuscript_year
     recent = sum(
@@ -1168,6 +1215,13 @@ def build_apa_report_docx(result):
         ("DOI suspicious (possible fabricated references)",
          f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
          doi_suspicious > 0),
+        # --- NEW summary rows ---
+        ("Journal Articles missing DOI",
+         f"{journals_missing_doi} / {len(journal_rows)}",
+         journals_missing_doi > 0),
+        ("Journal Articles missing page range",
+         f"{journals_missing_pages} / {len(journal_rows)}",
+         journals_missing_pages > 0),
         (f"% references within last 10 years "
          f"({window_start}-{window_end})",
          f"{recent_pct:.1f}%", False),
@@ -1341,7 +1395,14 @@ def build_apa_report_docx(result):
             else:
                 _add_run(p_orig, original, size_pt=11)
 
-            if row.get("DOI Suspicious") != "—":
+            # Determine suspicion / withheld state once
+            is_withheld = (
+                row.get("Corrected Version", "").startswith("— WITHHELD")
+                or row.get("DOI Suspicious") != "—"
+            )
+            is_journal = row.get("Source Type") == "Journal Article"
+
+            if is_withheld:
                 withheld = doc.add_paragraph()
                 withheld.paragraph_format.left_indent = Inches(0.25)
                 withheld.paragraph_format.space_after = Pt(6)
@@ -1367,9 +1428,20 @@ def build_apa_report_docx(result):
                     for t in (italic_elements or "").split(",")
                     if t.strip()
                 ]
+
+                # --- NEW: compute red warnings for Journal Articles ---
+                warn_suffixes = []
+                if is_journal:
+                    if not _reference_has_doi(corrected):
+                        warn_suffixes.append("  doi: ???")
+                    if not _reference_has_page_range(corrected):
+                        warn_suffixes.append("  pp. ???")
+
                 _emit_with_italic_tokens(
                     p_corr, corrected, tokens, size_pt=11
                 )
+                for w in warn_suffixes:
+                    _add_run(p_corr, w, size_pt=11, bold=True, red=True)
 
                 if row.get("Source") == "OpenAlex":
                     src_p = doc.add_paragraph()
@@ -1642,7 +1714,7 @@ def render():
 
     client = OpenAI(api_key=openai_key)
 
-    # ---- Uploader ----
+    # ---- Uploader (versioned key for reset) ----
     if "apa_uploader_version" not in st.session_state:
         st.session_state["apa_uploader_version"] = 0
 
@@ -1661,20 +1733,26 @@ def render():
 
     # ---- Manual manuscript publication year (drives the 10-year window) ----
     current_year = datetime.now().year
-    default_year = st.session_state.get("apa_manuscript_year", current_year)
+    # FIX: seed session state once, then let the widget own the value.
+    if "apa_manuscript_year" not in st.session_state:
+        st.session_state["apa_manuscript_year"] = current_year
+
     manuscript_year = st.number_input(
         "Manuscript publication year",
         min_value=1900,
         max_value=current_year + 5,
-        value=int(default_year),
         step=1,
         help=(
-            "Used to compute the % of references published within the last "
-            "10 years. The window is [year-9, year], inclusive."
+            "Controls the trailing-10-year recency window. "
+            "Example: 2024 → window 2015–2024 (inclusive)."
         ),
-        key="apa_manuscript_year_input",
+        key="apa_manuscript_year",  # FIX: single source of truth
     )
-    st.session_state["apa_manuscript_year"] = int(manuscript_year)
+    manuscript_year = int(manuscript_year)
+    st.caption(
+        f"10-year recency window: **{manuscript_year - 9}–{manuscript_year}** "
+        f"(inclusive of both ends)"
+    )
 
     file_keys = []
     for idx, uf in enumerate(uploaded_files):
@@ -1767,10 +1845,24 @@ def render():
     if not any_done:
         return
 
-    selector_options = [k for k, _ in file_keys]
+    # FIX: only include keys that exist in pdf_batches.
+    selector_options = [
+        k for k, _ in file_keys
+        if k in st.session_state["pdf_batches"]
+    ]
 
+    if not selector_options:
+        st.warning(
+            "No processed manuscripts found in the current session. "
+            "Click **Extract & Review** to process the uploaded files."
+        )
+        return
+
+    # FIX: _fmt uses .get() with fallback so a missing key can't crash.
     def _fmt(k):
-        b = st.session_state["pdf_batches"][k]
+        b = st.session_state["pdf_batches"].get(k)
+        if not b:
+            return k
         suffix = "" if b.get("ai_done") else "  (not yet processed)"
         return b["filename"] + suffix
 
@@ -1789,8 +1881,11 @@ def render():
         )
         return
 
-    # Refresh the batch's manuscript_year with whatever is in the widget now
-    batch["manuscript_year"] = int(st.session_state.get("apa_manuscript_year", current_year))
+    # FIX: pull the current widget value (single source of truth).
+    batch["manuscript_year"] = int(
+        st.session_state.get("apa_manuscript_year", current_year)
+    )
+    manuscript_year = batch["manuscript_year"]
 
     with st.expander("View reference section (sent to AI)", expanded=False):
         st.text_area(
@@ -1805,7 +1900,6 @@ def render():
     citation_rows = batch["citation_rows"]
     stats = batch["citation_stats"]
     citations = batch["citations"]
-    manuscript_year = batch["manuscript_year"]
 
     total_refs = len(reference_rows)
     total_cits = stats["total"]
@@ -1834,7 +1928,22 @@ def render():
             if (p["first_author"].lower(), p["year"]) not in cit_keys:
                 missing_refs += 1
 
-    # ---- Revised: window anchored to manuscript_year, inclusive ----
+    # --- NEW: journal-article DOI / page-range coverage ---
+    journal_rows = [
+        r for r in reference_rows if r.get("Source Type") == "Journal Article"
+    ]
+    journals_missing_doi = sum(
+        1 for r in journal_rows
+        if not _reference_has_doi(r.get("Corrected Version", ""))
+        and not r.get("Corrected Version", "").startswith("— WITHHELD")
+    )
+    journals_missing_pages = sum(
+        1 for r in journal_rows
+        if not _reference_has_page_range(r.get("Corrected Version", ""))
+        and not r.get("Corrected Version", "").startswith("— WITHHELD")
+    )
+
+    # --- window anchored to manuscript_year, inclusive ---
     window_start = manuscript_year - 9
     window_end = manuscript_year
     recent = sum(
@@ -1860,6 +1969,11 @@ def render():
         ("DOI Suspicious (possible fabrication)",
          f"{doi_suspicious} "
          f"({doi_suspicious / total_refs * 100:.1f}%)" if total_refs else "0"),
+        # --- NEW metric rows ---
+        ("Journal Articles missing DOI",
+         f"{journals_missing_doi} / {len(journal_rows)}"),
+        ("Journal Articles missing page range",
+         f"{journals_missing_pages} / {len(journal_rows)}"),
     ]
 
     metric_df = pd.DataFrame(metrics, columns=["Metric", "Value"])
@@ -1945,7 +2059,7 @@ def render():
             st.session_state.get("apa_uploader_version", 0) + 1
         )
 
-        # 4. Optional: reset the manuscript year back to current year.
+        # 4. Reset the manuscript year back to current year.
         st.session_state["apa_manuscript_year"] = datetime.now().year
 
         # 5. Rerun so everything re-renders clean.
