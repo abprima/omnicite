@@ -1623,15 +1623,7 @@ def _get_openalex_api_key():
 # ============================================================
 
 def render():
-    st.title("📚 OmniCite Auditor — APA 7th Edition")
-
-    st.caption(
-        "Narrative + parenthetical in-text citations ↔ APA reference list. "
-        "MarkItDown extracts PDF text locally, headers/footers are stripped, "
-        "in-text citations are found with regex, OpenAI reviews APA 7 format "
-        "for both references and citations, and DOIs are verified against "
-        "OpenAlex when a key is available."
-    )
+    st.title("OmniCite Auditor — APA 7th Edition")
 
     # ---- API keys ----
     openai_key = _get_openai_api_key()
@@ -1708,7 +1700,7 @@ def render():
 
             overall.progress(
                 base_pct + int(step * 0.10),
-                text=f"[{i}/{n}] Extracting {uf.name} with MarkItDown...",
+                text=f"[{i}/{n}] Extracting {uf.name}...",
             )
             try:
                 (
