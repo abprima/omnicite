@@ -582,6 +582,62 @@ def is_strong_reference_start(line: str) -> bool:
 
     return False
 
+def split_glued_reference_line(line):
+    """
+    Split a PDF-extracted physical line when two or more APA references
+    have been collapsed onto the same line.
+
+    The heuristic:
+      - Find candidate positions where a new reference appears to begin
+        (author/org name followed by a parenthesized year).
+      - For each candidate, reuse is_strong_reference_start() to confirm.
+      - Cut the line at each confirmed candidate.
+
+    Returns a list of strings (>= 1 element). If no boundary is found,
+    returns [line] unchanged.
+    """
+    if not line:
+        return []
+
+    line = re.sub(r"\s+", " ", line).strip()
+    if not line:
+        return []
+
+    # Look for whitespace + AuthorName(s), ... (YEAR)
+    candidate_re = re.compile(
+        r"(?=\s+"
+        r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
+        r"(?:\s+[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)*"
+        r"\s*,"
+        r".{0,180}?"
+        r"\((?:(?:19|20)\d{2}[a-z]?|n\.?d\.?)\)"
+        r")"
+    )
+
+    starts = [m.start() for m in candidate_re.finditer(line)]
+
+    if not starts:
+        return [line]
+
+    pieces = []
+    last = 0
+
+    for pos in starts:
+        candidate_text = line[pos:].strip()
+
+        # Reuse the strong detector we already trust.
+        if is_strong_reference_start(candidate_text):
+            before = line[last:pos].strip()
+            if before:
+                pieces.append(before)
+            last = pos
+
+    remainder = line[last:].strip()
+    if remainder:
+        pieces.append(remainder)
+
+    return pieces or [line]
+
 def split_references(reference_text):
     raw_lines = reference_text.splitlines()
     lines = []
@@ -595,7 +651,10 @@ def split_references(reference_text):
         line = line.replace("\u00ad", "")
         line = re.sub(r"\s+", " ", line).strip()
         if line:
-            lines.append(line)
+            # Pre-split physical lines that contain two references
+            for piece in split_glued_reference_line(line):
+                if piece:
+                    lines.append(piece)
 
     references, current = [], []
     current_has_year = False
@@ -689,14 +748,11 @@ def split_references(reference_text):
         # ── 2. WEAKER boundary ─────────────────────────────────────
         # Personal or corporate author start, but only split when the
         # previous reference already looks complete.
+        # ── 2. WEAKER boundary
         if starts_personal_author(line) or starts_corporate_author(line):
-            if looks_reference_complete(" ".join(current)):
-                save_current()
-                current = [line]
-                current_has_year = contains_apa_date(line)
-            else:
-                current.append(line)
-                current_has_year = current_has_year or contains_apa_date(line)
+            save_current()
+            current = [line]
+            current_has_year = contains_apa_date(line)
             continue
 
         # Author connector at end of the previous line (e.g. "& ")
