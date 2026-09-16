@@ -27,8 +27,7 @@ def _get_openalex_api_key():
 
 
 # =========================================================
-# VERIFICATION THRESHOLDS (from Similarity thresholds.py)
-# Conservative: WITHHELD requires strong evidence of fraud.
+# VERIFICATION THRESHOLDS
 # =========================================================
 
 TITLE_STRONG_MATCH    = 0.78
@@ -511,6 +510,7 @@ def contains_apa_date(text):
 def is_page_break(line):
     return bool(re.fullmatch(r"<<<PAGE_BREAK:\d+>>>", line.strip()))
 
+
 def is_strong_reference_start(line: str) -> bool:
     """
     Detect a strong APA reference beginning.
@@ -534,29 +534,32 @@ def is_strong_reference_start(line: str) -> bool:
     if re.match(r"^(https?://|www\.|doi\s*:)", s, re.I):
         return False
 
+    # ── NEW: Reject lines that are just initials + year, e.g.
+    #    "E. (2024). ..."  or  "D. W. E. (2024). ..."
+    #    These are ALWAYS continuations of the previous author list.
+    if re.match(
+        r"^(?:[A-Z]\.)(?:\s*[A-Z]\.)*\s*"
+        r"\((?:(?:19|20)\d{2}[a-z]?|n\.?d\.?)\)",
+        s,
+    ):
+        return False
+
     # APA year near the beginning of the reference.
-    # Allows 2022, 2022a, n.d., n.d
     year_pattern = r"\((?:(?:19|20)\d{2}[a-z]?|n\.?d\.?)\)"
 
     m = re.search(year_pattern, s, re.I)
     if not m:
         return False
 
-    # A reference start should have meaningful author/organization text
-    # before the year.
     before_year = s[:m.start()].strip()
 
     if len(before_year) < 2:
         return False
 
-    # Avoid accidentally splitting ordinary prose where the year occurs
-    # very late in the line.
     if len(before_year) > 220:
         return False
 
-    # Personal author:
-    # Rodiahwati, D.
-    # Masita, Biswan, M., & Puspita, E.
+    # Personal author: Surname, Initials.
     personal = re.match(
         r"^[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
         r"(?:\s+[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)*"
@@ -567,67 +570,44 @@ def is_strong_reference_start(line: str) -> bool:
     if personal:
         return True
 
-    # Corporate/institutional author:
-    # WHO.
-    # BKKBN.
-    # Kementerian Kesehatan RI.
-    # World Health Organization.
+    # Corporate/institutional author — requires at least 2 chars
     corporate = re.match(
         r"^[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ0-9&'’()./\-\s]+[.\s]?$",
         before_year
     )
 
     if corporate:
-        return True
+        stripped = before_year.rstrip(". ").strip()
+        if len(stripped) >= 2:
+            return True
 
     return False
+
 
 def _looks_like_reference_tail(text):
     """
     Return True if `text` ends like a completed APA reference entry.
-
-    Used as a second-layer guard before cutting a glued line:
-    the text BEFORE a candidate start must look like it actually
-    finished a reference (DOI, URL, page range, or a trailing period
-    after a page number).
     """
     t = (text or "").rstrip()
     if not t:
         return False
 
-    # Ends with a DOI URL
     if re.search(r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/\S+$", t, re.I):
         return True
-
-    # Ends with any URL
     if re.search(r"https?://\S+$", t, re.I):
         return True
-
-    # Ends with a page range followed by a period:  "123–130."
     if re.search(r"\b\d+\s*[–-]\s*\d+\.\s*$", t):
         return True
-
-    # Ends with a bare page number followed by a period:  "130."
     if re.search(r"\b\d+\.\s*$", t):
         return True
 
     return False
 
+
 def split_glued_reference_line(line):
     """
     Split a PDF-extracted physical line when two or more APA references
     have been collapsed onto the same line.
-
-    Only splits at positions that satisfy BOTH:
-      (a) The text IMMEDIATELY BEFORE the candidate looks like the end
-          of a reference — i.e. a DOI/URL, or a page range followed by
-          a period.
-      (b) The candidate text itself is a strong reference start
-          (verified via is_strong_reference_start).
-
-    This prevents splitting in the middle of an author list such as
-    "Angraini, D. I., Karyus, A., ... (2021)" where "Sari, M. I.,"
-    could otherwise be mistaken for a new reference.
     """
     if not line:
         return []
@@ -636,18 +616,15 @@ def split_glued_reference_line(line):
     if not line:
         return []
 
-    # Where could a boundary be? Right after a DOI, a URL, or a
-    # completed page range that ends a reference.
     boundary_re = re.compile(
         r"(?:"
-        r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/\S+"   # DOI
-        r"|https?://\S+"                                # any URL
-        r"|\.\s+\d+\s*[–-]\s*\d+\s*\."                  # ". 123–130."
-        r"|\b\d+\s*[–-]\s*\d+\s*\."                     # "123–130."
+        r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/\S+"
+        r"|https?://\S+"
+        r"|\.\s+\d+\s*[–-]\s*\d+\s*\."
+        r"|\b\d+\s*[–-]\s*\d+\s*\."
         r")"
     )
 
-    # Candidate: whitespace + Author + optional more authors + (YYYY)
     candidate_re = re.compile(
         r"(?=\s+"
         r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
@@ -658,20 +635,14 @@ def split_glued_reference_line(line):
         r")"
     )
 
-    # 1. Collect all boundary anchors (positions where a reference could end)
     anchors = [m.end() for m in boundary_re.finditer(line)]
     if not anchors:
         return [line]
 
-    # 2. Collect all candidate starts
     candidates = [m.start() for m in candidate_re.finditer(line)]
     if not candidates:
         return [line]
 
-    # 3. Keep only candidates that:
-    #    (a) sit right after a boundary anchor (DOI/URL/page-range),
-    #    (b) look like a strong reference start, AND
-    #    (c) have preceding text that looks like a completed reference.
     valid_cuts = []
     for cand in candidates:
         for anchor in anchors:
@@ -687,7 +658,6 @@ def split_glued_reference_line(line):
     if not valid_cuts:
         return [line]
 
-    # 4. Cut at each validated position
     pieces = []
     last = 0
     for pos in valid_cuts:
@@ -700,6 +670,7 @@ def split_glued_reference_line(line):
         pieces.append(remainder)
 
     return pieces or [line]
+
 
 def split_references(reference_text):
     raw_lines = reference_text.splitlines()
@@ -714,7 +685,6 @@ def split_references(reference_text):
         line = line.replace("\u00ad", "")
         line = re.sub(r"\s+", " ", line).strip()
         if line:
-            # Pre-split physical lines that contain two references
             for piece in split_glued_reference_line(line):
                 if piece:
                     lines.append(piece)
@@ -746,19 +716,41 @@ def split_references(reference_text):
             line, re.I,
         ))
 
+    # ── NEW: A line that starts with initials + year is a continuation.
+    #    This covers "E. (2024). ...", "D. W. E. (2024). ...", etc.
+    _INITIALS_ONLY_RE = re.compile(
+        r"^(?:[A-Z]\.)(?:\s*[A-Z]\.)*\s*"
+        r"\((?:(?:19|20)\d{2}[a-z]?|n\.?d\.?)\)"
+    )
+
+    def is_initials_only_continuation(line):
+        return bool(_INITIALS_ONLY_RE.match(line.strip()))
+
     def previous_ends_author_connector():
+        """
+        Return True if the previous appended line clearly indicates the
+        current reference's author list is not finished.
+        """
         if not current:
             return False
         previous = current[-1].strip()
-        # Ends with a comma, ampersand, or "and"
+
+        # 1. Ends with a comma, ampersand, or "and"
         if re.search(r"(?:,|&|\band)\s*$", previous):
             return True
-        # Ends mid-sentence — no terminal punctuation at all
-        # (this catches "Michaeli, T.," fragments)
+
+        # 2. Ends with one or more initials like "D. W." or just "W."
+        #    This catches author lists whose last initial wraps to the
+        #    next line ("... & Dewi, D. W.\nE. (2024). ...").
+        if re.search(r"(?:^|\s)[A-Z]\.(?:\s*[A-Z]\.)*\s*$", previous):
+            if not contains_apa_date(" ".join(current)):
+                return True
+
+        # 3. Ends mid-sentence with an author-list fragment
         if previous and not re.search(r"[.!?:]$", previous):
-            # But only if the fragment looks like an author list fragment
             if re.search(r"[A-ZÀ-ÖØ-Ý][a-z]+\s*,\s*(?:[A-Z]\.\s*)+$", previous):
                 return True
+
         return False
 
     def looks_reference_complete(text):
@@ -795,22 +787,22 @@ def split_references(reference_text):
         if not line:
             continue
 
-        # Skip page-break markers entirely (they are handled by cleaning
-        # inside save_current, so they must not be treated as content).
         if is_page_break(line):
             continue
 
-        # ── NEW GUARD: if the previous line ends with a connector,
-        #    the current line is a continuation of the same author list.
-        if current:
-            prev = current[-1].strip()
-            if re.search(r"(?:,|&|\band)\s*$", prev):
-                current.append(line)
-                current_has_year = current_has_year or contains_apa_date(line)
-                continue
+        # ── GUARD A: initials-only continuation line
+        if current and is_initials_only_continuation(line):
+            current.append(line)
+            current_has_year = current_has_year or contains_apa_date(line)
+            continue
 
-        # ── 1. STRONG boundary ─────────────────────────────────────
-        # Author/organization + (year) → almost certainly a new reference.
+        # ── GUARD B: previous line ends with a connector / initial
+        if previous_ends_author_connector():
+            current.append(line)
+            current_has_year = current_has_year or contains_apa_date(line)
+            continue
+
+        # ── 1. STRONG boundary
         if current and is_strong_reference_start(line):
             save_current()
             current = [line]
@@ -823,9 +815,7 @@ def split_references(reference_text):
             current_has_year = contains_apa_date(line)
             continue
 
-        # ── 2. WEAKER boundary ─────────────────────────────────────
-        # Personal or corporate author start, but only split when the
-        # previous reference already looks complete.
+        # ── 2. WEAKER boundary
         if starts_personal_author(line) or starts_corporate_author(line):
             if looks_reference_complete(" ".join(current)):
                 save_current()
@@ -836,19 +826,13 @@ def split_references(reference_text):
                 current_has_year = current_has_year or contains_apa_date(line)
             continue
 
-        # Author connector at end of the previous line (e.g. "& ")
-        if previous_ends_author_connector():
-            current.append(line)
-            current_has_year = current_has_year or contains_apa_date(line)
-            continue
-
         # If the current reference has no year yet, keep appending
         if not current_has_year:
             current.append(line)
             current_has_year = current_has_year or contains_apa_date(line)
             continue
 
-        # ── 3. Otherwise it is a continuation ──────────────────────
+        # ── 3. Otherwise it is a continuation
         current.append(line)
         current_has_year = current_has_year or contains_apa_date(line)
 
@@ -1181,7 +1165,7 @@ def extract_narrative_citations(text):
         })
         occupied.append((m.start(), m.end()))
 
-    # Pattern F — "Author, 2024" (single-author malformed)
+    # Pattern F — "Author, 2024"
     for m in re.finditer(
         r"(?<![,\.])\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*"
         r"((?:19|20)\d{2})[a-z]?\b",
@@ -1500,10 +1484,6 @@ def _fetch_openalex_metadata(doi):
 
 
 def _verify_doi_resolution(doi):
-    """
-    Secondary DOI validation via doi.org.
-    A network error is INCONCLUSIVE, not invalid.
-    """
     if not doi:
         return {"resolves": None, "reason": "No DOI supplied"}
 
@@ -1534,7 +1514,6 @@ def _verify_doi_resolution(doi):
 
 
 def _openalex_search_by_title(title, max_results=5):
-    """Search OpenAlex by title for references without a DOI."""
     if not title:
         return []
     try:
@@ -1584,7 +1563,6 @@ def _surname_from_full_name(name):
 
 
 def _extract_apa_title(reference):
-    """APA titles are not quoted. Take the segment after the year+period."""
     ym = re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)\.\s*", reference)
     if not ym:
         return ""
@@ -1596,10 +1574,6 @@ def _extract_apa_title(reference):
 
 
 def _compare_metadata_advanced(submitted, external):
-    """
-    Compare submitted reference against external metadata.
-    Returns dict with title_similarity, author_similarity, year_match.
-    """
     t = _title_similarity(
         _extract_apa_title(submitted.get("raw", "")),
         external.get("title") or "",
@@ -1624,12 +1598,6 @@ def _compare_metadata_advanced(submitted, external):
 
 
 def _decide_doi_status_advanced(comparison):
-    """
-    Decide verification status for a DOI that exists in OpenAlex.
-
-    WITHHELD requires SEVERE mismatch on all three identity signals.
-    Minor metadata errors -> VERIFIED_METADATA_CORRECTED, not WITHHELD.
-    """
     t = comparison.get("title_similarity")
     a = comparison.get("author_similarity")
     y = comparison.get("year_match")
@@ -1675,10 +1643,6 @@ def _decide_doi_status_advanced(comparison):
 
 
 def verify_reference_against_openalex(reference, parsed):
-    """
-    Verify a reference against OpenAlex + doi.org resolver.
-    Returns a richer dict with status, reasons, and comparison metrics.
-    """
     result = {
         "checked": False,
         "doi": parsed.get("doi"),
@@ -1699,7 +1663,6 @@ def verify_reference_against_openalex(reference, parsed):
     if not doi:
         return result
 
-    # ---- Step 1: OpenAlex lookup
     meta = _fetch_openalex_metadata(doi)
 
     if meta is None:
@@ -1709,7 +1672,6 @@ def verify_reference_against_openalex(reference, parsed):
         return result
 
     if meta.get("_not_found"):
-        # ---- Step 2: doi.org resolver fallback
         resolution = _verify_doi_resolution(doi)
         result["doi_resolution"] = resolution
 
@@ -1739,7 +1701,6 @@ def verify_reference_against_openalex(reference, parsed):
         )
         return result
 
-    # ---- Step 3: OpenAlex metadata available, compare
     result["checked"] = True
     result["source_of_truth"] = "openalex"
     result["crossref_title"] = meta.get("title")
@@ -1928,7 +1889,6 @@ def revise_narrative_citation(citation):
     if _AS_CITED_IN_RE.search(raw):
         return revise_parenthetical_citation(re.sub(r"^\(|\)$", "", raw))
 
-    # Malformed: "Author et al., 2024" -> "Author et al. (2024)"
     if citation.get("malformed") and et_al and authors:
         ym = _YEAR_TOKEN_RE.search(raw)
         if ym:
@@ -2225,10 +2185,6 @@ def fallback_italic_elements(source_type):
 
 
 def derive_italic_elements_from_reference(reference, source_type):
-    """
-    Return comma-separated LITERAL substrings that should be italicized
-    in the given APA 7 reference, based on its detected structure.
-    """
     if not reference:
         return ""
 
@@ -2288,7 +2244,6 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
         ai = by_no.get(i, {})
         original_clean = strip_markdown_markers(clean_text(original))
 
-        # ---- Step 1: base text
         ai_corrected = strip_markdown_markers(
             clean_text(ai.get("revised_reference", ""))
         ) if ai else ""
@@ -2297,7 +2252,6 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
             if not _reference_is_hallucinated(original_clean, ai_corrected):
                 base_text = ai_corrected
 
-        # ---- Step 2: parse + verify
         parsed = parse_reference(base_text)
         doi_present = bool(parsed.get("doi"))
 
@@ -2318,7 +2272,6 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
         doi_suspicious = verification["suspicious"]
         doi_status = verification.get("status", "UNVERIFIED")
 
-        # ---- Step 3: build corrected version
         if doi_suspicious:
             corrected = "— WITHHELD (DOI mismatch) —"
             correction_note = (
@@ -2333,7 +2286,6 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
                 ai.get("source_type") or _source_type_from_openalex(meta)
             )
 
-            # ── Step 1: OpenAI formats the APA reference from OpenAlex data
             ai_formatted = format_apa_with_ai(
                 meta, original_clean, source_type
             )
@@ -2349,7 +2301,6 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
                 placeholders = {}
 
             else:
-                # ── Step 2: fallback to deterministic skeleton
                 oa_ref, oa_note = build_apa_reference_from_openalex(
                     meta, parsed, original_clean
                 )
@@ -2380,12 +2331,10 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
                 or fallback_italic_elements(source_type)
             )
 
-        # ---- Step 4: year
         year = ai.get("year")
         if not isinstance(year, int):
             year = extract_reference_year(corrected)
 
-        # ---- Step 5: final status
         if doi_suspicious:
             status = "WITHHELD"
         elif doi_status in ("VERIFIED", "VERIFIED_METADATA_CORRECTED"):
@@ -2506,16 +2455,8 @@ def build_apa_reference_from_openalex(meta, parsed_reference, original_reference
     note = "Corrected using OpenAlex bibliographic record."
     return reconstructed, note
 
-def format_apa_with_ai(openalex_meta, original_reference, source_type):
-    """
-    Feed verified OpenAlex metadata to OpenAI and receive:
-      - a complete APA 7 reference string
-      - the exact literal substrings that should be italicized
-      - the confirmed source type
 
-    The AI is FORBIDDEN from inventing or altering any bibliographic fact.
-    It may only reshape facts into APA 7 format.
-    """
+def format_apa_with_ai(openalex_meta, original_reference, source_type):
     client = _get_openai_client()
     if client is None:
         return {
@@ -2525,13 +2466,11 @@ def format_apa_with_ai(openalex_meta, original_reference, source_type):
             "explanation": "OpenAI client unavailable",
         }
 
-    # ── Preserve [translation] bracket from the original reference
     translation = ""
     m = re.search(r"\[([^\]]+)\]", original_reference)
     if m:
         translation = m.group(0)
 
-    # ── Build the ground-truth payload for OpenAI
     ground_truth = {
         "title":        openalex_meta.get("title"),
         "year":         openalex_meta.get("year"),
@@ -2623,7 +2562,6 @@ ORIGINAL REFERENCE (for reference only — do NOT copy its errors):
         stype     = normalize_source_type(data.get("source_type") or source_type)
         note      = data.get("explanation") or ""
 
-        # ── Safety 1: reject if AI invented numbers/DOIs/URLs
         if corrected and _reference_is_hallucinated(original_reference, corrected):
             return {
                 "corrected_reference": "",
@@ -2632,7 +2570,6 @@ ORIGINAL REFERENCE (for reference only — do NOT copy its errors):
                 "explanation": "AI output rejected (invented data).",
             }
 
-        # ── Safety 2: keep only italic tokens that appear verbatim
         if italics:
             tokens = [t.strip() for t in italics.split(",") if t.strip()]
             tokens = [t for t in tokens if t in corrected]
@@ -2652,6 +2589,7 @@ ORIGINAL REFERENCE (for reference only — do NOT copy its errors):
             "source_type": source_type,
             "explanation": f"OpenAI error: {exc}",
         }
+
 
 def _source_type_from_openalex(meta):
     if not meta:
@@ -2851,11 +2789,6 @@ def _emit_with_placeholders(paragraph, text, italic=False):
 
 
 def _add_styled_reference(paragraph, text, italic_elements):
-    """
-    Write an APA reference with italics on the specified elements and
-    red bold italic on placeholders. Uses word-boundary matching to
-    avoid matching a volume number inside a DOI (e.g. "5" inside "1153").
-    """
     if isinstance(italic_elements, list):
         tokens = [t.strip() for t in italic_elements if t and t.strip()]
     else:
@@ -3019,7 +2952,6 @@ def build_correction_docx(result):
                 italic_elements = row.get("Italicized in APA", "")
                 _add_styled_reference(p2, corrected, italic_elements)
 
-                # Source tag
                 if not row.get("DOI Suspicious"):
                     source_tag = (
                         "  [corrected from OpenAlex]"
@@ -3028,7 +2960,6 @@ def build_correction_docx(result):
                     )
                     _add_run(p2, source_tag, size_pt=9, italic=True)
 
-                # Verification status
                 vstatus = row.get("Verification Status", "")
                 if vstatus and vstatus not in ("VERIFIED",):
                     status_p = doc.add_paragraph()
