@@ -511,6 +511,76 @@ def contains_apa_date(text):
 def is_page_break(line):
     return bool(re.fullmatch(r"<<<PAGE_BREAK:\d+>>>", line.strip()))
 
+def is_strong_reference_start(line: str) -> bool:
+    """
+    Detect a strong APA reference beginning.
+
+    Examples:
+    Masita, Biswan, M., & Puspita, E. (2018).
+    Rodiahwati, D. (2022).
+    Kementerian Kesehatan RI. (2022).
+    WHO. (2022).
+    BKKBN. (2021).
+
+    A line is considered a strong start when an author/organization
+    is followed by a parenthesized year.
+    """
+    if not line:
+        return False
+
+    s = re.sub(r"\s+", " ", line).strip()
+
+    # Do not treat obvious DOI/URL continuation lines as reference starts
+    if re.match(r"^(https?://|www\.|doi\s*:)", s, re.I):
+        return False
+
+    # APA year near the beginning of the reference.
+    # Allows 2022, 2022a, n.d., n.d
+    year_pattern = r"\((?:(?:19|20)\d{2}[a-z]?|n\.?d\.?)\)"
+
+    m = re.search(year_pattern, s, re.I)
+    if not m:
+        return False
+
+    # A reference start should have meaningful author/organization text
+    # before the year.
+    before_year = s[:m.start()].strip()
+
+    if len(before_year) < 2:
+        return False
+
+    # Avoid accidentally splitting ordinary prose where the year occurs
+    # very late in the line.
+    if len(before_year) > 220:
+        return False
+
+    # Personal author:
+    # Rodiahwati, D.
+    # Masita, Biswan, M., & Puspita, E.
+    personal = re.match(
+        r"^[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
+        r"(?:\s+[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)*"
+        r"\s*,",
+        before_year
+    )
+
+    if personal:
+        return True
+
+    # Corporate/institutional author:
+    # WHO.
+    # BKKBN.
+    # Kementerian Kesehatan RI.
+    # World Health Organization.
+    corporate = re.match(
+        r"^[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ0-9&'’()./\-\s]+[.\s]?$",
+        before_year
+    )
+
+    if corporate:
+        return True
+
+    return False
 
 def split_references(reference_text):
     raw_lines = reference_text.splitlines()
@@ -520,7 +590,8 @@ def split_references(reference_text):
         if not line:
             continue
         if is_page_break(line):
-            lines.append(line); continue
+            lines.append(line)
+            continue
         line = line.replace("\u00ad", "")
         line = re.sub(r"\s+", " ", line).strip()
         if line:
@@ -537,22 +608,30 @@ def split_references(reference_text):
         reference = re.sub(r"<<<PAGE_BREAK:\d+>>>", " ", reference).strip()
         if reference:
             references.append(reference)
-        current = []; current_has_year = False
+        current = []
+        current_has_year = False
 
     def starts_personal_author(line):
         return bool(re.match(
-            r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+\s*,\s*(?:[A-Z](?:\.-?[A-Z])?\.\s*)+", line))
+            r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+\s*,\s*(?:[A-Z](?:\.-?[A-Z])?\.\s*)+",
+            line,
+        ))
 
     def starts_corporate_author(line):
         return bool(re.match(
-            r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ0-9&'’\-\s]+?\.\s*\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)",
-            line, re.I))
+            r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ0-9&'’\-\s]+?\.\s*"
+            r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)",
+            line, re.I,
+        ))
 
     def previous_ends_author_connector():
         if not current:
             return False
         previous = current[-1].strip()
-        return bool(re.search(r"(?:&|,\s*&|,)\s*$", previous)) and not contains_apa_date(" ".join(current))
+        return (
+            bool(re.search(r"(?:&|,\s*&|,)\s*$", previous))
+            and not contains_apa_date(" ".join(current))
+        )
 
     def looks_reference_complete(text):
         if not contains_apa_date(text):
@@ -565,11 +644,15 @@ def split_references(reference_text):
             score += 4
         elif re.search(r"https?://\S+\.?$", text, re.I):
             score += 3
-        if re.search(r"\b\d+\s*\([^)]*\)\s*,\s*(?:\d+\s*[–-]\s*\d+|e\d+|article\s+\w+)\.?$", text, re.I):
+        if re.search(
+            r"\b\d+\s*\([^)]*\)\s*,\s*(?:\d+\s*[–-]\s*\d+|e\d+|article\s+\w+)\.?$",
+            text, re.I,
+        ):
             score += 3
         elif re.search(r"\b\d+\s*[–-]\s*\d+\.?$", text):
             score += 2
-        if re.search(r"\b(?:press|publishing|publisher|university press)\.?$", text, re.I):
+        if re.search(r"\b(?:press|publishing|publisher|university press)\.?$",
+                     text, re.I):
             score += 2
         if re.search(r"[.!?]$", text):
             score += 1
@@ -579,23 +662,58 @@ def split_references(reference_text):
         return score >= 2
 
     for line in lines:
+
+        line = line.strip()
+        if not line:
+            continue
+
+        # Skip page-break markers entirely (they are handled by cleaning
+        # inside save_current, so they must not be treated as content).
         if is_page_break(line):
             continue
-        line_has_year = contains_apa_date(line)
-        if not current:
-            current = [line]; current_has_year = line_has_year; continue
-        if previous_ends_author_connector():
-            current.append(line); current_has_year = current_has_year or line_has_year; continue
-        if not current_has_year:
-            current.append(line); current_has_year = current_has_year or line_has_year; continue
-        if starts_personal_author(line) or starts_corporate_author(line):
-            if looks_reference_complete(re.sub(r"\s+", " ", " ".join(current)).strip()):
-                save_current()
-                current = [line]; current_has_year = line_has_year
-            else:
-                current.append(line); current_has_year = True
+
+        # ── 1. STRONG boundary ─────────────────────────────────────
+        # Author/organization + (year) → almost certainly a new reference.
+        if current and is_strong_reference_start(line):
+            save_current()
+            current = [line]
+            current_has_year = contains_apa_date(line)
             continue
-        current.append(line); current_has_year = True
+
+        # First line of the entire section
+        if not current:
+            current = [line]
+            current_has_year = contains_apa_date(line)
+            continue
+
+        # ── 2. WEAKER boundary ─────────────────────────────────────
+        # Personal or corporate author start, but only split when the
+        # previous reference already looks complete.
+        if starts_personal_author(line) or starts_corporate_author(line):
+            if looks_reference_complete(" ".join(current)):
+                save_current()
+                current = [line]
+                current_has_year = contains_apa_date(line)
+            else:
+                current.append(line)
+                current_has_year = current_has_year or contains_apa_date(line)
+            continue
+
+        # Author connector at end of the previous line (e.g. "& ")
+        if previous_ends_author_connector():
+            current.append(line)
+            current_has_year = current_has_year or contains_apa_date(line)
+            continue
+
+        # If the current reference has no year yet, keep appending
+        if not current_has_year:
+            current.append(line)
+            current_has_year = current_has_year or contains_apa_date(line)
+            continue
+
+        # ── 3. Otherwise it is a continuation ──────────────────────
+        current.append(line)
+        current_has_year = current_has_year or contains_apa_date(line)
 
     save_current()
     return references
