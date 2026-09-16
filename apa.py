@@ -1623,7 +1623,7 @@ def _get_openalex_api_key():
 # ============================================================
 
 def render():
-    st.title("OmniCite Auditor — APA 7th Edition")
+    st.title("OmniCite Auditor — APA Style")
 
     # ---- API keys ----
     openai_key = _get_openai_api_key()
