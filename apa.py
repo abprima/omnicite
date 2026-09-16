@@ -4,10 +4,8 @@ from datetime import datetime
 import io
 import os
 import json
-import hashlib
 import traceback
 import difflib
-import shutil
 
 import streamlit as st
 import pandas as pd
@@ -19,9 +17,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from openalex_config import get_openalex_api_key
 
-
 # =========================================================
-# SECRETS
+# SECRETS — now reads from session_state (set at login)
 # =========================================================
 
 def _get_openalex_api_key():
@@ -29,150 +26,412 @@ def _get_openalex_api_key():
 
 
 # =========================================================
-# THRESHOLDS
+# SAFE REGEX HELPERS
 # =========================================================
 
-TITLE_STRONG_MATCH    = 0.78
-TITLE_REVIEW_MATCH    = 0.55
-AUTHOR_STRONG_MATCH   = 0.60
-AUTHOR_REVIEW_MATCH   = 0.35
-SEVERE_TITLE_MISMATCH  = 0.30
-SEVERE_AUTHOR_MISMATCH = 0.25
+def _safe_compile(pattern, flags=0):
+    try:
+        return re.compile(pattern, flags)
+    except re.error:
+        return None
 
-TITLE_SEARCH_MIN_SIM  = 0.75
-TITLE_SEARCH_YEAR_BONUS = 0.3
 
-DOI_RESOLVER_URL     = "https://doi.org"
-DOI_RESOLVER_TIMEOUT = 10
+def _safe_search(pattern, string, flags=0):
+    compiled = _safe_compile(pattern, flags)
+    if compiled is None or string is None:
+        return None
+    try:
+        return compiled.search(string)
+    except Exception:
+        return None
 
-# ── Max output tokens for extraction (gpt-4o max is 16384)
-EXTRACTION_MAX_TOKENS = 16384
 
-# ── Long manuscripts (chars) get split into two calls
-SPLIT_EXTRACTION_THRESHOLD = 25000
+def _safe_findall(pattern, string, flags=0):
+    compiled = _safe_compile(pattern, flags)
+    if compiled is None or string is None:
+        return []
+    try:
+        return compiled.findall(string)
+    except Exception:
+        return []
 
-CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".cache", "apa_v3"
-)
-os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ── Diagnostic dump location
-DEBUG_DUMP_PATH = "/tmp/ai_raw_response.txt"
+def _safe_sub(pattern, repl, string, flags=0):
+    compiled = _safe_compile(pattern, flags)
+    if compiled is None or string is None:
+        return string if string is not None else ""
+    try:
+        return compiled.sub(repl, string)
+    except Exception:
+        return string
+
+
+def _safe_fullmatch(pattern, string, flags=0):
+    compiled = _safe_compile(pattern, flags)
+    if compiled is None or string is None:
+        return None
+    try:
+        return compiled.fullmatch(string)
+    except Exception:
+        return None
+
+
+def _esc(value):
+    if value is None:
+        return ""
+    return re.escape(str(value))
 
 
 # =========================================================
-# REFERENCE SECTION DETECTION HEADINGS
+# PDF EXTRACTION + HEADER / FOOTER REMOVAL
+# =========================================================
+
+def normalize_running_text(text):
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    text = re.sub(r"\b\d+\b", "<num>", text)
+    return text
+
+
+def extract_pdf_text(uploaded_file):
+    pdf_bytes = uploaded_file.read()
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_blocks = []
+
+    for page_number, page in enumerate(document):
+        page_height = page.rect.height
+        page_width = page.rect.width
+        blocks = []
+        for block in page.get_text("blocks"):
+            x0, y0, x1, y1, text, *_ = block
+            text = text.strip()
+            if not text:
+                continue
+            blocks.append({
+                "text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                "page_height": page_height, "page_width": page_width
+            })
+        blocks.sort(key=lambda b: (round(b["y0"], 1), round(b["x0"], 1)))
+        page_blocks.append({"page": page_number + 1, "blocks": blocks})
+
+    candidate_counter = Counter()
+    for page_data in page_blocks:
+        seen_on_page = set()
+        for block in page_data["blocks"]:
+            ph = block["page_height"]
+            is_top = block["y0"] <= ph * 0.12
+            is_bottom = block["y1"] >= ph * 0.90
+            if not (is_top or is_bottom):
+                continue
+            normalized = normalize_running_text(block["text"])
+            if not normalized:
+                continue
+            if normalized not in seen_on_page:
+                candidate_counter[normalized] += 1
+                seen_on_page.add(normalized)
+
+    total_pages = len(page_blocks)
+    minimum_pages = max(2, int(total_pages * 0.30))
+    running_text_patterns = {
+        text for text, count in candidate_counter.items()
+        if count >= minimum_pages
+    }
+
+    pages = []
+    removed_running_text = []
+    for page_data in page_blocks:
+        clean_blocks = []
+        for block in page_data["blocks"]:
+            text = block["text"]
+            normalized = normalize_running_text(text)
+            ph = block["page_height"]
+            is_top = block["y0"] <= ph * 0.12
+            is_bottom = block["y1"] >= ph * 0.90
+
+            if (is_top or is_bottom) and normalized in running_text_patterns:
+                removed_running_text.append({
+                    "Page": page_data["page"], "Text": text,
+                    "Reason": "Repeated header/footer"
+                })
+                continue
+
+            if _safe_fullmatch(r"\s*(?:page\s*)?\d+\s*", text, flags=re.IGNORECASE):
+                if is_top or is_bottom:
+                    removed_running_text.append({
+                        "Page": page_data["page"], "Text": text,
+                        "Reason": "Page number"
+                    })
+                    continue
+            clean_blocks.append(text)
+
+        page_text = "\n".join(clean_blocks)
+        pages.append({"page": page_data["page"], "text": page_text})
+
+    document.close()
+    full_text = "\n".join(
+        f"<<<PAGE_BREAK:{p['page']}>>>\n{p['text']}" for p in pages
+    )
+    return full_text, pages, removed_running_text
+
+
+# =========================================================
+# PDF FONT / ITALIC EXTRACTION
+# =========================================================
+
+def extract_pdf_style_spans(uploaded_file):
+    uploaded_file.seek(0)
+    pdf_bytes = uploaded_file.read()
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    spans = []
+    for page_number, page in enumerate(document, start=1):
+        page_dict = page.get_text("dict")
+        for block in page_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "")
+                    if not text.strip():
+                        continue
+                    font = span.get("font", "")
+                    flags = span.get("flags", 0)
+                    italic = bool(flags & 2) or bool(
+                        re.search(r"italic|oblique", font, re.I)
+                    )
+                    spans.append({
+                        "page": page_number, "text": text, "font": font,
+                        "flags": flags, "italic": italic, "bbox": span.get("bbox")
+                    })
+    document.close()
+    uploaded_file.seek(0)
+    return spans
+
+
+def normalize_style_text(text):
+    text = (text or "").replace("\u00ad", "")
+    text = text.replace("‐", "-").replace("‑", "-").replace("–", "-").replace("—", "-")
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def _normalized_page_char_map(spans, page_number):
+    chars, styles, fonts = [], [], []
+    last_space = True
+    for span in spans:
+        if span["page"] != page_number:
+            continue
+        raw = (span.get("text") or "").replace("\u00ad", "")
+        raw = raw.replace("‐", "-").replace("‑", "-").replace("–", "-").replace("—", "-")
+        for ch in raw:
+            if ch.isspace():
+                if not last_space and chars:
+                    chars.append(" "); styles.append(False); fonts.append("")
+                last_space = True
+            else:
+                chars.append(ch.lower())
+                styles.append(bool(span.get("italic")))
+                fonts.append(span.get("font", ""))
+                last_space = False
+        if chars and not last_space:
+            chars.append(" "); styles.append(False); fonts.append(""); last_space = True
+    text = "".join(chars).strip()
+    if len(text) < len(chars):
+        chars = list(text); styles = styles[:len(text)]; fonts = fonts[:len(text)]
+    return text, styles, fonts
+
+
+def _style_for_exact_range(page_text, styles, fonts, start, end):
+    positions = [i for i in range(start, end) if i < len(page_text) and not page_text[i].isspace()]
+    if not positions:
+        return None
+    italic_count = sum(1 for i in positions if styles[i])
+    ratio = italic_count / len(positions)
+    used_fonts = sorted({fonts[i] for i in positions if fonts[i]})
+    return {"found": True, "italic": ratio >= 0.80, "italic_ratio": ratio, "fonts": used_fonts}
+
+
+def find_phrase_style(spans, phrase):
+    target = normalize_style_text(phrase)
+    if not target or len(target) < 2:
+        return None
+    for page in sorted({s["page"] for s in spans}):
+        page_text, styles, fonts = _normalized_page_char_map(spans, page)
+        idx = page_text.find(target)
+        if idx >= 0:
+            result = _style_for_exact_range(page_text, styles, fonts, idx, idx + len(target))
+            if result:
+                result["page"] = page
+                return result
+    return {"found": False, "italic": None, "italic_ratio": None, "fonts": [], "page": None}
+
+
+def find_component_style_after_anchor(spans, anchor, component, max_distance=120):
+    anchor_n = normalize_style_text(anchor)
+    component_n = normalize_style_text(component)
+    if not anchor_n or not component_n:
+        return {"found": False, "italic": None, "italic_ratio": None, "fonts": [], "page": None}
+    for page in sorted({s["page"] for s in spans}):
+        page_text, styles, fonts = _normalized_page_char_map(spans, page)
+        a = page_text.find(anchor_n)
+        if a < 0:
+            continue
+        search_start = a + len(anchor_n)
+        search_end = min(len(page_text), search_start + max_distance)
+        region = page_text[search_start:search_end]
+        m = _safe_search(r"(?<!\w)" + _esc(component_n) + r"(?!\w)", region)
+        if m:
+            start = search_start + m.start()
+            end = search_start + m.end()
+            result = _style_for_exact_range(page_text, styles, fonts, start, end)
+            if result:
+                result["page"] = page
+                return result
+    return {"found": False, "italic": None, "italic_ratio": None, "fonts": [], "page": None}
+
+
+def extract_journal_format_parts(reference):
+    pattern = re.compile(
+        r"\.\s*(?P<journal>[^.]+?),\s*(?P<volume>\d+)\s*(?:\((?P<issue>[^)]+)\))?\s*,\s*"
+        r"(?P<pages>\d+(?:\s*[–-]\s*\d+)?|[Ee]\d+|[Aa]rticle\s+\w+)(?=\s*[\.,]|\s*https?://|$)",
+        re.I
+    )
+    matches = list(pattern.finditer(reference))
+    if not matches:
+        return {"is_journal": False, "journal": None, "volume": None, "issue": None, "pages": None}
+    m = matches[-1]
+    return {
+        "is_journal": True, "journal": m.group("journal").strip(),
+        "volume": m.group("volume"), "issue": m.group("issue"), "pages": m.group("pages")
+    }
+
+
+def extract_book_format_parts(reference):
+    ym = re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)\.\s*", reference, re.I)
+    if not ym:
+        return {"is_book": False, "title": None, "publisher": None}
+    tail = reference[ym.end():].strip()
+    if re.search(r",\s*\d+\s*(?:\([^)]+\))?\s*,\s*\d+", tail):
+        return {"is_book": False, "title": None, "publisher": None}
+    tail = re.sub(r"\s+https?://\S+\s*$", "", tail).strip()
+    sentences = [x.strip() for x in re.split(r"(?<=\.)\s+", tail) if x.strip()]
+    if len(sentences) < 2:
+        return {"is_book": False, "title": None, "publisher": None}
+    return {"is_book": True, "title": sentences[0].rstrip("."), "publisher": sentences[-1].rstrip(".")}
+
+
+def detect_apa_source_type(reference):
+    if extract_journal_format_parts(reference)["is_journal"]:
+        return "Journal Article"
+    low = reference.lower()
+    if re.search(r"\b(?:in)\s+[A-Z].+\(eds?\.\)", reference) or re.search(r"\(eds?\.\)", reference, re.I):
+        return "Book Chapter"
+    if re.search(r"\b(proceedings|conference|symposium)\b", low):
+        return "Conference Proceeding"
+    if re.search(r"\b(report|technical report|working paper)\b", low):
+        return "Report"
+    if extract_book_format_parts(reference)["is_book"] and not re.search(r"https?://", reference):
+        return "Book"
+    if re.search(r"https?://", reference) and "doi.org" not in low:
+        return "Webpage / Online Document"
+    return "Other"
+
+
+def check_reference_italics(reference, style_spans, source_type=None):
+    source_type = source_type or detect_apa_source_type(reference)
+    results = {
+        "journal_title_italic": None, "volume_italic": None,
+        "issue_not_italic": None, "book_title_italic": None, "style_notes": []
+    }
+
+    if source_type == "Journal Article":
+        parts = extract_journal_format_parts(reference)
+        journal, volume, issue = parts["journal"], parts["volume"], parts["issue"]
+        js = find_phrase_style(style_spans, journal)
+        if js and js.get("found"):
+            results["journal_title_italic"] = js["italic"]
+            if not js["italic"]:
+                results["style_notes"].append("Journal title should be italic in APA 7.")
+        else:
+            results["style_notes"].append("Journal title formatting could not be located reliably in PDF spans.")
+        vs = find_component_style_after_anchor(style_spans, journal, volume)
+        if vs.get("found"):
+            results["volume_italic"] = vs["italic"]
+            if not vs["italic"]:
+                results["style_notes"].append("Journal volume should be italic in APA 7.")
+        else:
+            results["style_notes"].append("Volume formatting could not be located reliably in PDF spans.")
+        if issue:
+            ins = find_component_style_after_anchor(style_spans, journal, f"({issue})")
+            if ins.get("found"):
+                results["issue_not_italic"] = not ins["italic"]
+                if ins["italic"]:
+                    results["style_notes"].append("Issue number should not be italic in APA 7.")
+            else:
+                results["style_notes"].append("Issue-number formatting could not be located reliably in PDF spans.")
+    elif source_type == "Book":
+        parts = extract_book_format_parts(reference)
+        title = parts.get("title")
+        if title:
+            ts = find_phrase_style(style_spans, title)
+            if ts and ts.get("found"):
+                results["book_title_italic"] = ts["italic"]
+                if not ts["italic"]:
+                    results["style_notes"].append("Book title should be italic in APA 7.")
+            else:
+                results["style_notes"].append("Book-title formatting could not be located reliably in PDF spans.")
+    return results
+
+
+# =========================================================
+# TEXT CLEANING
+# =========================================================
+
+def clean_text(text):
+    text = text.replace("\u00ad", "")
+    text = text.replace("\u2013", "–").replace("\u2014", "—")
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    return text
+
+
+def strip_markdown_markers(text):
+    if not text:
+        return text
+    text = _safe_sub(r"\*\*\*(.+?)\*\*\*", r"\1", text, flags=re.S)
+    text = _safe_sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
+    text = _safe_sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", text, flags=re.S)
+    text = _safe_sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", r"\1", text, flags=re.S)
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    return text
+
+
+# =========================================================
+# REFERENCE SECTION DETECTION
 # =========================================================
 
 REFERENCE_HEADINGS = [
-    "references", "reference", "reference list", "reference section",
-    "literature cited", "literature", "works cited", "works consulted",
-    "bibliography", "bibliographies", "cited references",
-    "daftar pustaka", "daftar rujukan", "daftar bacaan",
-    "rujukan", "rujukan pustaka", "bahan rujukan",
-    "bibliografi", "referensi", "kepustakaan",
-    "sumber rujukan", "sumber pustaka", "sumber referensi",
-    "ref", "refs",
+    "references",
+    "reference",
+    "daftar pustaka",
+    "daftar rujukan",
+    "rujukan",
+    "bibliografi",
+    "bibliography",
+    "referensi",
 ]
 
-
 POST_REFERENCE_HEADINGS = {
-    # Acknowledgments
-    "acknowledgement", "acknowledgements",
-    "acknowledgment", "acknowledgments",
-    "acknowledgement of funding", "acknowledgment of funding",
-    "acknowledgement section", "acknowledgment section",
-    "ucapan terima kasih", "ucapan terimakasih",
-    "ucapan terima kasih dan apresiasi",
-
-    # Author contribution
-    "author contribution", "author contributions",
-    "authors contribution", "authors contributions",
-    "author's contribution", "author's contributions",
-    "authors' contribution", "authors' contributions",
-    "author’s contribution", "author’s contributions",
-    "authors’ contribution", "authors’ contributions",
-    "contribution", "contributions",
-    "credit author statement", "credit authorship contribution statement",
-    "author contribution statement", "authorship statement",
-    "kontribusi penulis", "kontribusi author",
-    "pernyataan kontribusi penulis", "pernyataan kontribusi",
-
-    # Author profile / bios
-    "author profile", "authors profile",
-    "author profiles", "authors profiles",
-    "profile", "profiles",
-    "biography", "biographies",
-    "author biography", "author biographies",
-    "about the authors", "about the author",
-    "author bio", "authors bio",
-    "biodata penulis", "profil penulis",
-
-    # Conflicts
-    "conflict of interest", "conflicts of interest",
-    "conflict of interests", "conflicts of interests",
-    "competing interest", "competing interests",
-    "declaration of competing interest",
-    "declaration of competing interests",
-    "declaration of interest", "declaration of interests",
-    "declarations of interest", "declarations of interests",
-    "declaration", "declarations",
-    "pernyataan konflik kepentingan", "konflik kepentingan",
-    "pernyataan kepentingan",
-
-    # Funding
-    "funding", "funding information", "funding statement",
-    "funding sources", "funding acknowledgements",
-    "financial support", "financial disclosure",
-    "sources of funding", "role of the funding source",
-    "pendanaan", "pernyataan pendanaan",
-    "sumber pendanaan", "sumber dana",
-
-    # Data
-    "data availability", "data availability statement",
-    "availability of data", "availability of data and materials",
-    "data and code availability", "data sharing statement",
-    "code availability", "supplementary data",
-    "ketersediaan data",
-
-    # Ethics
-    "ethical approval", "ethics approval",
-    "ethics statement", "ethical statement",
-    "ethics declarations", "ethical declarations",
-    "informed consent", "consent for publication",
-    "consent to participate", "consent statement",
-    "persetujuan etik", "persetujuan etis",
-    "pernyataan etik", "keterangan etik",
-    "informed consent statement",
-
-    # Disclosures / AI
-    "disclosure", "disclosures", "disclosure statement",
-    "declaration of generative ai",
-    "declaration of generative ai use",
-    "use of ai", "ai use statement",
-    "penggunaan teknologi ai", "pernyataan penggunaan ai",
-    "pernyataan penggunaan teknologi ai",
-
-    # Appendices
-    "appendix", "appendices", "appendix a", "appendix b", "appendix c",
-    "supplementary material", "supplementary materials",
-    "supplemental material", "supplemental materials",
-    "supplementary information", "supporting information",
-    "supporting information file",
-    "lampiran", "lampiran a", "lampiran b",
-
-    # Notes
-    "notes", "note",
-    "author note", "author notes",
-    "endnotes", "endnote",
-    "footnotes", "footnote",
-    "catatan", "catatan kaki",
-
-    # Correspondence
-    "corresponding author", "corresponding author details",
-    "correspondence", "address correspondence to",
-    "reprint requests", "reprints",
-    "orcid",
+    "acknowledgement", "acknowledgements", "acknowledgment", "acknowledgments",
+    "author contribution", "author contributions", "authors contribution",
+    "authors contributions", "authors' contribution", "authors' contributions",
+    "authors’ contribution", "authors’ contributions", "contribution", "contributions",
+    "author profile", "authors profile", "author profiles", "authors profiles",
+    "profile", "profiles", "biography", "biographies", "author biography",
+    "author biographies", "conflict of interest", "conflicts of interest",
+    "conflict of interests", "competing interest", "competing interests",
+    "declaration", "declarations", "declaration of interest", "declaration of interests",
+    "declarations of interest", "funding", "funding information", "funding statement",
+    "data availability", "data availability statement", "availability of data",
+    "ethical approval", "ethics approval", "ethics statement", "ethical statement",
+    "informed consent", "consent for publication", "disclosure", "disclosures",
+    "appendix", "appendices", "supplementary material", "supplementary materials",
+    "supplemental material", "supplemental materials", "notes", "author note", "author notes",
 }
 
 
@@ -181,7 +440,6 @@ def normalize_heading(text):
     text = re.sub(r"^\s*(?:\d+(?:\.\d+)*)[\.\s:-]+", "", text)
     text = re.sub(r"^[\*\#•\-\s]+|[\*\#•\-\s]+$", "", text)
     text = re.sub(r"\s+", " ", text).rstrip(":").strip()
-    text = text.rstrip(".:-—–").strip()
     return text
 
 
@@ -229,473 +487,151 @@ def find_reference_section(text):
 
 
 # =========================================================
-# SAFE REGEX HELPERS
+# APA REFERENCE SPLITTING
 # =========================================================
 
-def _safe_compile(pattern, flags=0):
-    try:
-        return re.compile(pattern, flags)
-    except re.error:
-        return None
+APA_DATE_RE = re.compile(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)", re.I)
 
 
-def _safe_search(pattern, string, flags=0):
-    compiled = _safe_compile(pattern, flags)
-    if compiled is None or string is None:
-        return None
-    try:
-        return compiled.search(string)
-    except Exception:
-        return None
+def contains_apa_date(text):
+    return bool(APA_DATE_RE.search(text or ""))
 
 
-def _safe_sub(pattern, repl, string, flags=0):
-    compiled = _safe_compile(pattern, flags)
-    if compiled is None or string is None:
-        return string if string is not None else ""
-    try:
-        return compiled.sub(repl, string)
-    except Exception:
-        return string
+def is_page_break(line):
+    return bool(re.fullmatch(r"<<<PAGE_BREAK:\d+>>>", line.strip()))
 
 
-def _safe_fullmatch(pattern, string, flags=0):
-    compiled = _safe_compile(pattern, flags)
-    if compiled is None or string is None:
-        return None
-    try:
-        return compiled.fullmatch(string)
-    except Exception:
-        return None
-
-
-def _esc(value):
-    if value is None:
-        return ""
-    return re.escape(str(value))
-
-
-# =========================================================
-# AGGRESSIVE JSON RECOVERY
-# =========================================================
-
-def _safe_json_loads(text):
-    """
-    Aggressive JSON recovery for AI responses.
-    Handles: markdown fences, leading/trailing prose, concatenated objects,
-    trailing commas, unescaped control chars, BOM.
-    """
-    if text is None:
-        raise ValueError("Empty AI response (None).")
-
-    text = str(text)
-
-    if text.startswith("\ufeff"):
-        text = text[1:]
-
-    # Strip markdown fences anywhere
-    text = re.sub(r"```(?:json)?", "", text, flags=re.I)
-
-    # Trim to first { and last }
-    first = text.find("{")
-    last = text.rfind("}")
-    if first >= 0 and last > first:
-        text = text[first:last + 1]
-
-    text = text.strip()
-
-    # 1. Straight parse
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # 2. Remove control chars
-    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # 3. Fix trailing commas
-    repaired = re.sub(r",(\s*[}\]])", r"\1", cleaned)
-    try:
-        return json.loads(repaired)
-    except json.JSONDecodeError:
-        pass
-
-    # 4. Brace-counting extraction
-    depth = 0
-    start = None
-    in_string = False
-    escape = False
-    for i, ch in enumerate(cleaned):
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
+def split_references(reference_text):
+    raw_lines = reference_text.splitlines()
+    lines = []
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line:
             continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            if start is None:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                candidate = cleaned[start:i + 1]
-                for repair_fn in (
-                    lambda s: s,
-                    lambda s: re.sub(r",(\s*[}\]])", r"\1", s),
-                    lambda s: re.sub(r"[\x00-\x1f]", " ", s),
-                ):
-                    try:
-                        return json.loads(repair_fn(candidate))
-                    except json.JSONDecodeError:
-                        continue
-                start = None
-                depth = 0
+        if is_page_break(line):
+            lines.append(line); continue
+        line = line.replace("\u00ad", "")
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
 
-    preview = text[:500].replace("\n", "\\n")
-    raise ValueError(
-        f"Could not parse JSON from AI response. "
-        f"Length={len(text)}. First 500 chars: {preview!r}"
-    )
+    references, current = [], []
+    current_has_year = False
+
+    def save_current():
+        nonlocal current, current_has_year
+        if not current:
+            return
+        reference = re.sub(r"\s+", " ", " ".join(current)).strip()
+        reference = re.sub(r"<<<PAGE_BREAK:\d+>>>", " ", reference).strip()
+        if reference:
+            references.append(reference)
+        current = []; current_has_year = False
+
+    def starts_personal_author(line):
+        return bool(re.match(
+            r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+\s*,\s*(?:[A-Z](?:\.-?[A-Z])?\.\s*)+", line))
+
+    def starts_corporate_author(line):
+        return bool(re.match(
+            r"^[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ0-9&'’\-\s]+?\.\s*\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)",
+            line, re.I))
+
+    def previous_ends_author_connector():
+        if not current:
+            return False
+        previous = current[-1].strip()
+        return bool(re.search(r"(?:&|,\s*&|,)\s*$", previous)) and not contains_apa_date(" ".join(current))
+
+    def looks_reference_complete(text):
+        if not contains_apa_date(text):
+            return False
+        tail = text.rstrip()
+        if re.search(r"(?:&|,\s*&|,)\s*$", tail):
+            return False
+        score = 0
+        if re.search(r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/\S+\.?$", text, re.I):
+            score += 4
+        elif re.search(r"https?://\S+\.?$", text, re.I):
+            score += 3
+        if re.search(r"\b\d+\s*\([^)]*\)\s*,\s*(?:\d+\s*[–-]\s*\d+|e\d+|article\s+\w+)\.?$", text, re.I):
+            score += 3
+        elif re.search(r"\b\d+\s*[–-]\s*\d+\.?$", text):
+            score += 2
+        if re.search(r"\b(?:press|publishing|publisher|university press)\.?$", text, re.I):
+            score += 2
+        if re.search(r"[.!?]$", text):
+            score += 1
+        m = APA_DATE_RE.search(text)
+        if m and len(text[m.end():].strip()) >= 45:
+            score += 1
+        return score >= 2
+
+    for line in lines:
+        if is_page_break(line):
+            continue
+        line_has_year = contains_apa_date(line)
+        if not current:
+            current = [line]; current_has_year = line_has_year; continue
+        if previous_ends_author_connector():
+            current.append(line); current_has_year = current_has_year or line_has_year; continue
+        if not current_has_year:
+            current.append(line); current_has_year = current_has_year or line_has_year; continue
+        if starts_personal_author(line) or starts_corporate_author(line):
+            if looks_reference_complete(re.sub(r"\s+", " ", " ".join(current)).strip()):
+                save_current()
+                current = [line]; current_has_year = line_has_year
+            else:
+                current.append(line); current_has_year = True
+            continue
+        current.append(line); current_has_year = True
+
+    save_current()
+    return references
 
 
 # =========================================================
-# PDF EXTRACTION
+# BASIC APA REFERENCE PARSER
 # =========================================================
 
-def extract_pdf_text(uploaded_file):
-    pdf_bytes = uploaded_file.read()
-    document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    for page_number, page in enumerate(document, start=1):
-        text = page.get_text("text")
-        pages.append({"page": page_number, "text": text})
-    document.close()
-    full_text = "\n".join(
-        f"<<<PAGE_BREAK:{p['page']}>>>\n{p['text']}" for p in pages
+def normalize_doi_or_url(value):
+    if not value:
+        return value
+
+    text = str(value).strip()
+
+    m = re.match(r'^https?://(?:dx\.)?doi\.org(https?://.+)$', text, re.I)
+    if m:
+        return m.group(1).rstrip(".,;)")
+
+    text = re.sub(
+        r'(?i)^https?://(?:dx\.)?doi\.org/'
+        r'(?:https?://(?:dx\.)?doi\.org/)+',
+        'https://doi.org/',
+        text
     )
-    uploaded_file.seek(0)
-    return full_text, pages
 
+    doi_match = re.search(r'10\.\d{4,9}/[-._;()/:A-Za-z0-9]+', text, re.I)
+    if doi_match:
+        doi = doi_match.group(0).rstrip(".,;)")
+        doi = re.sub(r'^(10\.\d{4,9})/{2,}', r'\1/', doi)
+        return f"https://doi.org/{doi}"
 
-def strip_markdown_markers(text):
-    if not text:
-        return text
-    text = _safe_sub(r"\*\*\*(.+?)\*\*\*", r"\1", text, flags=re.S)
-    text = _safe_sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
-    text = _safe_sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", text, flags=re.S)
-    text = _safe_sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", r"\1", text, flags=re.S)
-    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    url_match = re.search(r'https?://\S+', text, re.I)
+    if url_match:
+        return url_match.group(0).rstrip(".,;)")
+
     return text
 
-
-def clean_text(text):
-    text = text.replace("\u00ad", "")
-    text = text.replace("\u2013", "–").replace("\u2014", "—")
-    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
-    return text
-
-
-# =========================================================
-# OPENAI CLIENT
-# =========================================================
-
-def _get_openai_client():
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return None
-    try:
-        from openai import OpenAI
-        return OpenAI(api_key=api_key)
-    except Exception:
-        return None
-
-
-def _openai_model():
-    return os.getenv("OPENAI_MODEL", "gpt-4o")
-
-
-def _cache_path(namespace, key_payload):
-    key = hashlib.sha256(
-        f"{namespace}||{key_payload}".encode("utf-8")
-    ).hexdigest()
-    return os.path.join(CACHE_DIR, f"{key}.json")
-
-
-def _cache_get(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _cache_set(path, value):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(value, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def _clear_cache():
-    try:
-        shutil.rmtree(CACHE_DIR, ignore_errors=True)
-        os.makedirs(CACHE_DIR, exist_ok=True)
-    except Exception:
-        pass
-
-
-def _debug_dump(label, content):
-    """Write raw AI output to disk for debugging."""
-    try:
-        with open(DEBUG_DUMP_PATH, "a", encoding="utf-8") as f:
-            f.write(f"\n\n===== {label} @ {datetime.now().isoformat()} =====\n")
-            f.write(content or "<empty>")
-        print(f"[DEBUG] Wrote {label} to {DEBUG_DUMP_PATH} "
-              f"({len(content or '')} chars)")
-    except Exception as exc:
-        print(f"[DEBUG] Could not write dump: {exc}")
-
-
-# =========================================================
-# STAGE 1 — AI EXTRACTION
-# =========================================================
-
-# ── Single-call prompt (short PDFs)
-EXTRACTION_PROMPT = """You are analyzing the full text of an academic manuscript.
-
-TASK
-Extract:
-  (A) Every entry in the REFERENCE LIST (Daftar Rujukan / References / Bibliography).
-  (B) Every IN-TEXT CITATION in the body (parenthetical and narrative).
-
-REFERENCE LIST RULES
-- One entry = one bibliographic reference.
-- Preserve the original text of each reference EXACTLY (typos included).
-- If a reference spans multiple lines, join it into one string.
-- Do NOT merge two references. Do NOT split one reference.
-- Do NOT invent references. Do NOT include headings.
-- Skip acknowledgments, author bios, funding statements.
-- Two references by the SAME author in the SAME year are TWO separate entries.
-- If you cannot tell whether something is a reference, put it in "uncertain".
-
-IN-TEXT CITATION RULES
-- Include both parenthetical "(Author, 2020)" and narrative "Author (2020)".
-- Do NOT include citations inside the reference list itself.
-- Preserve the exact text of each citation.
-- Multiple sources inside one parenthetical are ONE citation string.
-- Report "type" as "parenthetical" or "narrative".
-
-OUTPUT FORMAT (JSON only, no markdown, no indentation)
-{"references": ["...", "..."], "citations": [{"raw": "...", "type": "parenthetical"}], "uncertain": []}
-
-FULL MANUSCRIPT TEXT
-====================
-{manuscript_text}
-====================
-"""
-
-
-# ── Split prompts (long PDFs, called twice)
-EXTRACTION_PROMPT_REFS = """You are extracting the REFERENCE LIST ONLY.
-
-RULES
-- Output every reference entry as a single string.
-- Preserve original text exactly (typos included).
-- Join multi-line references into one string.
-- Do NOT merge two references, do NOT split one reference.
-- Do NOT include headings, acknowledgments, funding, author bios.
-- Do NOT include in-text citations.
-- Do NOT invent entries.
-
-OUTPUT (JSON only, no markdown)
-{"references": ["...", "..."]}
-
-FULL MANUSCRIPT TEXT
-====================
-{manuscript_text}
-====================
-"""
-
-
-EXTRACTION_PROMPT_CITS = """You are extracting IN-TEXT CITATIONS ONLY.
-
-RULES
-- Include parenthetical "(Author, 2020)" and narrative "Author (2020)".
-- Exclude anything inside the reference list itself.
-- Preserve exact text of each citation.
-- Multiple sources inside one pair of parentheses = ONE citation string.
-
-OUTPUT (JSON only, no markdown)
-{"citations": [{"raw": "...", "type": "parenthetical"}, {"raw": "...", "type": "narrative"}]}
-
-FULL MANUSCRIPT TEXT
-====================
-{manuscript_text}
-====================
-"""
-
-
-def _call_openai_for_json(prompt, label="extraction"):
-    """Single OpenAI call → parsed JSON dict, or {"error": "..."}."""
-    client = _get_openai_client()
-    if client is None:
-        return {"error": "OpenAI client unavailable (missing key)."}
-
-    try:
-        response = client.chat.completions.create(
-            model=_openai_model(),
-            messages=[
-                {"role": "system",
-                 "content": "Return compact JSON only. No markdown."},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-            seed=42,
-            max_tokens=EXTRACTION_MAX_TOKENS,
-        )
-        raw_content = response.choices[0].message.content
-    except Exception as exc:
-        return {"error": f"API call failed: {exc}"}
-
-    # Dump for debugging
-    _debug_dump(label, raw_content)
-
-    try:
-        data = _safe_json_loads(raw_content)
-    except ValueError as exc:
-        preview = (raw_content or "")[:200].replace("\n", "\\n")
-        return {
-            "error": (
-                f"AI returned non-JSON output for {label}. "
-                f"Preview: {preview!r} | parse error: {exc}"
-            )
-        }
-
-    if not isinstance(data, dict):
-        return {"error": f"AI returned JSON but not an object ({label})."}
-
-    return data
-
-
-def _extract_split(manuscript_text):
-    """Two smaller calls for long PDFs."""
-    refs_resp = _call_openai_for_json(
-        EXTRACTION_PROMPT_REFS.format(manuscript_text=manuscript_text),
-        label="references",
-    )
-    if "error" in refs_resp:
-        return {"error": f"Reference extraction failed: {refs_resp['error']}"}
-
-    cits_resp = _call_openai_for_json(
-        EXTRACTION_PROMPT_CITS.format(manuscript_text=manuscript_text),
-        label="citations",
-    )
-    if "error" in cits_resp:
-        return {"error": f"Citation extraction failed: {cits_resp['error']}"}
-
-    references = [
-        r.strip() for r in refs_resp.get("references", [])
-        if isinstance(r, str) and r.strip() and len(r) > 15
-    ]
-
-    citations = []
-    for c in cits_resp.get("citations", []) or []:
-        if not isinstance(c, dict):
-            continue
-        raw = (c.get("raw") or "").strip()
-        ctype = (c.get("type") or "").lower().strip()
-        if not raw:
-            continue
-        if ctype not in ("parenthetical", "narrative"):
-            ctype = "parenthetical" if raw.startswith("(") else "narrative"
-        citations.append({"raw": raw, "type": ctype})
-
-    return {"references": references, "citations": citations, "uncertain": []}
-
-
-def _extract_with_ai(manuscript_text):
-    """
-    Stage 1: AI extracts references + in-text citations.
-    Uses split calls for long PDFs, single call for short ones.
-    Cached by content hash. Returns dict or {"error": "..."} on failure.
-    """
-    client = _get_openai_client()
-    if client is None:
-        return {"error": "OpenAI client unavailable (missing key)."}
-
-    model = _openai_model()
-    cache_key = f"{model}::{len(manuscript_text)}::{manuscript_text[:2000]}"
-    path = _cache_path("extract", cache_key)
-
-    cached = _cache_get(path)
-    if cached and isinstance(cached, dict) and "references" in cached:
-        return cached
-
-    # ── Long PDF → two calls
-    if len(manuscript_text) > SPLIT_EXTRACTION_THRESHOLD:
-        result = _extract_split(manuscript_text)
-        if "error" not in result and result.get("references"):
-            _cache_set(path, result)
-        return result
-
-    # ── Short PDF → single call
-    prompt = EXTRACTION_PROMPT.format(manuscript_text=manuscript_text)
-    data = _call_openai_for_json(prompt, label="extraction")
-    if "error" in data:
-        return data
-
-    references = data.get("references", []) or []
-    citations  = data.get("citations", []) or []
-
-    references = [r.strip() for r in references
-                  if isinstance(r, str) and r.strip()]
-    references = [r for r in references if len(r) > 15]
-
-    cleaned_citations = []
-    for c in citations:
-        if not isinstance(c, dict):
-            continue
-        raw = (c.get("raw") or "").strip()
-        ctype = (c.get("type") or "").strip().lower()
-        if not raw:
-            continue
-        if ctype not in ("parenthetical", "narrative"):
-            ctype = "parenthetical" if raw.startswith("(") else "narrative"
-        cleaned_citations.append({"raw": raw, "type": ctype})
-
-    result = {
-        "references": references,
-        "citations": cleaned_citations,
-        "uncertain": data.get("uncertain", []) or [],
-    }
-
-    if references or cleaned_citations:
-        _cache_set(path, result)
-
-    return result
-
-
-# =========================================================
-# PARSING HELPERS
-# =========================================================
 
 def parse_reference(reference):
     result = {
-        "raw": reference, "year": None, "first_author": None,
-        "authors": [], "doi": None, "url": None,
+        "raw": reference,
+        "year": None,
+        "first_author": None,
+        "authors": [],
+        "doi": None,
+        "url": None
     }
 
     year_match = re.search(r"\(((?:19|20)\d{2})[a-z]?\)", reference)
@@ -713,8 +649,9 @@ def parse_reference(reference):
         r"(?:^|,\s*)&?\s*"
         r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
         r"\s*,\s*(?:[A-Z]\.\s*)+",
-        author_block,
+        author_block
     )
+
     if author_matches:
         result["authors"] = author_matches
         result["first_author"] = author_matches[0]
@@ -726,68 +663,292 @@ def parse_reference(reference):
 
     url_match = re.search(r"https?://\S+", reference, re.I)
     if url_match:
-        url = url_match.group(0).rstrip(".,)")
-        if re.match(r"^https?://(?:dx\.)?doi\.org/", url, re.I):
-            result["doi"] = normalize_doi_or_url(url)
-            result["url"] = result["doi"]
+        original_url = url_match.group(0).rstrip(".,)")
+        normalized_url = normalize_doi_or_url(original_url)
+        if normalized_url and re.match(r"^https://doi\.org/10\.\d{4,9}/", normalized_url, re.I):
+            result["doi"] = normalized_url
+            result["url"] = normalized_url
         else:
-            result["url"] = url
+            result["url"] = normalized_url
     else:
-        doi_match = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+",
-                              reference, re.I)
+        doi_match = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", reference, re.I)
         if doi_match:
-            result["doi"] = normalize_doi_or_url(doi_match.group(0))
-            result["url"] = result["doi"]
+            normalized_url = normalize_doi_or_url(doi_match.group(0))
+            result["doi"] = normalized_url
+            result["url"] = normalized_url
 
     return result
 
 
-def normalize_doi_or_url(value):
-    if not value:
-        return value
-    text = str(value).strip()
-    m = re.match(r'^https?://(?:dx\.)?doi\.org(https?://.+)$', text, re.I)
-    if m:
-        return m.group(1).rstrip(".,;)")
-    text = re.sub(
-        r'(?i)^https?://(?:dx\.)?doi\.org/'
-        r'(?:https?://(?:dx\.)?doi\.org/)+',
-        'https://doi.org/', text,
-    )
-    doi_match = re.search(r'10\.\d{4,9}/[-._;()/:A-Za-z0-9]+', text, re.I)
-    if doi_match:
-        doi = doi_match.group(0).rstrip(".,;)")
-        return f"https://doi.org/{doi}"
-    url_match = re.search(r'https?://\S+', text, re.I)
-    if url_match:
-        return url_match.group(0).rstrip(".,;)")
-    return text
+def build_apa_disambiguation_map(parsed_references):
+    groups = {}
+
+    for ref in parsed_references:
+        authors = ref.get("authors") or []
+        year = ref.get("year")
+        if len(authors) < 3 or not year:
+            continue
+        key = (normalize(authors[0]), str(year))
+        groups.setdefault(key, []).append(authors)
+
+    ambiguous = {}
+    for key, author_lists in groups.items():
+        unique = []
+        for authors in author_lists:
+            normalized_authors = tuple(normalize(a) for a in authors)
+            if normalized_authors not in [
+                tuple(normalize(a) for a in x)
+                for x in unique
+            ]:
+                unique.append(authors)
+        if len(unique) > 1:
+            ambiguous[key] = unique
+
+    return ambiguous
 
 
-def parse_citation(citation):
+def get_disambiguated_author_form(authors, year, disambiguation_map):
+    if not authors:
+        return None
+    if len(authors) < 3:
+        return None
+
+    key = (normalize(authors[0]), str(year))
+    competing_lists = disambiguation_map.get(key, [])
+
+    if len(competing_lists) <= 1:
+        return f"{authors[0]} et al."
+
+    target = [normalize(a) for a in authors]
+    others = []
+    for other in competing_lists:
+        other_norm = [normalize(a) for a in other]
+        if other_norm != target:
+            others.append(other_norm)
+
+    if not others:
+        return f"{authors[0]} et al."
+
+    for keep_count in range(2, len(authors) + 1):
+        target_prefix = target[:keep_count]
+        still_ambiguous = False
+        for other in others:
+            if other[:keep_count] == target_prefix:
+                still_ambiguous = True
+                break
+        if not still_ambiguous:
+            displayed = authors[:keep_count]
+            if keep_count < len(authors):
+                return ", ".join(displayed) + ", et al."
+            return ", ".join(displayed)
+
+    return ", ".join(authors)
+
+
+def is_apa_disambiguated_citation(citation, disambiguation_map):
     raw = citation.get("raw", "")
-    ctype = citation.get("type", "parenthetical")
+    year = citation.get("year")
+    first_author = citation.get("author")
 
-    year_match = re.search(r"\b((?:19|20)\d{2})[a-z]?\b", raw)
-    year = year_match.group(1) if year_match else None
+    if not raw or not year or not first_author:
+        return False
 
-    inner = raw
-    if ctype == "parenthetical":
-        inner = re.sub(r"^\(|\)$", "", raw).strip()
+    key = (normalize(first_author), str(year))
+    competing_lists = disambiguation_map.get(key, [])
 
-    author = None
-    if ctype == "parenthetical":
-        first = inner.split(";")[0].strip()
-        m = re.match(r"^([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)", first)
-        if m:
-            author = m.group(1)
-    else:
-        m = re.match(r"^([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)", raw)
-        if m:
-            author = m.group(1)
+    if len(competing_lists) <= 1:
+        return False
 
-    return {"raw": raw, "type": ctype, "author": author, "year": year}
+    raw_normalized = normalize(raw)
 
+    for authors in competing_lists:
+        correct_form = get_disambiguated_author_form(authors, year, disambiguation_map)
+        if not correct_form:
+            continue
+        expected = normalize(correct_form)
+        if expected and expected in raw_normalized:
+            return True
+
+    return False
+
+
+# =========================================================
+# APA IN-TEXT CITATION EXTRACTION
+# =========================================================
+
+def extract_parenthetical_citations(text):
+    citations = []
+    year_pattern = re.compile(r"\b(?:19|20)\d{2}[a-z]?\b")
+    for content in re.findall(r"\(([^()]+)\)", text):
+        if not year_pattern.search(content):
+            continue
+        for part in content.split(";"):
+            ym = year_pattern.search(part)
+            if not ym:
+                continue
+            year = ym.group(0)[:4]
+            author_part = part[:ym.start()].strip(" ,")
+            et_al = bool(re.search(r"\bet\s+al\.", author_part, re.I))
+            author_part_clean = re.sub(r"\bet\s+al\.", "", author_part, flags=re.I).strip()
+            authors = re.findall(
+                r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\b",
+                author_part_clean
+            )
+            authors = [a for a in authors if a.lower() not in {"and", "according", "see", "cf"}]
+            if not authors:
+                continue
+            citations.append({
+                "author": authors[0],
+                "authors": authors,
+                "year": year,
+                "type": "parenthetical",
+                "et_al": et_al,
+                "raw": f"({part.strip()})",
+                "parenthetical_content": content.strip(),
+            })
+    return citations
+
+
+def _inside_parentheses(text, pos):
+    """Return True if character index `pos` sits inside a ( … ) span."""
+    depth = 0
+    for i in range(pos):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+    return depth > 0
+
+
+def extract_narrative_citations(text):
+    citations = []
+    occupied = []
+
+    # ── Pattern A — "Author, Author et al. (2024)" ──────────────────
+    for m in re.finditer(
+        r"\b("
+        r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
+        r"(?:\s*,\s*[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)+"
+        r")"
+        r"\s*,?\s*et\s+al\.\s*"
+        r"\(((?:19|20)\d{2})[a-z]?\)",
+        text
+    ):
+        author_text = m.group(1)
+        authors = [a.strip() for a in author_text.split(",") if a.strip()]
+        if not authors:
+            continue
+        citations.append({
+            "author": authors[0], "authors": authors,
+            "year": m.group(2), "type": "narrative",
+            "et_al": True, "raw": m.group(0),
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ── Pattern B — "Author et al. (2024)" ─────────────────────────
+    for m in re.finditer(
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s+et\s+al\.\s*"
+        r"\(((?:19|20)\d{2})[a-z]?\)",
+        text
+    ):
+        if any(m.start() >= s and m.end() <= e for s, e in occupied):
+            continue
+        citations.append({
+            "author": m.group(1), "authors": [m.group(1)],
+            "year": m.group(2), "type": "narrative",
+            "et_al": True, "raw": m.group(0),
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ── Pattern C — "Author (2024)" ────────────────────────────────
+    for m in re.finditer(
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s+"
+        r"\(((?:19|20)\d{2})[a-z]?\)",
+        text
+    ):
+        if any(m.start() >= s and m.end() <= e for s, e in occupied):
+            continue
+        citations.append({
+            "author": m.group(1), "authors": [m.group(1)],
+            "year": m.group(2), "type": "narrative",
+            "et_al": False, "raw": m.group(0),
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ── Pattern D — "Author et al., 2024"  (MALFORMED: year not in parens)
+    for m in re.finditer(
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+        r"\s+et\s+al\.\s*,\s*"
+        r"((?:19|20)\d{2})[a-z]?\b",
+        text
+    ):
+        if any(m.start() >= s and m.end() <= e for s, e in occupied):
+            continue
+        if _inside_parentheses(text, m.start()):
+            continue
+        citations.append({
+            "author": m.group(1), "authors": [m.group(1)],
+            "year": m.group(2), "type": "narrative",
+            "et_al": True, "raw": m.group(0),
+            "malformed": True,
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ── Pattern E — "Author and Author, 2024" / "Author & Author, 2024"
+    for m in re.finditer(
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+        r"\s+(?:and|&)\s+"
+        r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*"
+        r"((?:19|20)\d{2})[a-z]?\b",
+        text
+    ):
+        if any(m.start() >= s and m.end() <= e for s, e in occupied):
+            continue
+        if _inside_parentheses(text, m.start()):
+            continue
+        citations.append({
+            "author": m.group(1),
+            "authors": [m.group(1), m.group(2)],
+            "year": m.group(3), "type": "narrative",
+            "et_al": False, "raw": m.group(0),
+            "malformed": True,
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ── Pattern F — "Author, 2024"  (single-author malformed) ──────
+    # Only used when the surname is capitalised and NOT preceded by a comma
+    # (so "In Smith, 2024, ..." and reference-list-style lines don't match).
+    for m in re.finditer(
+        r"(?<![,\.])\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*"
+        r"((?:19|20)\d{2})[a-z]?\b",
+        text
+    ):
+        if any(m.start() >= s and m.end() <= e for s, e in occupied):
+            continue
+        if _inside_parentheses(text, m.start()):
+            continue
+        # Skip if preceded by a comma (looks like part of an author list)
+        if m.start() > 0 and text[m.start() - 1] == ",":
+            continue
+        citations.append({
+            "author": m.group(1), "authors": [m.group(1)],
+            "year": m.group(2), "type": "narrative",
+            "et_al": False, "raw": m.group(0),
+            "malformed": True,
+        })
+        occupied.append((m.start(), m.end()))
+
+    return citations
+
+
+def extract_all_citations(text):
+    return extract_parenthetical_citations(text) + extract_narrative_citations(text)
+
+
+# =========================================================
+# STATISTICS / CHECKERS
+# =========================================================
 
 def calculate_citation_statistics(citations):
     narrative = sum(1 for c in citations if c.get("type") == "narrative")
@@ -796,8 +957,27 @@ def calculate_citation_statistics(citations):
     return {
         "total": total, "narrative": narrative, "parenthetical": parenthetical,
         "narrative_percentage": (narrative / total * 100 if total else 0),
-        "parenthetical_percentage": (parenthetical / total * 100 if total else 0),
+        "parenthetical_percentage": (parenthetical / total * 100 if total else 0)
     }
+
+
+def check_apa_intext_citation(citation):
+    issues = []
+    raw = citation.get("raw", "")
+    ctype = citation.get("type")
+    authors = citation.get("authors", [])
+    et_al = citation.get("et_al", False)
+    if ctype == "parenthetical":
+        if len(authors) == 2 and not et_al and "&" not in raw:
+            issues.append("Two-author parenthetical citation should use '&'.")
+        if len(authors) >= 3 and not et_al:
+            issues.append("APA 7 uses 'et al.' for in-text citations with three or more authors.")
+    elif ctype == "narrative":
+        if len(authors) == 2 and not et_al and not re.search(r"\band\b", raw, re.I):
+            issues.append("Two-author narrative citation should use 'and', not '&'.")
+        if len(authors) >= 3 and not et_al:
+            issues.append("APA 7 uses 'et al.' for in-text citations with three or more authors.")
+    return ("Pass" if not issues else "Needs review", issues)
 
 
 def normalize(value):
@@ -808,30 +988,95 @@ def normalize(value):
 
 def match_citations_to_references(citations, parsed_references):
     results = []
-    keys = {(normalize(c.get("author")), c.get("year")) for c in citations}
+    keys = {(normalize(c["author"]), c["year"]) for c in citations}
     for i, ref in enumerate(parsed_references, start=1):
         key = (normalize(ref["first_author"]), ref["year"])
         results.append({
-            "Reference #": i, "Author": ref["first_author"],
-            "Year": ref["year"], "Cited": key in keys, "Reference": ref["raw"],
+            "Reference #": i, "Author": ref["first_author"], "Year": ref["year"],
+            "Cited": key in keys, "Reference": ref["raw"]
         })
     return results
 
 
 def find_missing_references(citations, parsed_references):
-    ref_keys = {(normalize(r["first_author"]), r["year"])
-                for r in parsed_references}
+    ref_keys = {(normalize(r["first_author"]), r["year"]) for r in parsed_references}
     missing, seen = [], set()
     for c in citations:
-        key = (normalize(c.get("author")), c.get("year"))
-        if key not in ref_keys and key not in seen and c.get("author"):
-            missing.append({
-                "Citation": c.get("raw"),
-                "Author": c.get("author"),
-                "Year": c.get("year"),
-            })
+        key = (normalize(c["author"]), c["year"])
+        if key not in ref_keys and key not in seen:
+            missing.append({"Citation": c["raw"], "Author": c["author"], "Year": c["year"]})
             seen.add(key)
     return missing
+
+
+def detect_duplicates(parsed_references):
+    duplicates = []
+    for doi, count in Counter(normalize(r["doi"]) for r in parsed_references if r["doi"]).items():
+        if count > 1:
+            duplicates.append({"Type": "DOI", "Value": doi, "Count": count})
+    return duplicates
+
+
+def check_apa_reference(reference, style_spans=None):
+    issues, warnings = [], []
+    ref = reference.strip()
+    source_type = detect_apa_source_type(ref)
+
+    year_match = re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)", ref, re.I)
+    if not year_match:
+        issues.append("Missing or incorrectly formatted APA publication date.")
+        author_section = ""
+    else:
+        author_section = ref[:year_match.start()].strip()
+        if not author_section:
+            issues.append("Author or group author is missing.")
+        if not re.match(r"\s*\.", ref[year_match.end():]):
+            issues.append("Publication date should normally be followed by a period.")
+
+    personal_authors = re.findall(
+        r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z](?:\.-?[A-Z])?\.\s*)+",
+        author_section
+    )
+    if len(personal_authors) >= 2 and "&" not in author_section:
+        issues.append("Multiple-author reference should use '&' before the final author.")
+    if re.search(r"\band\b", author_section, re.I):
+        issues.append("APA reference lists use '&', not 'and', before the final author.")
+
+    if re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", ref, re.I):
+        if not re.search(r"https://doi\.org/10\.\d{4,9}/", ref, re.I):
+            issues.append("DOI should use the https://doi.org/... format.")
+        if re.search(r"\bdoi\s*:", ref, re.I):
+            issues.append("Do not use the old 'doi:' prefix; use https://doi.org/...")
+
+    if len([w for w in ref.split() if len(w) > 3 and w.isupper()]) >= 4:
+        warnings.append("Possible incorrect capitalization; APA article/book titles normally use sentence case.")
+
+    italic_results = {
+        "journal_title_italic": None, "volume_italic": None,
+        "issue_not_italic": None, "book_title_italic": None, "style_notes": []
+    }
+    if style_spans is not None:
+        italic_results = check_reference_italics(ref, style_spans, source_type)
+        if italic_results["journal_title_italic"] is False:
+            issues.append("Journal title is not italic in the PDF.")
+        if italic_results["volume_italic"] is False:
+            issues.append("Journal volume is not italic in the PDF.")
+        if italic_results["issue_not_italic"] is False:
+            issues.append("Journal issue number appears italic; APA 7 normally keeps the issue number non-italic.")
+        if italic_results.get("book_title_italic") is False:
+            issues.append("Book title is not italic in the PDF.")
+        for note in italic_results["style_notes"]:
+            if "could not be located" in note or "not applied" in note:
+                warnings.append(note)
+
+    if issues:
+        status = "Fail"
+    elif warnings:
+        status = "Review"
+    else:
+        status = "Pass"
+    italic_results["source_type"] = source_type
+    return status, issues, warnings, italic_results
 
 
 def extract_reference_year(reference):
@@ -858,27 +1103,22 @@ def calculate_reference_recency(references, manuscript_year):
         else:
             category = "Older than 10 years"; older += 1
             year_counts[year] = year_counts.get(year, 0) + 1
-        rows.append({
-            "Reference #": i,
-            "Year": year if year is not None else "Not detected",
-            "Recency": category,
-            "Reference": ref,
-        })
+        rows.append({"Reference #": i, "Year": year if year is not None else "Not detected",
+                     "Recency": category, "Reference": ref})
     total = len(references)
     return {
         "start_year": start_year, "end_year": manuscript_year, "total": total,
-        "recent_count": recent, "older_count": older,
-        "unknown_count": unknown, "future_count": future,
+        "recent_count": recent, "older_count": older, "unknown_count": unknown,
+        "future_count": future,
         "recent_percentage": recent / total * 100 if total else 0,
         "rows": rows,
         "year_summary": [{"Year": y, "References": c} for y, c in
-                         sorted(year_counts.items(), key=lambda x: x[0],
-                                reverse=True)],
+                         sorted(year_counts.items(), key=lambda x: x[0], reverse=True)],
     }
 
 
 # =========================================================
-# STAGE 2 — OPENALEX VERIFICATION
+# CANONICAL SOURCE TYPES
 # =========================================================
 
 CANONICAL_SOURCE_TYPES = [
@@ -927,6 +1167,10 @@ def normalize_source_type(value):
     return "Other"
 
 
+# =========================================================
+# OPENALEX DOI VERIFICATION
+# =========================================================
+
 def _normalize_doi_for_lookup(doi):
     if not doi:
         return ""
@@ -945,12 +1189,15 @@ def _fetch_openalex_metadata(doi):
         import requests
     except Exception:
         return None
+
     api_key = _get_openalex_api_key()
     if not api_key:
         return None
+
     clean = _normalize_doi_for_lookup(doi)
     if not clean:
         return None
+
     url = f"https://api.openalex.org/works/doi:{clean}"
     try:
         r = requests.get(url, params={"api_key": api_key}, timeout=10)
@@ -962,106 +1209,15 @@ def _fetch_openalex_metadata(doi):
     except Exception:
         return None
 
+    title = data.get("title") or ""
+    year = data.get("publication_year")
     authors = []
     for a in data.get("authorships", []) or []:
         name = (a.get("author") or {}).get("display_name")
         if name:
             authors.append(name)
 
-    primary = data.get("primary_location") or {}
-    source = primary.get("source") or {}
-    biblio = data.get("biblio") or {}
-
-    return {
-        "_not_found": False,
-        "title": data.get("title") or "",
-        "year": data.get("publication_year"),
-        "authors": authors,
-        "doi": data.get("doi") or f"https://doi.org/{clean}",
-        "journal": source.get("display_name"),
-        "source_type": source.get("type"),
-        "volume": biblio.get("volume"),
-        "issue": biblio.get("issue"),
-        "first_page": biblio.get("first_page"),
-        "last_page": biblio.get("last_page"),
-        "publisher": source.get("host_organization_name"),
-        "is_oa": data.get("open_access", {}).get("is_oa"),
-    }
-
-
-def _openalex_result_to_meta(item):
-    if not item:
-        return None
-    authors = []
-    for a in item.get("authorships", []) or []:
-        name = (a.get("author") or {}).get("display_name")
-        if name:
-            authors.append(name)
-    primary = item.get("primary_location") or {}
-    source = primary.get("source") or {}
-    biblio = item.get("biblio") or {}
-    return {
-        "_not_found": False,
-        "title": item.get("title") or "",
-        "year": item.get("publication_year"),
-        "authors": authors,
-        "doi": item.get("doi") or "",
-        "journal": source.get("display_name"),
-        "source_type": source.get("type"),
-        "volume": biblio.get("volume"),
-        "issue": biblio.get("issue"),
-        "first_page": biblio.get("first_page"),
-        "last_page": biblio.get("last_page"),
-        "publisher": source.get("host_organization_name"),
-        "is_oa": item.get("open_access", {}).get("is_oa"),
-    }
-
-
-def _verify_doi_resolution(doi):
-    if not doi:
-        return {"resolves": None, "reason": "No DOI supplied"}
-    try:
-        import requests
-    except Exception:
-        return {"resolves": None, "reason": "requests missing"}
-    clean = _normalize_doi_for_lookup(doi)
-    if not clean:
-        return {"resolves": None, "reason": "DOI not parseable"}
-    url = f"{DOI_RESOLVER_URL}/{clean}"
-    headers = {"User-Agent": "OmniCite/3.0"}
-    try:
-        r = requests.get(url, headers=headers, allow_redirects=True,
-                         timeout=DOI_RESOLVER_TIMEOUT)
-    except Exception as exc:
-        return {"resolves": None, "reason": f"resolver unavailable: {exc}"}
-    if 200 <= r.status_code < 400:
-        return {"resolves": True, "reason": "DOI resolves", "final_url": r.url}
-    if r.status_code in (404, 410):
-        return {"resolves": False, "reason": f"HTTP {r.status_code}"}
-    return {"resolves": None, "reason": f"Inconclusive HTTP {r.status_code}"}
-
-
-def _openalex_search_by_title(title, max_results=5):
-    if not title:
-        return []
-    try:
-        import requests
-    except Exception:
-        return []
-    api_key = _get_openalex_api_key()
-    if not api_key:
-        return []
-    try:
-        r = requests.get(
-            "https://api.openalex.org/works",
-            params={"search": title, "per-page": max_results, "api_key": api_key},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return []
-        return r.json().get("results", [])
-    except Exception:
-        return []
+    return {"title": title, "authors": authors, "year": year}
 
 
 def _normalize_for_compare(s):
@@ -1091,381 +1247,208 @@ def _surname_from_full_name(name):
 
 
 def _extract_apa_title(reference):
+    """APA titles are not quoted. Take the segment after the year+period."""
     ym = re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)\.\s*", reference)
     if not ym:
         return ""
     tail = reference[ym.end():].strip()
+    # Title ends at the first period followed by a space and uppercase
     m = re.match(r"^(.+?)\.\s", tail)
     if m:
         return m.group(1).strip()
     return tail.split(".")[0].strip()
 
 
-def _compare_metadata_advanced(submitted, external):
-    t = _title_similarity(
-        _extract_apa_title(submitted.get("raw", "")),
-        external.get("title") or "",
-    )
-    ref_surnames = {s.lower() for s in (submitted.get("authors") or []) if s}
-    ext_surnames = {_surname_from_full_name(n)
-                    for n in (external.get("authors") or []) if n}
-    ext_surnames.discard("")
-    a = None
-    if ref_surnames and ext_surnames:
-        a = len(ref_surnames & ext_surnames) / max(1, len(ref_surnames | ext_surnames))
-    sy = str(submitted.get("year") or "").strip()
-    ey = str(external.get("year") or "").strip()
-    year_match = (sy == ey) if sy and ey else None
-    return {"title_similarity": t, "author_similarity": a, "year_match": year_match}
-
-
-def _decide_doi_status_advanced(comparison):
-    t = comparison.get("title_similarity")
-    a = comparison.get("author_similarity")
-    y = comparison.get("year_match")
-    severe_title  = t is not None and t < SEVERE_TITLE_MISMATCH
-    severe_author = a is not None and a < SEVERE_AUTHOR_MISMATCH
-    year_wrong    = y is False
-
-    if severe_title and severe_author and year_wrong:
-        return ("WITHHELD",
-                "DOI exists but title, authors, and year strongly conflict "
-                "with OpenAlex metadata. Possible fabricated citation.")
-    title_good  = t is None or t >= TITLE_STRONG_MATCH
-    author_good = a is None or a >= AUTHOR_STRONG_MATCH
-    year_good   = y is None or y is True
-    if title_good and author_good and year_good:
-        return ("VERIFIED", "DOI exists and matches external metadata.")
-    title_review  = t is None or t >= TITLE_REVIEW_MATCH
-    author_review = a is None or a >= AUTHOR_REVIEW_MATCH
-    if title_review and author_review:
-        return ("VERIFIED_METADATA_CORRECTED",
-                "Source identifiable; some metadata fields need correction.")
-    return ("MANUAL_CHECK",
-            "DOI exists but reference does not match strongly enough.")
-
-
 def verify_reference_against_openalex(reference, parsed):
     result = {
-        "checked": False, "suspicious": False,
-        "title_similarity": None, "author_similarity": None,
-        "year_match": None, "status": "UNVERIFIED",
-        "reasons": [], "crossref_title": None,
-        "crossref_authors": [], "source_of_truth": None,
-        "doi_resolution": None,
+        "checked": False,
+        "doi": parsed.get("doi"),
+        "title_similarity": None,
+        "author_overlap": None,
+        "suspicious": False,
+        "reasons": [],
+        "crossref_title": None,
+        "crossref_authors": [],
     }
+
     doi = parsed.get("doi")
     if not doi:
         return result
 
     meta = _fetch_openalex_metadata(doi)
-
     if meta is None:
-        result["checked"] = False
-        result["status"] = "MANUAL_CHECK"
-        result["reasons"].append("OpenAlex lookup failed (network).")
         return result
 
     if meta.get("_not_found"):
-        resolution = _verify_doi_resolution(doi)
-        result["doi_resolution"] = resolution
-        if resolution["resolves"] is False:
-            result["checked"] = True
-            result["suspicious"] = True
-            result["status"] = "WITHHELD"
-            result["reasons"].append(
-                "DOI does not resolve in OpenAlex OR doi.org. "
-                "Possible fabricated DOI."
-            )
-            return result
-        if resolution["resolves"] is True:
-            result["checked"] = True
-            result["status"] = "UNVERIFIED"
-            result["reasons"].append("DOI resolves but not in OpenAlex.")
-            return result
         result["checked"] = True
-        result["status"] = "MANUAL_CHECK"
-        result["reasons"].append("DOI verification inconclusive.")
+        result["suspicious"] = True
+        result["reasons"].append("DOI does not resolve in OpenAlex (possible fake DOI).")
         return result
 
     result["checked"] = True
-    result["source_of_truth"] = "openalex"
     result["crossref_title"] = meta.get("title")
     result["crossref_authors"] = meta.get("authors", [])
 
-    submitted = {
-        "raw": reference,
-        "authors": parsed.get("authors") or [],
-        "year": parsed.get("year"),
-    }
-    comparison = _compare_metadata_advanced(submitted, meta)
-    result["title_similarity"] = comparison["title_similarity"]
-    result["author_similarity"] = comparison["author_similarity"]
-    result["year_match"] = comparison["year_match"]
-
-    status, reason = _decide_doi_status_advanced(comparison)
-    result["status"] = status
-    result["reasons"].append(reason)
-    if status == "WITHHELD":
-        result["suspicious"] = True
-    return result
-
-
-def resolve_canonical_metadata(reference, parsed):
-    result = {
-        "found": False, "source": None, "confidence": "unverified",
-        "meta": None, "verification": None,
-    }
-
-    doi = parsed.get("doi")
-    if doi:
-        meta = _fetch_openalex_metadata(doi)
-        if meta and not meta.get("_not_found"):
-            verification = verify_reference_against_openalex(reference, parsed)
-            result["found"] = True
-            result["source"] = "openalex_doi"
-            result["confidence"] = (
-                "high" if verification.get("status") in
-                ("VERIFIED", "VERIFIED_METADATA_CORRECTED")
-                else "medium"
+    ref_title = _extract_apa_title(reference)
+    oa_title = meta.get("title") or ""
+    if ref_title and oa_title:
+        sim = _title_similarity(ref_title, oa_title)
+        result["title_similarity"] = sim
+        if sim < 0.60:
+            result["suspicious"] = True
+            result["reasons"].append(
+                f"DOI resolves to a different title (similarity {sim:.0%})."
             )
-            result["meta"] = meta
-            result["verification"] = verification
-            return result
 
-    title = _extract_apa_title(reference)
-    if title and len(title) >= 15:
-        candidates = _openalex_search_by_title(title, max_results=5)
-        if candidates:
-            best = None
-            best_score = 0.0
-            ref_year = str(parsed.get("year") or "").strip()
-            ref_surnames = {s.lower() for s in (parsed.get("authors") or []) if s}
-            for cand in candidates:
-                cand_title = cand.get("title") or ""
-                cand_year = str(cand.get("publication_year") or "").strip()
-                t_sim = _title_similarity(title, cand_title)
-                if t_sim < TITLE_SEARCH_MIN_SIM:
-                    continue
-                score = t_sim
-                if ref_year and cand_year == ref_year:
-                    score += TITLE_SEARCH_YEAR_BONUS
-                cand_authors = []
-                for a in cand.get("authorships", []) or []:
-                    name = (a.get("author") or {}).get("display_name")
-                    if name:
-                        cand_authors.append(name)
-                cand_surnames = {_surname_from_full_name(n) for n in cand_authors}
-                cand_surnames.discard("")
-                if ref_surnames and cand_surnames:
-                    if not (ref_surnames & cand_surnames):
-                        continue
-                if score > best_score:
-                    best_score = score
-                    best = cand
-            if best:
-                meta = _openalex_result_to_meta(best)
-                result["found"] = True
-                result["source"] = "openalex_title"
-                result["confidence"] = "medium"
-                result["meta"] = meta
-                result["verification"] = {
-                    "checked": True, "suspicious": False,
-                    "status": "VERIFIED_TITLE_MATCH",
-                    "reasons": [f"Matched by title search (score={best_score:.2f})"],
-                    "crossref_title": meta.get("title"),
-                    "crossref_authors": meta.get("authors", []),
-                    "title_similarity": _title_similarity(title, meta.get("title") or ""),
-                    "author_similarity": None,
-                    "year_match": (str(meta.get("year") or "") == ref_year
-                                   if ref_year else None),
-                    "source_of_truth": "openalex",
-                }
-                return result
+    ref_surnames = {s.lower() for s in (parsed.get("authors") or []) if s}
+    oa_surnames = {_surname_from_full_name(n) for n in meta.get("authors", []) if n}
+    oa_surnames.discard("")
+    if oa_surnames:
+        overlap = len(ref_surnames & oa_surnames) / max(1, len(oa_surnames))
+        result["author_overlap"] = overlap
+        if overlap < 0.50:
+            result["suspicious"] = True
+            result["reasons"].append(
+                f"DOI author list does not match the manuscript "
+                f"(only {overlap:.0%} of DOI surnames found)."
+            )
 
     return result
 
 
 # =========================================================
-# STAGE 3 — AI APA FORMATTING FROM CANONICAL METADATA
+# PLACEHOLDERS FOR MISSING FIELDS
 # =========================================================
 
-APA_FORMAT_PROMPT = """You are formatting ONE APA 7th edition reference-list entry.
-
-The bibliographic facts below come from a VERIFIED OpenAlex record.
-You MUST NOT change any of these fields:
-  - Author surnames, initials, or ordering
-  - Publication year
-  - Title text
-  - Journal / book / source name
-  - Volume, issue, page numbers
-  - DOI or URL
-
-You MAY only:
-  1. Reorder fields into correct APA 7 order.
-  2. Fix punctuation (periods, commas, ampersands, en dashes).
-  3. Convert author list to APA 7 form.
-  4. Apply APA 7 capitalization (sentence case for titles, title case for journal).
-  5. Preserve the [translation] bracket if present.
-  6. Choose the exact italic spans.
-
-SOURCE TYPE (choose one):
-  "Journal Article", "Book", "Book Chapter", "Conference Proceeding",
-  "Report", "Webpage / Online Document", "Other"
-
-APA 7 ITALIC RULES:
-  - Journal Article -> journal name + volume number (issue NOT italic, pages NOT italic)
-  - Book           -> book title
-  - Book Chapter   -> book title
-  - Report         -> report title
-  - Webpage        -> webpage title
-  - Conference     -> proceedings title
-
-CRITICAL — `italic_elements` MUST be a comma-separated list of LITERAL
-substrings appearing VERBATIM inside `corrected_reference`.
-
-Return JSON ONLY:
-{{
-  "corrected_reference": "...",
-  "italic_elements": "literal, substrings, to, italicize",
-  "source_type": "one of the source types above",
-  "explanation": "short note"
-}}
-
-GROUND TRUTH (do NOT alter):
-{ground_truth}
-
-ORIGINAL REFERENCE (for reference only — do NOT copy its errors):
-{original_reference}
-"""
+PLACEHOLDER_VOL = "vol. ???"
+PLACEHOLDER_NO = "no. ???"
+PLACEHOLDER_PAGES = "pp. ???-???"
+PLACEHOLDER_DOI = "doi: ???"
 
 
-def format_reference_with_ai(openalex_meta, original_reference, source_type):
-    client = _get_openai_client()
-    if client is None:
-        return {
-            "corrected_reference": "",
-            "italic_elements": "",
-            "source_type": source_type,
-            "explanation": "OpenAI client unavailable",
-        }
+def _make_author_placeholder(count):
+    if not isinstance(count, int) or count < 1:
+        return "author ???"
+    if count == 1:
+        return "author 1"
+    return ", ".join(f"author {i}" for i in range(1, count + 1))
 
-    translation = ""
-    m = re.search(r"\[([^\]]+)\]", original_reference)
-    if m:
-        translation = m.group(0)
 
-    ground_truth = {
-        "title":        openalex_meta.get("title"),
-        "year":         openalex_meta.get("year"),
-        "authors":      openalex_meta.get("authors") or [],
-        "journal":      openalex_meta.get("journal"),
-        "volume":       openalex_meta.get("volume"),
-        "issue":        openalex_meta.get("issue"),
-        "first_page":   openalex_meta.get("first_page"),
-        "last_page":    openalex_meta.get("last_page"),
-        "doi":          openalex_meta.get("doi"),
-        "source_type":  source_type,
-        "translation_bracket_from_original": translation,
-    }
-
-    prompt = APA_FORMAT_PROMPT.format(
-        ground_truth=json.dumps(ground_truth, ensure_ascii=False, indent=2),
-        original_reference=original_reference,
+def _guess_author_count_from_text(reference):
+    year_match = re.search(r"\(((?:19|20)\d{2})[a-z]?\)", reference)
+    cut = year_match.start() if year_match else min(len(reference), 250)
+    block = reference[:cut].strip().rstrip(",.")
+    if not block:
+        return 0
+    # Count "Surname, A." occurrences
+    matches = re.findall(
+        r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+\s*,\s*(?:[A-Z]\.\s*)+",
+        block
     )
-
-    try:
-        response = client.chat.completions.create(
-            model=_openai_model(),
-            messages=[
-                {"role": "system",
-                 "content": "You format APA 7 references from verified "
-                            "metadata. Never invent facts. JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-            seed=42,
-        )
-        data = _safe_json_loads(response.choices[0].message.content)
-
-        corrected = (data.get("corrected_reference") or "").strip()
-        italics   = (data.get("italic_elements") or "").strip()
-        stype     = normalize_source_type(data.get("source_type") or source_type)
-        note      = data.get("explanation") or ""
-
-        if corrected and _reference_is_hallucinated(original_reference, corrected):
-            return {
-                "corrected_reference": "",
-                "italic_elements": "",
-                "source_type": source_type,
-                "explanation": "AI output rejected (invented data).",
-            }
-
-        if italics:
-            tokens = [t.strip() for t in italics.split(",") if t.strip()]
-            tokens = [t for t in tokens if t in corrected]
-            italics = ", ".join(tokens)
-
-        return {
-            "corrected_reference": corrected,
-            "italic_elements": italics,
-            "source_type": stype,
-            "explanation": note,
-        }
-    except Exception as exc:
-        return {
-            "corrected_reference": "",
-            "italic_elements": "",
-            "source_type": source_type,
-            "explanation": f"OpenAI error: {exc}",
-        }
+    return len(matches) if matches else 0
 
 
-def _reference_is_hallucinated(original, corrected):
-    if not corrected:
+def _is_single_page_range(pages_value):
+    if not pages_value:
         return False
-    def numbers(text):
-        return set(re.findall(r"\b\d+(?:\.\d+)?\b", text or ""))
-    def dois(text):
-        return set(re.findall(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+",
-                              text or "", re.I))
-    def urls(text):
-        return set(re.findall(r"https?://\S+", text or "", re.I))
-    if numbers(corrected) - numbers(original):
-        return True
-    if dois(corrected) - dois(original):
-        return True
-    if urls(corrected) - urls(original):
-        return True
-    return False
+    s = str(pages_value).strip()
+    s = re.sub(r"^\s*p+p?\.\s*", "", s, flags=re.I)
+    return bool(re.match(r"^\s*\d+\s*$", s))
+
+
+def _insert_placeholder_after_journal(ref, placeholder):
+    m = re.search(r",\s*(?:\d+(?:\s*[–-]\s*\d+)?\s*\.|https?://|doi:)", ref, re.I)
+    if m:
+        return ref[:m.start()] + f", {placeholder}" + ref[m.start():]
+    return ref.rstrip(".").rstrip() + f", {placeholder}."
 
 
 # =========================================================
-# IN-TEXT CITATION CORRECTION
+# DETERMINISTIC APA IN-TEXT CORRECTION
 # =========================================================
 
 _YEAR_TOKEN_RE = re.compile(r"\b((?:19|20)\d{2}[a-z]?)\b")
+_AS_CITED_IN_RE = re.compile(r"\bas\s+cited\s+in\b", re.I)
 
 
-def revise_parenthetical_citation_local(content):
+def _extract_tokens_from_citation(text):
+    if not text:
+        return set()
+    years = set(re.findall(r"\b((?:19|20)\d{2}[a-z]?)\b", text))
+    cleaned = re.sub(r"\b(?:19|20)\d{2}[a-z]?\b", " ", text)
+    cleaned = re.sub(r"\bet\s+al\.?", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(?:and|&|see|cf|e\.g\.|i\.e\.)\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"[\(\)\;,\.’'\-]", " ", cleaned)
+    surnames = set()
+    for tok in cleaned.split():
+        m = re.match(r"^([A-Za-zÀ-ÖØ-öø-ÿ]+)", tok)
+        if m:
+            surnames.add(m.group(1).lower())
+    return {(s, y) for s in surnames for y in years}
+
+
+def _citation_is_hallucinated(original, corrected):
+    orig_surnames = {s for s, _ in _extract_tokens_from_citation(original)}
+    orig_years = {y for _, y in _extract_tokens_from_citation(original)}
+    corr_surnames = {s for s, _ in _extract_tokens_from_citation(corrected)}
+    corr_years = {y for _, y in _extract_tokens_from_citation(corrected)}
+    return bool(corr_surnames - orig_surnames) or bool(corr_years - orig_years)
+
+
+def _source_count(text):
+    inner = re.sub(r"^\(|\)$", "", text or "")
+    return max(1, len([p for p in inner.split(";") if p.strip()]))
+
+
+def _citation_added_or_removed_sources(original, corrected):
+    return _source_count(original) != _source_count(corrected)
+
+
+def _strip_secondary_source_prefix(author_text):
+    if not author_text:
+        return author_text
+    m = _AS_CITED_IN_RE.search(author_text)
+    if m:
+        author_text = author_text[m.end():].strip(" ,")
+    author_text = re.sub(r"^(?:see|cf)\.?\s+", "", author_text, flags=re.I)
+    return author_text
+
+
+def _extract_surnames_from_author_text(author_text):
+    if not author_text:
+        return []
+    author_text = _strip_secondary_source_prefix(author_text)
+    if re.search(r"\s&\s|\band\b", author_text, re.I):
+        parts = re.split(r"\s*&\s*|\s+\band\b\s+", author_text, flags=re.I)
+        out = []
+        for p in parts:
+            p = re.sub(r"\bet\s+al\.?", "", p, flags=re.I).strip(" .,&")
+            if p:
+                out.append(p)
+        return out
+    if "," in author_text:
+        cleaned = re.sub(r"\bet\s+al\.?", "", author_text, flags=re.I).strip(" ,")
+        return [p.strip() for p in cleaned.split(",") if p.strip()]
+    cleaned = re.sub(r"\bet\s+al\.?", "", author_text, flags=re.I).strip(" ,")
+    return [cleaned] if cleaned else []
+
+
+def revise_parenthetical_citation(content):
     parts = [p.strip() for p in content.split(";") if p.strip()]
     if not parts:
         return "(" + content.strip() + ")"
     corrected = []
     for part in parts:
-        ym = _YEAR_TOKEN_RE.search(part)
-        if not ym:
+        year_match = _YEAR_TOKEN_RE.search(part)
+        if not year_match:
             corrected.append(part)
             continue
-        year = ym.group(1)
-        author_text = part[:ym.start()].strip(" ,")
-        surnames = re.findall(
-            r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\b", author_text
-        )
-        surnames = [s for s in surnames if s.lower() not in
-                    {"and", "see", "cf", "et", "al"}]
+        year = year_match.group(1)
+        author_text = part[:year_match.start()].strip(" ,")
+        trailing = part[year_match.end():].strip()
+        author_text = _strip_secondary_source_prefix(author_text)
         has_et_al = bool(re.search(r"\bet\s+al\.", author_text, re.I))
+        surnames = _extract_surnames_from_author_text(author_text)
         if not surnames:
             corrected.append(part)
             continue
@@ -1475,123 +1458,466 @@ def revise_parenthetical_citation_local(content):
             author_final = f"{surnames[0]} & {surnames[1]}"
         else:
             author_final = surnames[0]
-        corrected.append(f"{author_final}, {year}")
+        if trailing and not trailing.startswith(","):
+            trailing = ", " + trailing.lstrip(", ")
+        corrected.append(f"{author_final}, {year}{trailing}".rstrip())
     if len(corrected) > 1:
-        corrected.sort(key=lambda s: s.lower())
+        def sort_key(s):
+            m = re.match(r"^([A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)", s)
+            return m.group(1).lower() if m else s.lower()
+        corrected.sort(key=sort_key)
     return "(" + "; ".join(corrected) + ")"
 
 
-def revise_narrative_citation_local(raw):
-    ym = _YEAR_TOKEN_RE.search(raw)
-    if not ym:
+def revise_narrative_citation(citation):
+    raw = citation.get("raw", "")
+    ctype = citation.get("type")
+    authors = citation.get("authors", [])
+    et_al = citation.get("et_al", False)
+    if ctype != "narrative":
         return raw
-    year = ym.group(1)
-    before = raw[:ym.start()].strip(" ,")
-    surnames = re.findall(
-        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\b", before
-    )
-    surnames = [s for s in surnames if s.lower() not in
-                {"and", "see", "cf", "et", "al"}]
-    if not surnames:
+    if _AS_CITED_IN_RE.search(raw):
+        return revise_parenthetical_citation(re.sub(r"^\(|\)$", "", raw))
+    if len(authors) >= 3 and not et_al:
+        ym = _YEAR_TOKEN_RE.search(raw)
+        if ym:
+            return f"{authors[0]} et al. ({ym.group(1)})"
         return raw
-    if len(surnames) >= 2:
-        if "&" in before:
-            return f"{surnames[0]} and {surnames[1]} ({year})"
+    if len(authors) == 2 and not et_al:
+        ym = _YEAR_TOKEN_RE.search(raw)
+        if ym:
+            return f"{authors[0]} and {authors[1]} ({ym.group(1)})"
         return raw
-    return f"{surnames[0]} ({year})"
+    return raw
 
 
-def build_citation_correction(citation):
+def build_local_citation_correction(citation, disambiguation_map=None):
     raw = citation.get("raw", "").strip()
-    ctype = citation.get("type", "parenthetical")
+    ctype = citation.get("type")
+    disambiguation_map = disambiguation_map or {}
+    if is_apa_disambiguated_citation(citation, disambiguation_map):
+        return {"Corrected": raw, "Status": "MATCH",
+                "Note": "APA author disambiguation correctly retained"}
     if ctype == "parenthetical":
-        inner = re.sub(r"^\(|\)$", "", raw).strip()
-        corrected = revise_parenthetical_citation_local(inner)
+        content = citation.get("parenthetical_content")
+        if not content:
+            m = re.match(r"^\((.*)\)$", raw)
+            content = m.group(1) if m else raw
+        corrected = revise_parenthetical_citation(content)
+        if _source_count(raw) != _source_count(corrected):
+            return {"Corrected": raw, "Status": "MATCH", "Note": ""}
+        if _citation_is_hallucinated(raw, corrected):
+            return {"Corrected": raw, "Status": "MATCH", "Note": ""}
     else:
-        corrected = revise_narrative_citation_local(raw)
-    status = "MATCH" if corrected.strip() == raw.strip() else "REVISED"
-    return {"Corrected": corrected, "Status": status}
+        corrected = revise_narrative_citation(citation)
+    if corrected.strip() == raw.strip():
+        return {"Corrected": corrected, "Status": "MATCH", "Note": ""}
+    notes = []
+    if ctype == "parenthetical":
+        if _AS_CITED_IN_RE.search(raw) and not _AS_CITED_IN_RE.search(corrected):
+            notes.append("Removed secondary source ('as cited in')")
+        if (re.search(r"\bet\s+al\.", corrected, re.I)
+                and not re.search(r"\bet\s+al\.", raw, re.I)):
+            notes.append("Collapsed 3+ authors to 'et al.'")
+        raw_sources = [p.strip() for p in re.sub(r"^\(|\)$", "", raw).split(";") if p.strip()]
+        corr_sources = [p.strip() for p in re.sub(r"^\(|\)$", "", corrected).split(";") if p.strip()]
+        if len(raw_sources) > 1 and len(corr_sources) > 1:
+            if [s.lower() for s in raw_sources] != [s.lower() for s in corr_sources]:
+                if set(raw_sources) == set(corr_sources):
+                    notes.append("Alphabetized multiple sources")
+        if "&" in corrected and re.search(r"\band\b", raw, re.I):
+            notes.append("Replaced 'and' with '&' inside parenthetical")
+    else:
+        if " and " in corrected and "&" in raw:
+            notes.append("Replaced '&' with 'and' in narrative citation")
+        if (re.search(r"\bet\s+al\.", corrected, re.I)
+                and not re.search(r"\bet\s+al\.", raw, re.I)):
+            notes.append("Collapsed 3+ authors to 'et al.'")
+    return {"Corrected": corrected, "Status": "REVISED",
+            "Note": " | ".join(notes) if notes else "APA 7 formatting adjusted"}
 
 
-def review_citations_with_ai(citations):
+# =========================================================
+# DETERMINISTIC APA REFERENCE CORRECTION (with placeholders)
+# =========================================================
+
+def build_local_apa_reference_correction(reference):
+    """
+    Deterministic APA reference tidy-up.
+
+    Applies:
+      1. DOI format normalization to https://doi.org/...
+      2. Placeholders for missing vol./issue/pp./doi/authors
+      3. Single-page expansion: pp. 123 -> pp. 123-???
+      4. Trailing period
+    """
+    original = reference.strip()
+    ref = original
+    notes = []
+    placeholder_flags = {
+        "missing_vol": False,
+        "missing_no": False,
+        "missing_pp": False,
+        "missing_doi": False,
+        "missing_authors": False,
+    }
+
+    # --- DOI normalization to https://doi.org/
+    dm = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", ref, re.I)
+    if dm:
+        doi = dm.group(0).rstrip(".,;)")
+        old = ref
+        ref = re.sub(
+            r"https?://(?:dx\.)?doi\.org/" + _esc(doi),
+            f"https://doi.org/{doi}",
+            ref,
+            flags=re.I,
+        )
+        ref = re.sub(r"\bdoi\s*:\s*" + _esc(doi), f"https://doi.org/{doi}", ref, flags=re.I)
+        if ref != old:
+            notes.append("DOI normalized to https://doi.org/... format.")
+
+    # --- Author presence check
+    parsed_now = parse_reference(ref)
+    year_match = re.search(r"\(((?:19|20)\d{2})[a-z]?\)", ref)
+    author_block = ref[:year_match.start()].strip() if year_match else ""
+
+    if not author_block and year_match:
+        guess = _guess_author_count_from_text(ref)
+        placeholder = _make_author_placeholder(guess)
+        ref = placeholder + ". " + ref[year_match.start():]
+        placeholder_flags["missing_authors"] = True
+        notes.append(f"Missing author list — placeholder inserted: {placeholder}")
+
+    # --- Journal-article structural placeholders
+    journal_parts = extract_journal_format_parts(ref)
+    if journal_parts["is_journal"]:
+        # Volume / issue placeholders are only added if the reference
+        # clearly has a journal section but is missing those elements.
+        # Single-page expansion:
+        pages = journal_parts["pages"]
+        if pages and _is_single_page_range(pages):
+            # Find the page number in the reference and append "-???"
+            m = re.search(r"\b" + re.escape(pages) + r"\b", ref)
+            if m:
+                ref = ref[:m.end()] + "-???" + ref[m.end():]
+                placeholder_flags["missing_pp"] = True
+                notes.append(f"Single page number — expanded to range placeholder: {pages}-???")
+
+    # --- DOI placeholder
+    if not re.search(r"10\.\d{4,9}/", ref) and not re.search(r"https?://", ref):
+        ref = ref.rstrip(".").rstrip() + f". {PLACEHOLDER_DOI}"
+        placeholder_flags["missing_doi"] = True
+        notes.append(f"Missing DOI/URL — placeholder inserted: {PLACEHOLDER_DOI}")
+
+    # --- Trailing period
+    ref = ref.rstrip()
+    if ref and not ref.endswith("."):
+        ref = ref + "."
+        notes.append("Trailing period added.")
+
+    changed = ref != original
+    return {
+        "Corrected": ref,
+        "Status": "REVISED" if changed else "MATCH",
+        "Note": " | ".join(notes) if notes else "",
+        "Placeholders": placeholder_flags,
+    }
+
+
+# =========================================================
+# APA AUTOMATED REVIEW
+# =========================================================
+
+def _apa_status_label(status):
+    status = str(status or "MANUAL_CHECK").upper().strip()
+    if status in {"OK", "PASS", "MATCH"}:
+        return "MATCH"
+    if status in {"REVISED", "NEEDS REVIEW", "NEEDS_REVIEW"}:
+        return "REVISED"
+    return "MANUAL CHECK"
+
+
+def _safe_json_loads(text):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
+
+
+def _reference_is_hallucinated(original, corrected):
+    if not corrected:
+        return False
+
+    def numbers(text):
+        return set(re.findall(r"\b\d+(?:\.\d+)?\b", text or ""))
+
+    def dois(text):
+        return set(re.findall(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text or "", re.I))
+
+    def urls(text):
+        return set(re.findall(r"https?://\S+", text or "", re.I))
+
+    if numbers(corrected) - numbers(original):
+        return True
+    if dois(corrected) - dois(original):
+        return True
+    if urls(corrected) - urls(original):
+        return True
+    return False
+
+
+def _get_openai_client():
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+        return OpenAI(api_key=api_key)
+    except Exception:
+        return None
+
+
+def review_apa_citations_with_ai(citations, parsed_references=None):
     client = _get_openai_client()
     if client is None or not citations:
         return []
+    parsed_references = parsed_references or []
+    disambiguation_map = build_apa_disambiguation_map(parsed_references)
     payload = [
-        {"number": i, "citation": c.get("raw", ""), "type": c.get("type", "")}
+        {
+            "number": i,
+            "citation": c.get("raw", ""),
+            "type": c.get("type", ""),
+            "apa_disambiguation_required": (
+                (normalize(c.get("author")), str(c.get("year"))) in disambiguation_map
+            ),
+        }
         for i, c in enumerate(citations, start=1)
     ]
+    reference_context = [
+        {"authors": ref.get("authors") or [], "year": ref.get("year")}
+        for ref in parsed_references
+        if ref.get("authors") and ref.get("year")
+    ]
     prompt = f"""
-Correct each APA 7 in-text citation IN ISOLATION.
-- Two authors: parenthetical uses "&"; narrative uses "and".
-- Three or more authors: "Surname et al."
-- Never merge or split citations. Never invent authors/years.
+You are checking APA 7th edition IN-TEXT citations.
 
-Return JSON only:
-{{"results": [{{"number": int, "status": "OK"|"REVISED"|"MANUAL_CHECK",
-"revised_citation": str, "explanation": str}}, ...]}}
+Each input item is ALREADY a separate, complete citation extracted from the PDF.
+You MUST correct each item IN ISOLATION. Do not merge sources or invent authors/years.
+
+DEFAULT APA 7 AUTHOR RULE:
+- One author: use that surname.
+- Two authors: parenthetical uses "&"; narrative uses "and".
+- Three or more authors: "FirstSurname et al." from the first citation.
+
+Return JSON only: {{"results": [{{"number": int, "status": "OK"|"REVISED"|"MANUAL_CHECK", "revised_citation": str, "explanation": str}}, ...]}}
+
+REFERENCE AUTHOR/YEAR CONTEXT:
+{json.dumps(reference_context, ensure_ascii=False)}
+
+INPUT CITATIONS:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": "You are a precise APA 7 citation editor. Return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        return _safe_json_loads(response.choices[0].message.content).get("results", [])
+    except Exception as exc:
+        return [{"number": 0, "status": "MANUAL_CHECK", "revised_citation": "",
+                 "explanation": f"OpenAI API error: {exc}"}]
+
+
+def review_apa_references_with_ai(references):
+    client = _get_openai_client()
+    if client is None or not references:
+        return []
+    payload = [{"number": i, "reference": clean_text(ref)} for i, ref in enumerate(references, start=1)]
+    prompt = f"""
+You are checking APA 7th edition REFERENCE-LIST entries.
+
+CRITICAL RULES:
+1. Each supplied "reference" is the ORIGINAL. Correct THAT SAME reference only.
+2. Do not invent missing bibliographic facts.
+3. DOI should use https://doi.org/...
+4. revised_reference must contain ONLY the corrected APA reference.
+
+SOURCE TYPE — exactly one of:
+  "Journal Article", "Book", "Book Chapter", "Conference Proceeding",
+  "Report", "Webpage / Online Document", "Other"
+
+Return JSON only: {{"results": [{{"number": int, "status": "OK"|"REVISED"|"MANUAL_CHECK", "revised_reference": str, "source_type": str, "italic_elements": str, "year": int|null, "missing_required_elements": [str], "explanation": str}}, ...]}}
 
 INPUT:
 {json.dumps(payload, ensure_ascii=False)}
 """
     try:
         response = client.chat.completions.create(
-            model=_openai_model(),
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=[
-                {"role": "system",
-                 "content": "Precise APA 7 in-text citation editor. JSON only."},
+                {"role": "system", "content": "You are a precise APA 7 reference-list editor. Return valid JSON only."},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
             temperature=0,
-            seed=42,
         )
-        return _safe_json_loads(response.choices[0].message.content).get("results", [])
+        results = _safe_json_loads(response.choices[0].message.content).get("results", [])
+        for r in results:
+            r["source_type"] = normalize_source_type(r.get("source_type"))
+        return results
     except Exception as exc:
-        return [{"number": 0, "status": "MANUAL_CHECK",
-                 "revised_citation": "", "explanation": f"API error: {exc}"}]
+        return [{"number": 0, "status": "MANUAL_CHECK", "revised_reference": "",
+                 "source_type": "Other", "italic_elements": "", "year": None,
+                 "missing_required_elements": [], "explanation": f"OpenAI API error: {exc}"}]
 
 
-def _citation_is_hallucinated(original, corrected):
-    def surnames(text):
-        return set(re.findall(r"\b([A-ZÀ-ÖØ-Ý][a-zà-ÿ]+)\b", text or ""))
-    def years(text):
-        return set(re.findall(r"\b((?:19|20)\d{2})\b", text or ""))
-    return (surnames(corrected) - surnames(original)) or \
-           (years(corrected) - years(original))
+def fallback_italic_elements(source_type):
+    return {
+        "Journal Article": "journal title, volume",
+        "Book": "book title",
+        "Book Chapter": "book title",
+        "Report": "report title",
+        "Webpage / Online Document": "webpage title",
+        "Conference Proceeding": "proceedings title",
+        "Other": "",
+    }.get(source_type, "")
 
 
-def build_citation_comparison(citations, ai_results=None):
-    by_no = {int(x.get("number", -1)): x
-             for x in (ai_results or [])
-             if str(x.get("number", "")).isdigit()}
+def build_apa_reference_comparison(references, ai_results, manuscript_year):
+    by_no = {
+        int(x.get("number", -1)): x
+        for x in (ai_results or [])
+        if str(x.get("number", "")).isdigit()
+    }
     rows = []
-    for i, citation in enumerate(citations, start=1):
-        local = build_citation_correction(citation)
+    for i, original in enumerate(references, start=1):
         ai = by_no.get(i, {})
-        original = strip_markdown_markers(citation.get("raw", ""))
-        ai_corrected = strip_markdown_markers(
-            ai.get("revised_citation", "")
-        ) if ai else ""
+        original_clean = strip_markdown_markers(clean_text(original))
 
-        use_ai = (
+        corrected = strip_markdown_markers(
+            clean_text(ai.get("revised_reference", ""))
+        ) or original_clean
+        if corrected != original_clean and _reference_is_hallucinated(original_clean, corrected):
+            corrected = original_clean
+
+        local = build_local_apa_reference_correction(corrected)
+        corrected = local["Corrected"]
+
+        parsed = parse_reference(corrected)
+        verification = verify_reference_against_openalex(original_clean, parsed)
+
+        source_type = normalize_source_type(ai.get("source_type"))
+        if source_type == "Other" and not ai.get("source_type"):
+            source_type = detect_apa_source_type(corrected)
+
+        italic_elements = (ai.get("italic_elements") or "").strip()
+        if not italic_elements:
+            italic_elements = fallback_italic_elements(source_type)
+
+        year = ai.get("year")
+        if not isinstance(year, int):
+            year = extract_reference_year(corrected)
+
+        missing = ai.get("missing_required_elements", []) or []
+        if isinstance(missing, str):
+            missing = [missing]
+
+        rows.append({
+            "No.": i,
+            "Source Type": source_type,
+            "Year": year,
+            "Original Reference": original_clean,
+            "Corrected Version": corrected,
+            "Italicized in APA": italic_elements,
+            "Status": _apa_status_label(ai.get("status")) if ai else "NOT AI CHECKED",
+            "Missing Required Elements": ", ".join(str(x) for x in missing),
+            "AI Explanation": ai.get("explanation", ""),
+            "Correction Note": local.get("Note", ""),
+            "Placeholders": local.get("Placeholders", {}),
+            "DOI Verified": verification["checked"],
+            "DOI Suspicious": verification["suspicious"],
+            "DOI Verification Reasons": " | ".join(verification["reasons"]),
+            "Title Similarity": verification.get("title_similarity"),
+            "Author Overlap": verification.get("author_overlap"),
+            "OpenAlex Title": verification.get("crossref_title"),
+            "OpenAlex Authors": ", ".join(verification.get("crossref_authors", [])[:5]),
+        })
+    return rows
+
+
+def _citation_breaks_apa_connector_rules(original, corrected, ctype):
+    if not corrected:
+        return False
+    corr = (corrected or "").lower()
+    orig = (original or "").lower()
+    corr_amp = corr.count("&")
+    corr_and = len(re.findall(r"\band\b", corr))
+    orig_amp = orig.count("&")
+    orig_and = len(re.findall(r"\band\b", orig))
+    if ctype == "parenthetical" and corr_and > orig_and:
+        return True
+    if ctype == "narrative" and corr_amp > orig_amp:
+        return True
+    return False
+
+
+def build_apa_citation_comparison(citations, ai_results, parsed_references=None):
+    by_no = {
+        int(x.get("number", -1)): x
+        for x in (ai_results or [])
+        if str(x.get("number", "")).isdigit()
+    }
+    rows = []
+    disambiguation_map = build_apa_disambiguation_map(parsed_references or [])
+    for i, citation in enumerate(citations, start=1):
+        local = build_local_citation_correction(citation, disambiguation_map)
+        protected_disambiguation = is_apa_disambiguated_citation(citation, disambiguation_map)
+        ai = by_no.get(i, {})
+        original = strip_markdown_markers(clean_text(citation.get("raw", "")))
+        ai_corrected = strip_markdown_markers(
+            clean_text(ai.get("revised_citation", ""))
+        ) if ai else ""
+        local_corrected = local["Corrected"]
+        hallucinated = bool(ai_corrected) and _citation_is_hallucinated(original, ai_corrected)
+        source_count_changed = bool(ai_corrected) and _citation_added_or_removed_sources(original, ai_corrected)
+        connector_violation = bool(ai_corrected) and _citation_breaks_apa_connector_rules(
+            original, ai_corrected, citation.get("type")
+        )
+        ai_is_safe = (
             ai_corrected
             and ai_corrected != original
-            and not _citation_is_hallucinated(original, ai_corrected)
+            and not protected_disambiguation
+            and not hallucinated
+            and not source_count_changed
+            and not connector_violation
         )
-
-        if use_ai:
+        if ai_is_safe:
             corrected = ai_corrected
             status = _apa_status_label(ai.get("status")) if ai else "REVISED"
-            note = ai.get("explanation", "") or local.get("Status", "")
+            note = ai.get("explanation", "") or local["Note"]
         else:
-            corrected = local["Corrected"]
+            corrected = local_corrected
             status = local["Status"]
-            note = ""
-
+            note = local["Note"]
+            if hallucinated:
+                note = ("AI revision rejected (invented authors/years); "
+                        "deterministic APA rules applied instead.")
+            elif source_count_changed:
+                note = ("AI revision rejected (changed number of sources); "
+                        "deterministic APA rules applied instead.")
+            elif connector_violation:
+                note = ("AI revision rejected ('&' vs 'and' violation); "
+                        "deterministic APA rules applied instead.")
         if corrected.strip() == original.strip():
             status = "MATCH"
-
         rows.append({
             "No.": i,
             "Type": citation.get("type", "").title(),
@@ -1603,145 +1929,66 @@ def build_citation_comparison(citations, ai_results=None):
     return rows
 
 
-def _apa_status_label(status):
-    status = str(status or "MANUAL_CHECK").upper().strip()
-    if status in {"OK", "PASS", "MATCH", "VERIFIED"}:
-        return "MATCH"
-    if status in {"REVISED", "NEEDS REVIEW", "NEEDS_REVIEW",
-                  "VERIFIED_METADATA_CORRECTED"}:
-        return "REVISED"
-    return "MANUAL CHECK"
+def analyze_apa_locally(uploaded_file, manuscript_year):
+    uploaded_file.seek(0)
+    full_text, pages, removed_running_text = extract_pdf_text(uploaded_file)
+    uploaded_file.seek(0)
+    style_spans = extract_pdf_style_spans(uploaded_file)
+    full_text = clean_text(full_text)
+    reference_text, heading, body_text = find_reference_section(full_text)
+    if reference_text is None:
+        raise ValueError("I could not detect a References section.")
 
+    references = split_references(reference_text)
+    parsed_references = [parse_reference(ref) for ref in references]
+    apa_disambiguation_map = build_apa_disambiguation_map(parsed_references)
+    citations = extract_all_citations(body_text)
+    citation_stats = calculate_citation_statistics(citations)
+    matching_results = match_citations_to_references(citations, parsed_references)
+    missing_references = find_missing_references(citations, parsed_references)
+    duplicates = detect_duplicates(parsed_references)
+    recency = calculate_reference_recency(references, manuscript_year)
 
-# =========================================================
-# REFERENCE COMPARISON TABLE
-# =========================================================
-
-def build_reference_comparison(references, manuscript_year):
-    rows = []
-    for i, original in enumerate(references, start=1):
-        original_clean = strip_markdown_markers(clean_text(original))
-        parsed = parse_reference(original_clean)
-        canonical = resolve_canonical_metadata(original_clean, parsed)
-
-        placeholders = {}
-        correction_note = ""
-        italic_elements = ""
-        source_type = detect_apa_source_type(original_clean)
-        corrected = original_clean
-        status = "UNVERIFIED"
-
-        if canonical["found"]:
-            meta = canonical["meta"]
-            verification = canonical["verification"] or {}
-            source = canonical["source"]
-
-            if (source == "openalex_doi"
-                    and verification.get("suspicious")):
-                corrected = "— WITHHELD (DOI mismatch) —"
-                correction_note = (verification.get("reasons") or [""])[0]
-                status = "WITHHELD"
-            else:
-                source_type = normalize_source_type(
-                    _source_type_from_openalex(meta) or source_type
-                )
-                ai_formatted = format_reference_with_ai(
-                    meta, original_clean, source_type
-                )
-                if ai_formatted.get("corrected_reference"):
-                    corrected = ai_formatted["corrected_reference"]
-                    italic_elements = ai_formatted["italic_elements"]
-                    source_type = ai_formatted["source_type"]
-                    correction_note = (ai_formatted.get("explanation")
-                                       or f"Formatted from {source}.")
-                else:
-                    corrected = original_clean
-                    correction_note = ai_formatted.get("explanation", "")
-                if source == "openalex_doi":
-                    status = verification.get("status", "VERIFIED")
-                else:
-                    status = "VERIFIED_TITLE_MATCH"
-        else:
-            corrected = original_clean.rstrip(".") + "."
-            correction_note = "No canonical metadata found; reference kept as-is."
-            status = "UNVERIFIED"
-
-        year = extract_reference_year(corrected)
-        verification = canonical.get("verification") or {}
-        meta = canonical.get("meta")
-
-        rows.append({
-            "No.": i,
-            "Source Type": source_type,
-            "Year": year,
-            "Original Reference": original_clean,
-            "Corrected Version": corrected,
-            "Italicized in APA": italic_elements,
-            "Status": status,
-            "Canonical Source": canonical.get("source") or "—",
-            "Confidence": canonical.get("confidence", "unverified"),
-            "Verification Status": verification.get("status", "UNVERIFIED"),
-            "Verification Reason": " | ".join(verification.get("reasons", [])),
-            "Source of Truth": verification.get("source_of_truth") or "local",
-            "Correction Note": correction_note,
-            "Placeholders": placeholders,
-            "DOI Verified": verification.get("checked", False),
-            "DOI Suspicious": verification.get("suspicious", False),
-            "DOI Verification Reasons": " | ".join(verification.get("reasons", [])),
-            "Title Similarity": verification.get("title_similarity"),
-            "Author Similarity": verification.get("author_similarity"),
-            "Year Match": verification.get("year_match"),
-            "OpenAlex Title": meta.get("title") if meta else None,
-            "OpenAlex Authors": ", ".join((meta.get("authors") or [])[:5]) if meta else None,
-            "OpenAlex Journal": meta.get("journal") if meta else None,
-            "OpenAlex Volume": meta.get("volume") if meta else None,
-            "OpenAlex Issue": meta.get("issue") if meta else None,
-            "OpenAlex Pages": (
-                f"{meta.get('first_page')}–{meta.get('last_page')}"
-                if meta and meta.get("first_page") else None
-            ),
+    local_reference_checks = []
+    for i, ref in enumerate(references, start=1):
+        status, issues, warnings, italic_info = check_apa_reference(ref, style_spans)
+        local_reference_checks.append({
+            "Reference #": i, "APA Status": status,
+            "Source Type": italic_info.get("source_type", detect_apa_source_type(ref)),
+            "Issues": " | ".join(issues), "Warnings": " | ".join(warnings),
         })
-    return rows
+
+    return {
+        "filename": uploaded_file.name, "heading": heading,
+        "references": references, "parsed_references": parsed_references,
+        "apa_disambiguation_map": apa_disambiguation_map,
+        "citations": citations, "citation_stats": citation_stats,
+        "matching_results": matching_results, "missing_references": missing_references,
+        "duplicates": duplicates, "recency": recency,
+        "local_reference_checks": local_reference_checks,
+        "removed_running_text": removed_running_text,
+        "manuscript_year": manuscript_year, "ai_complete": False,
+    }
 
 
-def _source_type_from_openalex(meta):
-    if not meta:
-        return "Other"
-    t = (meta.get("source_type") or "").lower()
-    if t == "journal":
-        return "Journal Article"
-    if t == "book":
-        return "Book"
-    if t in ("book series", "ebook platform"):
-        return "Book Chapter"
-    if t == "conference":
-        return "Conference Proceeding"
-    if t == "repository":
-        return "Webpage / Online Document"
-    return "Other"
-
-
-def detect_apa_source_type(reference):
-    low = (reference or "").lower()
-    if re.search(r"\(eds?\.\)", reference, re.I):
-        return "Book Chapter"
-    if re.search(r"\b(proceedings|conference|symposium)\b", low):
-        return "Conference Proceeding"
-    if re.search(r"\b(report|technical report|working paper)\b", low):
-        return "Report"
-    if re.search(r"https?://", reference) and "doi.org" not in low:
-        return "Webpage / Online Document"
-    if re.search(r",\s*\d+\s*(?:\([^)]+\))?\s*,\s*\d+", reference):
-        return "Journal Article"
-    return "Other"
+def enrich_apa_with_ai(result):
+    citation_ai = review_apa_citations_with_ai(
+        result["citations"], result.get("parsed_references", [])
+    )
+    reference_ai = review_apa_references_with_ai(result["references"])
+    result["citation_comparison"] = build_apa_citation_comparison(
+        result["citations"], citation_ai, result.get("parsed_references", [])
+    )
+    result["reference_comparison"] = build_apa_reference_comparison(
+        result["references"], reference_ai, result["manuscript_year"]
+    )
+    result["ai_complete"] = bool(_get_openai_client())
+    return result
 
 
 # =========================================================
 # DOCX EXPORT
 # =========================================================
-
-RED = RGBColor(0xC0, 0x00, 0x00)
-
 
 def _set_run_font(run, size_pt=11, bold=False, italic=False, color=None):
     run.font.size = Pt(size_pt)
@@ -1749,6 +1996,9 @@ def _set_run_font(run, size_pt=11, bold=False, italic=False, color=None):
     run.font.italic = italic
     if color is not None:
         run.font.color.rgb = color
+
+
+RED = RGBColor(0xC0, 0x00, 0x00)
 
 
 def _add_run(paragraph, text, size_pt=11, bold=False, italic=False, red=False):
@@ -1762,31 +2012,55 @@ def _add_red_italic_run(paragraph, text, size_pt=11):
     _add_run(paragraph, text, size_pt=size_pt, bold=True, italic=True, red=True)
 
 
+_PLACEHOLDER_RE = re.compile(
+    r"(author \?{3}"
+    r"|author \d+(?:, author \d+)+"
+    r"|vol\. \?{3}"
+    r"|no\. \?{3}"
+    r"|pp\. \d+-\?{3}"
+    r"|pp\. \?{3}-\?{3}"
+    r"|doi: \?{3})",
+    re.I,
+)
+
+
+def _emit_with_placeholders(paragraph, text, italic=False):
+    pos = 0
+    for m in _PLACEHOLDER_RE.finditer(text):
+        if m.start() > pos:
+            _add_run(paragraph, text[pos:m.start()], size_pt=11, italic=italic)
+        matched = m.group(0)
+        _add_run(paragraph, matched, size_pt=11, italic=True, bold=True, red=True)
+        pos = m.end()
+    if pos < len(text):
+        _add_run(paragraph, text[pos:], size_pt=11, italic=italic)
+
+
 def _add_styled_reference(paragraph, text, italic_elements):
-    if isinstance(italic_elements, list):
-        tokens = [t.strip() for t in italic_elements if t and t.strip()]
-    else:
-        tokens = [t.strip() for t in (italic_elements or "").split(",") if t.strip()]
+    """
+    Write an APA reference with italics on the specified elements and
+    red bold italic on placeholders.
+    """
+    tokens = [t.strip() for t in (italic_elements or "").split(",") if t.strip()]
     if not tokens:
-        _add_run(paragraph, text, size_pt=11)
+        _emit_with_placeholders(paragraph, text, italic=False)
         return
 
-    escaped = sorted({_esc(t) for t in tokens}, key=len, reverse=True)
-    pattern = _safe_compile(
-        r"(?<!\w)(" + "|".join(escaped) + r")(?!\w)", re.I,
-    )
+    flat = [_esc(t) for t in tokens]
+    pattern_str = "|".join(sorted(flat, key=len, reverse=True))
+    pattern = _safe_compile(pattern_str, re.I)
     if pattern is None:
-        _add_run(paragraph, text, size_pt=11)
+        _emit_with_placeholders(paragraph, text, italic=False)
         return
 
     pos = 0
     for m in pattern.finditer(text):
         if m.start() > pos:
-            _add_run(paragraph, text[pos:m.start()], size_pt=11)
-        _add_run(paragraph, m.group(0), size_pt=11, italic=True)
+            _emit_with_placeholders(paragraph, text[pos:m.start()], italic=False)
+        _emit_with_placeholders(paragraph, m.group(0), italic=True)
         pos = m.end()
     if pos < len(text):
-        _add_run(paragraph, text[pos:], size_pt=11)
+        _emit_with_placeholders(paragraph, text[pos:], italic=False)
 
 
 def _docx_set_default_font(document, font_name="Times New Roman", size_pt=11):
@@ -1815,13 +2089,18 @@ def build_correction_docx(result):
     mr = meta.add_run(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     _set_run_font(mr, size_pt=9, italic=True)
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
     doc.add_paragraph()
 
-    # --- Section 1: In-text Citation List
+    # ---------- Section 1: In-text Citation List ----------
     h1 = doc.add_heading(level=1)
-    _set_run_font(h1.add_run("1. In-text Citation List"), size_pt=14, bold=True)
+    hr = h1.add_run("1. In-text Citation List")
+    _set_run_font(hr, size_pt=14, bold=True)
 
-    citation_rows = result.get("citation_comparison") or []
+    citation_rows = result.get("citation_comparison") or build_apa_citation_comparison(
+        result.get("citations", []), []
+    )
+
     missing_citation_keys = set()
     for m in result.get("missing_references", []) or []:
         missing_citation_keys.add((normalize(m.get("Author")), m.get("Year")))
@@ -1834,153 +2113,262 @@ def build_correction_docx(result):
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(4)
 
+            author = ""
+            year = None
             raw = row.get("Original Citation", "")
-            author, year = "", None
             m = re.match(r"^\(?([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)", raw)
             if m:
                 author = m.group(1)
             ym = re.search(r"\b((?:19|20)\d{2})\b", raw)
             if ym:
                 year = ym.group(1)
-            missing = (normalize(author), year) in missing_citation_keys
 
-            _add_run(p, "Original : ", bold=True)
-            _add_run(p, raw)
-            if missing:
+            is_missing_from_refs = (normalize(author), year) in missing_citation_keys
+
+            r1 = p.add_run("Original : ")
+            _set_run_font(r1, size_pt=11, bold=True)
+            r2 = p.add_run(row.get("Original Citation", ""))
+            _set_run_font(r2, size_pt=11)
+            if is_missing_from_refs:
                 _add_red_italic_run(p, "  ← MISSING FROM REFERENCES")
 
             p2 = doc.add_paragraph()
             p2.paragraph_format.space_after = Pt(8)
-            _add_run(p2, "Corrected: ", bold=True)
-            _add_run(p2, row.get("Revised Citation", ""))
+            r3 = p2.add_run("Corrected: ")
+            _set_run_font(r3, size_pt=11, bold=True)
+            r4 = p2.add_run(row.get("Revised Citation", ""))
+            _set_run_font(r4, size_pt=11, italic=False)
 
     doc.add_page_break()
 
-    # --- Section 2: Reference List
+    # ---------- Section 2: Reference List ----------
     h2 = doc.add_heading(level=1)
-    _set_run_font(h2.add_run("2. Reference List (APA 7th Edition)"),
-                  size_pt=14, bold=True)
+    hr2 = h2.add_run("2. Reference List (APA 7th Edition)")
+    _set_run_font(hr2, size_pt=14, bold=True)
 
-    reference_rows = result.get("reference_comparison") or []
+    reference_rows = result.get("reference_comparison") or build_apa_reference_comparison(
+        result.get("references", []), [], result.get("manuscript_year")
+    )
+
     matching = result.get("matching_results", []) or []
-    uncited = {row.get("Reference #") for row in matching if not row.get("Cited")}
+    uncited_ref_nos = {row.get("Reference #") for row in matching if not row.get("Cited")}
 
     if not reference_rows:
         p = doc.add_paragraph()
         _set_run_font(p.add_run("No references were detected."), italic=True)
     else:
         def sort_key(row):
-            txt = row.get("Corrected Version") or row.get("Original Reference", "")
+            txt = row.get("Corrected Version", "") or row.get("Original Reference", "")
             m = re.match(r"^([A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)", txt)
             return m.group(1).lower() if m else txt.lower()
 
-        for row in sorted(reference_rows, key=sort_key):
+        sorted_rows = sorted(reference_rows, key=sort_key)
+
+        for row in sorted_rows:
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(6)
             p.paragraph_format.left_indent = Inches(0.5)
             p.paragraph_format.first_line_indent = Inches(-0.5)
 
+            # --- Original reference (red if DOI suspicious)
             original = row.get("Original Reference", "")
             if row.get("DOI Suspicious"):
-                _add_run(p, original, red=True)
+                _add_run(p, original, size_pt=11, red=True)
             else:
-                _add_run(p, original)
-            if row.get("No.") in uncited:
+                _add_run(p, original, size_pt=11)
+
+            if row.get("No.") in uncited_ref_nos:
                 _add_red_italic_run(p, "  ← NOT CITED IN TEXT")
 
+            # --- Corrected version (withheld when DOI suspicious)
             if row.get("DOI Suspicious"):
                 withheld = doc.add_paragraph()
                 withheld.paragraph_format.left_indent = Inches(0.5)
-                _add_run(withheld,
-                         "Corrected version withheld — DOI mismatch. "
-                         "Manual verification required.",
-                         size_pt=10, italic=True, bold=True, red=True)
+                withheld.paragraph_format.space_after = Pt(6)
+                _add_run(
+                    withheld,
+                    "Corrected version withheld — the DOI in this reference "
+                    "does not match the claimed title/authors. Manual verification "
+                    "required before any correction is applied.",
+                    size_pt=10, italic=True, bold=True, red=True,
+                )
             else:
                 p2 = doc.add_paragraph()
+                p2.paragraph_format.space_after = Pt(4)
                 p2.paragraph_format.left_indent = Inches(0.5)
-                _add_run(p2, "Corrected: ", bold=True)
-                _add_styled_reference(p2, row.get("Corrected Version", ""),
-                                      row.get("Italicized in APA", ""))
-                src_tag = f"  [{row.get('Canonical Source', '—')} · " \
-                          f"{row.get('Confidence', 'unverified')}]"
-                _add_run(p2, src_tag, size_pt=9, italic=True)
+                _add_run(p2, "Corrected: ", bold=True, size_pt=11)
+                corrected = row.get("Corrected Version", "")
+                italic_elements = row.get("Italicized in APA", "")
+                _add_styled_reference(p2, corrected, italic_elements)
 
-                vstatus = row.get("Verification Status", "")
-                if vstatus and vstatus not in ("VERIFIED",):
-                    sp = doc.add_paragraph()
-                    sp.paragraph_format.left_indent = Inches(0.5)
-                    _add_run(sp,
-                             f"Verification: {vstatus} — "
-                             f"{row.get('Verification Reason', '')}",
-                             size_pt=9, italic=True,
-                             red=(vstatus in ("MANUAL_CHECK", "WITHHELD")))
+                correction_note = row.get("Correction Note", "")
+                if correction_note:
+                    note_p = doc.add_paragraph()
+                    note_p.paragraph_format.left_indent = Inches(0.5)
+                    _add_run(note_p, f"Fix applied: {correction_note}",
+                             size_pt=10, italic=True)
 
-                note = row.get("Correction Note", "")
-                if note:
-                    np_ = doc.add_paragraph()
-                    np_.paragraph_format.left_indent = Inches(0.5)
-                    _add_run(np_, f"Fix applied: {note}", size_pt=10, italic=True)
+                placeholders = row.get("Placeholders") or {}
+                active_ph = [k for k, v in placeholders.items() if v]
+                if active_ph:
+                    ph_p = doc.add_paragraph()
+                    ph_p.paragraph_format.left_indent = Inches(0.5)
+                    _add_run(ph_p,
+                             "Placeholder used — fill in before submission: "
+                             + ", ".join(active_ph),
+                             size_pt=10, italic=True, bold=True, red=True)
 
+            # --- DOI warning (always shown)
             if row.get("DOI Suspicious"):
-                wp = doc.add_paragraph()
-                wp.paragraph_format.left_indent = Inches(0.5)
-                _add_run(wp,
-                         f"⚠ Possible fabricated reference: "
-                         f"{row.get('DOI Verification Reasons', '')}",
+                warn_p = doc.add_paragraph()
+                warn_p.paragraph_format.left_indent = Inches(0.5)
+                reasons = row.get("DOI Verification Reasons", "")
+                _add_run(warn_p, f"⚠ Possible fabricated reference: {reasons}",
                          size_pt=10, italic=True, bold=True, red=True)
+                if row.get("OpenAlex Title"):
+                    _add_run(warn_p, f'\n  OpenAlex says: "{row["OpenAlex Title"]}"',
+                             size_pt=10, italic=True)
+                if row.get("OpenAlex Authors"):
+                    _add_run(warn_p, f"\n  Authors: {row['OpenAlex Authors']}",
+                             size_pt=10, italic=True)
 
-    # --- Section 3: Summary
+            missing_elems = row.get("Missing Required Elements", "")
+            if missing_elems:
+                note_p = doc.add_paragraph()
+                note_p.paragraph_format.left_indent = Inches(0.5)
+                _add_run(note_p, f"Missing required element(s): {missing_elems}",
+                         size_pt=10, italic=True, red=True)
+
+    # ---------- Section 3: Summary ----------
     doc.add_page_break()
     h3 = doc.add_heading(level=1)
-    _set_run_font(h3.add_run("3. Summary"), size_pt=14, bold=True)
+    hr3 = h3.add_run("3. Summary")
+    _set_run_font(hr3, size_pt=14, bold=True)
 
     stats = result.get("citation_stats", {})
     recency = result.get("recency", {})
-    total_refs = len(result.get("references", []))
-    doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
-    doi_sus = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
-    high_conf = sum(1 for r in reference_rows if r.get("Confidence") == "high")
-    med_conf = sum(1 for r in reference_rows if r.get("Confidence") == "medium")
-    unv_conf = sum(1 for r in reference_rows if r.get("Confidence") == "unverified")
 
+    total_refs_now = len(result.get("references", []))
+    doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
+    doi_suspicious = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
+    doi_suspicious_pct = doi_suspicious / total_refs_now * 100 if total_refs_now else 0
+    single_page_count = sum(
+        1 for r in reference_rows
+        if (r.get("Placeholders") or {}).get("missing_pp")
+    )
+
+    # ---------- Section 3: Summary (as table) ----------
     summary_rows = [
-        ("Total references", str(total_refs), False),
+        ("Total references", str(total_refs_now), False),
         ("Total in-text citations", str(stats.get("total", 0)), False),
         ("  • Narrative", str(stats.get("narrative", 0)), False),
         ("  • Parenthetical", str(stats.get("parenthetical", 0)), False),
         ("Citations missing from references",
          str(len(result.get("missing_references", []))), False),
-        ("References missing from citations", str(len(uncited)), False),
-        ("  • HIGH confidence (DOI verified)", str(high_conf), False),
-        ("  • MEDIUM confidence (title match)", str(med_conf), False),
-        ("  • UNVERIFIED (local only)", str(unv_conf), False),
+        ("References missing from citations",
+         str(len(uncited_ref_nos)), False),
         ("DOI checked via OpenAlex", str(doi_checked), False),
         ("DOI suspicious (possible fabricated references)",
-         str(doi_sus), doi_sus > 0),
+         f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
+         doi_suspicious > 0),
+        ("Corrections withheld due to DOI mismatch",
+         str(doi_suspicious), doi_suspicious > 0),
+        ("References with incomplete page range",
+         str(single_page_count), False),
         ("% references within last 10 years "
          f"({recency.get('start_year')}-{recency.get('end_year')})",
          f"{recency.get('recent_percentage', 0):.1f}%", False),
     ]
 
-    table = doc.add_table(rows=1, cols=2)
-    table.style = "Light Grid Accent 1"
-    table.autofit = True
-    hdr = table.rows[0].cells
-    for cell, text in zip(hdr, ["Metric", "Value"]):
+    summary_table = doc.add_table(rows=1, cols=2)
+    summary_table.style = "Light Grid Accent 1"
+    summary_table.autofit = True
+
+    # Header
+    hdr_cells = summary_table.rows[0].cells
+    for cell, text in zip(hdr_cells, ["Metric", "Value"]):
         cell.text = ""
         run = cell.paragraphs[0].add_run(text)
         _set_run_font(run, size_pt=10, bold=True)
 
-    for label, value, warn in summary_rows:
-        cells = table.add_row().cells
+    # Data rows
+    for label, value, is_warning in summary_rows:
+        cells = summary_table.add_row().cells
+        # Label
         cells[0].text = ""
-        rl = cells[0].paragraphs[0].add_run(label)
-        _set_run_font(rl, size_pt=10, bold=warn,
-                      color=RED if warn else None)
+        run_label = cells[0].paragraphs[0].add_run(label)
+        _set_run_font(run_label, size_pt=10,
+                      bold=is_warning,
+                      color=RED if is_warning else None)
+        # Value
         cells[1].text = ""
-        rv = cells[1].paragraphs[0].add_run(value)
-        _set_run_font(rv, size_pt=10, bold=warn,
-                      color=RED if warn else None)
+        run_val = cells[1].paragraphs[0].add_run(value)
+        _set_run_font(run_val, size_pt=10,
+                      bold=is_warning,
+                      color=RED if is_warning else None)
+
+    # Optional: keep sub-bullets visually indented inside the cell
+    for row in summary_table.rows[1:]:
+        label_run = row.cells[0].paragraphs[0].runs[0]
+        if label_run.text.startswith("  •"):
+            row.cells[0].paragraphs[0].paragraph_format.left_indent = Inches(0.25)
+
+    # ---------- Section 3.1: Source Type Distribution ----------
+    h31 = doc.add_heading(level=2)
+    hr31 = h31.add_run("3.1 Source Type Distribution")
+    _set_run_font(hr31, size_pt=12, bold=True)
+
+    # Tally using the same canonical ordering as the Streamlit UI
+    source_counts = Counter(
+        (row.get("Source Type") or "Other") for row in reference_rows
+    )
+    source_order = CANONICAL_SOURCE_TYPES
+    extra_source_types = sorted(x for x in source_counts if x not in source_order)
+    ordered_sources = source_order + extra_source_types
+
+    if total_refs_now == 0:
+        p = doc.add_paragraph()
+        _set_run_font(p.add_run("No references were detected."), italic=True)
+    else:
+        # Build a 3-column table: Source Type | Count | Percentage
+        table = doc.add_table(rows=1, cols=3)
+        table.style = "Light Grid Accent 1"
+        table.autofit = True
+
+        # Header row
+        hdr = table.rows[0].cells
+        for cell, text in zip(hdr, ["Source Type", "Count", "Percentage"]):
+            cell.text = ""
+            run = cell.paragraphs[0].add_run(text)
+            _set_run_font(run, size_pt=10, bold=True)
+
+        # Data rows
+        for source_type in ordered_sources:
+            count = source_counts.get(source_type, 0)
+            if count == 0 and source_type not in source_order:
+                continue  # skip empty non-canonical types
+            pct = count / total_refs_now * 100 if total_refs_now else 0
+            cells = table.add_row().cells
+            for cell, val in zip(
+                cells,
+                [source_type, str(count), f"{pct:.1f}%"],
+            ):
+                cell.text = ""
+                run = cell.paragraphs[0].add_run(val)
+                _set_run_font(run, size_pt=10)
+
+        # Total row (bold)
+        cells = table.add_row().cells
+        for cell, val in zip(cells, ["Total", str(total_refs_now), "100.0%"]):
+            cell.text = ""
+            run = cell.paragraphs[0].add_run(val)
+            _set_run_font(run, size_pt=10, bold=True)
+
+        # Optional: indent the table slightly for readability
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    paragraph.paragraph_format.space_after = Pt(2)
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -1989,90 +2377,23 @@ def build_correction_docx(result):
 
 
 # =========================================================
-# MAIN PIPELINE
+# RENDER (called from app.py)
 # =========================================================
-
-def analyze_manuscript(uploaded_file, manuscript_year):
-    uploaded_file.seek(0)
-    full_text, _pages = extract_pdf_text(uploaded_file)
-    full_text = clean_text(full_text)
-
-    if not full_text.strip():
-        raise ValueError("PDF contained no extractable text.")
-
-    ai_extract = _extract_with_ai(full_text)
-    if not ai_extract:
-        raise ValueError("OpenAI extraction failed (no response).")
-    if "error" in ai_extract:
-        raise ValueError(ai_extract["error"])
-
-    references = ai_extract.get("references", [])
-    raw_citations = ai_extract.get("citations", [])
-
-    if not references:
-        raise ValueError("OpenAI found 0 references in the manuscript.")
-
-    citations = [parse_citation(c) for c in raw_citations]
-    reference_rows = build_reference_comparison(references, manuscript_year)
-    citation_ai = review_citations_with_ai(citations)
-    citation_rows = build_citation_comparison(citations, citation_ai)
-
-    parsed_refs = [parse_reference(r) for r in references]
-    matching = match_citations_to_references(citations, parsed_refs)
-    missing = find_missing_references(citations, parsed_refs)
-    citation_stats = calculate_citation_statistics(citations)
-    recency = calculate_reference_recency(references, manuscript_year)
-
-    return {
-        "filename": uploaded_file.name,
-        "references": references,
-        "parsed_references": parsed_refs,
-        "citations": citations,
-        "citation_stats": citation_stats,
-        "matching_results": matching,
-        "missing_references": missing,
-        "recency": recency,
-        "reference_comparison": reference_rows,
-        "citation_comparison": citation_rows,
-        "manuscript_year": manuscript_year,
-        "ai_complete": True,
-    }
-
-
-# =========================================================
-# UI RENDER
-# =========================================================
-
-def _sanitize_error(err):
-    """Never leak more than 200 chars of raw AI output."""
-    if not err:
-        return "Unknown error."
-    err = str(err)
-    # Trim raw dumps from the error string
-    for marker in ("Preview:", "First 500 chars:"):
-        if marker in err:
-            err = err.split(marker)[0].strip()
-            err += " (see server logs / /tmp/ai_raw_response.txt for full raw response)"
-    if len(err) > 400:
-        err = err[:400] + "..."
-    return err
-
 
 def render():
     st.title("OmniCite Auditor - APA 7th Edition")
-    st.caption("AI extraction → OpenAlex verification → AI formatting")
+    st.caption("Narrative + parenthetical in-text citations ↔ APA reference list")
 
     uploaded_files = st.file_uploader(
         "Upload manuscript PDFs",
         type=["pdf"],
         accept_multiple_files=True,
-        help="Upload up to 5 manuscripts.",
+        help="Upload up to 5 manuscripts in one batch.",
         key="apa_file_uploader",
     )
 
     manuscript_year = st.number_input(
-        "Manuscript publication year",
-        min_value=1900, max_value=2100,
+        "Manuscript publication year", min_value=1900, max_value=2100,
         value=datetime.now().year, step=1,
         key="apa_manuscript_year",
     )
@@ -2080,206 +2401,327 @@ def render():
     if "apa_batch_results" not in st.session_state:
         st.session_state["apa_batch_results"] = {}
 
-    # ── Cache management (always visible)
-    with st.expander("🔧 Cache & Debug", expanded=False):
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("🗑 Clear AI cache", use_container_width=True):
-                _clear_cache()
-                st.success("Cache cleared. Re-run extraction.")
-        with colB:
-            if st.button("📄 Show debug dump", use_container_width=True):
-                if os.path.exists(DEBUG_DUMP_PATH):
-                    try:
-                        with open(DEBUG_DUMP_PATH, "r", encoding="utf-8") as f:
-                            content = f.read()
-                        st.text_area("Raw AI responses",
-                                     content[-8000:], height=300)
-                    except Exception as exc:
-                        st.error(f"Could not read debug dump: {exc}")
-                else:
-                    st.info("No debug dump yet. Run extraction first.")
-
-    if not uploaded_files:
-        return
-
-    if len(uploaded_files) > 5:
-        st.error("Maximum batch size is 5 PDFs.")
-        st.stop()
-
-    if st.button(
-        f"Extract & Review ({len(uploaded_files)} PDF"
-        f"{'s' if len(uploaded_files) != 1 else ''})",
-        use_container_width=True,
-        key="apa_extract_button",
-    ):
-        if _get_openai_client() is None:
-            st.error("OPENAI_API_KEY is not set. This pipeline requires OpenAI.")
+    if uploaded_files:
+        if len(uploaded_files) > 5:
+            st.error(f"You uploaded {len(uploaded_files)} manuscripts. The maximum batch size is 5 PDFs.")
             st.stop()
 
-        results = {}
-        progress = st.progress(0, text="Starting...")
-        for i, uf in enumerate(uploaded_files, start=1):
-            key = f"{i}::{uf.name}"
-            try:
-                progress.progress(
-                    int(((i - 1) / len(uploaded_files)) * 100),
-                    text=f"Processing {i}/{len(uploaded_files)}: {uf.name}",
+        with st.container(key="blue_btn_extract_apa"):
+            extract_batch = st.button(
+                f"Extract & Review ({len(uploaded_files)} manuscript{'s' if len(uploaded_files) != 1 else ''})",
+                use_container_width=True,
+                key="apa_extract_button",
+            )
+
+        if extract_batch:
+            local_results = {}
+            progress = st.progress(0, text="Extracting APA citations and references locally...")
+            for file_index, uploaded_file in enumerate(uploaded_files, start=1):
+                key = f"{file_index}::{uploaded_file.name}"
+                try:
+                    progress.progress(
+                        int(((file_index - 1) / len(uploaded_files)) * 100),
+                        text=f"Extracting {file_index}/{len(uploaded_files)}: {uploaded_file.name}"
+                    )
+                    local_results[key] = analyze_apa_locally(uploaded_file, int(manuscript_year))
+                except Exception as exc:
+                    st.error(f"{uploaded_file.name} failed:\n\n{traceback.format_exc()}")
+                    local_results[key] = {
+                        "filename": uploaded_file.name,
+                        "error": str(exc),
+                        "manuscript_year": int(manuscript_year),
+                    }
+            progress.empty()
+            st.session_state["apa_batch_results"] = local_results
+
+        results = st.session_state.get("apa_batch_results", {})
+
+        if results:
+            valid_results = {k: v for k, v in results.items() if not v.get("error")}
+            ai_ready = bool(valid_results) and all(
+                v.get("ai_complete", False) for v in valid_results.values()
+            )
+            preview_key = next(iter(valid_results), None)
+            result = valid_results.get(preview_key) if preview_key else None
+
+            if result is None:
+                for failed in results.values():
+                    if failed.get("error"):
+                        st.error(f"{failed.get('filename', 'Manuscript')}: {failed['error']}")
+            else:
+                selector_keys = list(valid_results.keys())
+                selected_key = st.selectbox(
+                    "Select manuscript to review",
+                    selector_keys,
+                    format_func=lambda k: valid_results[k].get("filename", k),
+                    key="apa_local_selected_manuscript",
                 )
-                results[key] = analyze_manuscript(uf, int(manuscript_year))
-            except Exception as exc:
-                results[key] = {
-                    "filename": uf.name,
-                    "error": _sanitize_error(str(exc)),
-                    "manuscript_year": int(manuscript_year),
-                }
-        progress.empty()
-        st.session_state["apa_batch_results"] = results
-        st.rerun()
+                result = valid_results[selected_key]
 
-    results = st.session_state.get("apa_batch_results", {})
-    if not results:
-        return
+                citations = result["citations"]
+                references = result["references"]
+                stats = result["citation_stats"]
+                matching = result["matching_results"]
+                missing = result["missing_references"]
 
-    valid = {k: v for k, v in results.items() if not v.get("error")}
-    for k, v in results.items():
-        if v.get("error"):
-            st.error(f"{v['filename']}: {v['error']}")
+                ai_citation_rows = (
+                    result.get("citation_comparison")
+                    or build_apa_citation_comparison(citations, [])
+                )
+                narrative_rows = [
+                    r for r in ai_citation_rows
+                    if str(r.get("Type", "")).lower() == "narrative"
+                ]
+                parenthetical_rows = [
+                    r for r in ai_citation_rows
+                    if str(r.get("Type", "")).lower() == "parenthetical"
+                ]
 
-    if not valid:
-        return
+                st.caption(
+                    f"References: {len(references)}  |  "
+                    f"In-text citations: {len(citations)}"
+                )
 
-    selected_key = st.selectbox(
-        "Select manuscript to review",
-        list(valid.keys()),
-        format_func=lambda k: valid[k].get("filename", k),
-        key="apa_selected_manuscript",
-    )
-    result = valid[selected_key]
+                with st.expander(
+                    f"Narrative In-text Citations ({len(narrative_rows)})",
+                    expanded=False,
+                    key=f"narr_{selected_key}",
+                ):
+                    if narrative_rows:
+                        st.dataframe(
+                            pd.DataFrame([
+                                {"Original Citation": r.get("Original Citation", "")}
+                                for r in narrative_rows
+                            ]),
+                            use_container_width=True, hide_index=True,
+                            height=min(230, max(90, 38 * (len(narrative_rows) + 1))),
+                        )
+                    else:
+                        st.info("No narrative in-text citations were detected in this manuscript.")
 
-    stats = result["citation_stats"]
-    recency = result["recency"]
-    reference_rows = result.get("reference_comparison") or []
-    citation_rows  = result.get("citation_comparison") or []
-    matching       = result.get("matching_results") or []
-    missing        = result.get("missing_references") or []
+                with st.expander(
+                    f"Parenthetical In-text Citations ({len(parenthetical_rows)})",
+                    expanded=False,
+                    key=f"paren_{selected_key}",
+                ):
+                    if parenthetical_rows:
+                        st.dataframe(
+                            pd.DataFrame([
+                                {"Original Citation": r.get("Original Citation", "")}
+                                for r in parenthetical_rows
+                            ]),
+                            use_container_width=True, hide_index=True,
+                            height=min(230, max(90, 38 * (len(parenthetical_rows) + 1))),
+                        )
+                    else:
+                        st.info("No parenthetical in-text citations were detected in this manuscript.")
 
-    total_refs = len(result["references"])
-    total_cits = len(result["citations"])
-    cited_count = sum(1 for row in matching if row.get("Cited"))
-    cits_missing_ref = len(missing)
-    refs_missing_cit = max(0, total_refs - cited_count)
+                citations_missing_reference = len(missing)
+                references_missing_rows = [row for row in matching if not row.get("Cited")]
+                references_missing_citation = len(references_missing_rows)
 
-    doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
-    doi_sus = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
-    doi_sus_pct = doi_sus / total_refs * 100 if total_refs else 0
-    high_conf = sum(1 for r in reference_rows if r.get("Confidence") == "high")
-    med_conf = sum(1 for r in reference_rows if r.get("Confidence") == "medium")
-    unv_conf = sum(1 for r in reference_rows if r.get("Confidence") == "unverified")
+                if citations_missing_reference:
+                    with st.expander(
+                        f"Citations Missing from References ({citations_missing_reference})",
+                        expanded=False,
+                        key=f"missref_{selected_key}",
+                    ):
+                        st.dataframe(
+                            pd.DataFrame(missing)[["Citation", "Author", "Year"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
-    st.caption(f"References: {total_refs}  |  In-text citations: {total_cits}")
+                if references_missing_citation:
+                    with st.expander(
+                        f"References Missing from Citations ({references_missing_citation})",
+                        expanded=False,
+                        key=f"misscite_{selected_key}",
+                    ):
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "Reference #": row.get("Reference #"),
+                                    "Author": row.get("Author"),
+                                    "Year": row.get("Year"),
+                                    "Reference": row.get("Reference"),
+                                }
+                                for row in references_missing_rows
+                            ]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
-    metric_rows = [
-        {"Metric": "Total References", "Value": total_refs},
-        {"Metric": "References > 15",
-         "Value": (f"Yes ({total_refs})" if total_refs > 15 else f"No ({total_refs})")},
-        {"Metric": "Total In-text Citations", "Value": total_cits},
-        {"Metric": "Narrative Citations", "Value": stats.get("narrative", 0)},
-        {"Metric": "Parenthetical Citations", "Value": stats.get("parenthetical", 0)},
-        {"Metric": "HIGH-confidence corrections", "Value": high_conf},
-        {"Metric": "MEDIUM-confidence corrections", "Value": med_conf},
-        {"Metric": "UNVERIFIED corrections", "Value": unv_conf},
-        {"Metric": "% Last 10 Years",
-         "Value": f"{recency.get('recent_percentage', 0):.1f}%"},
-        {"Metric": "Citations Missing from References", "Value": cits_missing_ref},
-        {"Metric": "References Missing from Citations", "Value": refs_missing_cit},
-        {"Metric": "DOI Checked (OpenAlex)", "Value": doi_checked},
-        {"Metric": "DOI Suspicious (possible fabrication)",
-         "Value": f"{doi_sus} ({doi_sus_pct:.1f}%)"},
-    ]
-    metric_df = pd.DataFrame(metric_rows)
+                with st.container(key="green_btn_ai_apa"):
+                    run_ai = st.button(
+                        "Automated Processing Check",
+                        use_container_width=True,
+                        disabled=not bool(_get_openai_client()),
+                        help=None if _get_openai_client() else "Set key to enable automated APA correction.",
+                        key="run_automated_apa_review_below_missing_checks",
+                    )
 
-    source_counts = Counter((r.get("Source Type") or "Other") for r in reference_rows)
-    source_rows = []
-    for stype in CANONICAL_SOURCE_TYPES:
-        c = source_counts.get(stype, 0)
-        pct = c / total_refs * 100 if total_refs else 0
-        source_rows.append({
-            "Source Type": stype,
-            "Count / Percentage": f"{c} ({pct:.1f}%)",
-        })
-    source_df = pd.DataFrame(source_rows)
+                if run_ai:
+                    ai_progress = st.progress(0, text="Running automated APA review...")
+                    updated = {}
+                    for idx, (key, batch_result) in enumerate(valid_results.items(), start=1):
+                        ai_progress.progress(
+                            int(((idx - 1) / len(valid_results)) * 100),
+                            text=f"APA review {idx}/{len(valid_results)}: {batch_result['filename']}",
+                        )
+                        try:
+                            enriched = enrich_apa_with_ai(batch_result)
+                        except Exception:
+                            st.error(f"AI review failed for {batch_result.get('filename')}:\n\n{traceback.format_exc()}")
+                            enriched = batch_result
+                        updated[key] = enriched
+                        st.session_state["apa_batch_results"][key] = enriched
+                    ai_progress.empty()
+                    st.rerun()
 
-    col1, col2 = st.columns([1, 1], gap="large")
-    with col1:
-        st.dataframe(metric_df, use_container_width=True, hide_index=True)
-    with col2:
-        st.dataframe(source_df, use_container_width=True, hide_index=True)
+                if ai_ready:
+                    keys = list(valid_results.keys())
+                    selected_key = st.selectbox(
+                        "Manuscript to review",
+                        keys,
+                        format_func=lambda k: valid_results[k].get("filename", k),
+                        key="apa_ai_selected_manuscript",
+                    )
+                    result = valid_results[selected_key]
 
-    if st.toggle("Show In-text Citation Correction", value=False,
-                 key="show_intext"):
-        st.markdown("#### In-text Citation Correction")
-        if citation_rows:
-            df = pd.DataFrame([
-                {
-                    "Type": r.get("Type", ""),
-                    "Original Citation": r.get("Original Citation", ""),
-                    "Revised Citation": r.get("Revised Citation", ""),
-                    "Status": r.get("Status", "MATCH"),
-                    "Notes": r.get("Notes", ""),
-                }
-                for r in citation_rows
-            ])
-            st.dataframe(df, use_container_width=True, hide_index=True, height=320)
-        else:
-            st.info("No in-text citations available.")
+                    citations = result["citations"]
+                    references = result["references"]
+                    stats = result["citation_stats"]
+                    matching = result["matching_results"]
+                    missing = result["missing_references"]
+                    recency = result["recency"]
 
-    if st.toggle("Show Reference Correction", value=False,
-                 key="show_reference"):
-        st.markdown("#### Reference Correction")
-        if reference_rows:
-            df = pd.DataFrame([
-                {
-                    "No.": r.get("No."),
-                    "Source Type": r.get("Source Type", "Other"),
-                    "Year": r.get("Year"),
-                    "Original Reference": r.get("Original Reference", ""),
-                    "Corrected Version": (
-                        "— WITHHELD (DOI mismatch) —"
-                        if r.get("DOI Suspicious")
-                        else r.get("Corrected Version", "")
-                    ),
-                    "Confidence": r.get("Confidence", "unverified"),
-                    "Canonical Source": r.get("Canonical Source", "—"),
-                    "Status": r.get("Status", "—"),
-                    "Verification": r.get("Verification Status", "—"),
-                    "OpenAlex Title": (r.get("OpenAlex Title") or "")[:60],
-                    "OpenAlex Journal": r.get("OpenAlex Journal") or "—",
-                    "OpenAlex Vol/Issue/Pages": " / ".join(
-                        str(x) for x in [
-                            r.get("OpenAlex Volume") or "—",
-                            r.get("OpenAlex Issue") or "—",
-                            r.get("OpenAlex Pages") or "—",
-                        ]
-                    ),
-                }
-                for r in reference_rows
-            ])
-            st.dataframe(df, use_container_width=True, hide_index=True, height=320)
-        else:
-            st.info("No references available.")
+                    citation_rows = result.get("citation_comparison") or []
+                    reference_rows = result.get("reference_comparison") or []
 
-    try:
-        docx_bytes = build_correction_docx(result)
-        safe = re.sub(r"[^\w\-]+", "_", result.get("filename", "manuscript"))
-        st.download_button(
-            label="Download Diagnostic Report",
-            data=docx_bytes,
-            file_name=f"{safe}_diagnostic_report.docx",
-            mime=("application/vnd.openxmlformats-officedocument."
-                  "wordprocessingml.document"),
-            use_container_width=True,
-            key="download_apa_correction_docx",
-        )
-    except Exception as exc:
-        st.error(f"Could not build DOCX: {exc}")
+                    total_references = len(references)
+                    total_citations = len(citations)
+                    cited_count = sum(1 for row in matching if row.get("Cited"))
+                    citations_missing_reference = len(missing)
+                    references_missing_citation = max(0, total_references - cited_count)
+
+                    # --- DOI verification counters ---
+                    doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
+                    doi_suspicious = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
+                    doi_suspicious_pct = (
+                        doi_suspicious / total_references * 100 if total_references else 0
+                    )
+
+                    metric_rows = [
+                        {"Metric": "Total References", "Value": total_references},
+                        {"Metric": "References > 15",
+                         "Value": (f"Yes ({total_references})" if total_references > 15
+                                   else f"No ({total_references})")},
+                        {"Metric": "Total In-text Citations", "Value": total_citations},
+                        {"Metric": "Narrative Citations", "Value": stats.get("narrative", 0)},
+                        {"Metric": "Parenthetical Citations", "Value": stats.get("parenthetical", 0)},
+                        {"Metric": "% Last 10 Years",
+                         "Value": f"{recency.get('recent_percentage', 0):.1f}%"},
+                        {"Metric": "Citations Missing from References",
+                         "Value": citations_missing_reference},
+                        {"Metric": "References Missing from Citations",
+                         "Value": references_missing_citation},
+                        {"Metric": "DOI Checked (OpenAlex)", "Value": doi_checked},
+                        {"Metric": "DOI Suspicious (possible fabrication)",
+                         "Value": f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)"},
+                    ]
+                    metric_df = pd.DataFrame(metric_rows)
+
+                    source_counts = Counter(
+                        (row.get("Source Type") or "Other") for row in reference_rows
+                    )
+                    source_order = CANONICAL_SOURCE_TYPES
+                    extra_source_types = sorted(x for x in source_counts if x not in source_order)
+                    source_rows = []
+                    for source_type in source_order + extra_source_types:
+                        count = source_counts.get(source_type, 0)
+                        pct = count / total_references * 100 if total_references else 0
+                        source_rows.append({
+                            "Source Type": source_type,
+                            "Count / Percentage": f"{count} ({pct:.1f}%)",
+                        })
+                    source_df = pd.DataFrame(source_rows)
+
+                    left_col, right_col = st.columns([1, 1], gap="large")
+                    with left_col:
+                        st.dataframe(metric_df, use_container_width=True, hide_index=True)
+                    with right_col:
+                        st.dataframe(source_df, use_container_width=True, hide_index=True)
+
+                    show_intext = st.toggle(
+                        "Show In-text Citation Correction",
+                        value=False,
+                        key="show_intext_correction_toggle",
+                    )
+                    if show_intext:
+                        st.markdown("#### In-text Citation Correction")
+                        intext_display = pd.DataFrame([
+                            {
+                                "Type": row.get("Type", ""),
+                                "Original Citation": row.get("Original Citation", ""),
+                                "Revised Citation": row.get("Revised Citation", ""),
+                                "Status": row.get("Status", "MATCH"),
+                                "Notes": row.get("Notes", ""),
+                            }
+                            for row in citation_rows
+                        ])
+                        if not intext_display.empty:
+                            st.dataframe(intext_display, use_container_width=True,
+                                         hide_index=True, height=230)
+                        else:
+                            st.info("No in-text citations were available for automated review.")
+
+                    show_reference = st.toggle(
+                        "Show Reference Correction",
+                        value=False,
+                        key="show_reference_correction_toggle",
+                    )
+                    if show_reference:
+                        st.markdown("#### Reference Correction")
+                        reference_display = pd.DataFrame([
+                            {
+                                "No.": row.get("No."),
+                                "Source Type": row.get("Source Type", "Other"),
+                                "Year": row.get("Year"),
+                                "Original Reference": row.get("Original Reference", ""),
+                                "Corrected Version": (
+                                    "— WITHHELD (DOI mismatch) —"
+                                    if row.get("DOI Suspicious")
+                                    else row.get("Corrected Version", "")
+                                ),
+                                "Placeholders": ", ".join(
+                                    k for k, v in (row.get("Placeholders") or {}).items() if v
+                                ) or "—",
+                                "DOI Checked": "YES" if row.get("DOI Verified") else "NO",
+                                "DOI Suspicious": "⚠️ YES" if row.get("DOI Suspicious") else "—",
+                                "OpenAlex Title": (row.get("OpenAlex Title") or "")[:60],
+                                "DOI Issues": row.get("DOI Verification Reasons", ""),
+                                "Status": row.get("Status", "MANUAL CHECK"),
+                            }
+                            for row in reference_rows
+                        ])
+                        if not reference_display.empty:
+                            st.dataframe(reference_display, use_container_width=True,
+                                         hide_index=True, height=280)
+                        else:
+                            st.info("No references were available for automated review.")
+
+                    try:
+                        docx_bytes = build_correction_docx(result)
+                        safe_name = re.sub(r"[^\w\-]+", "_", result.get("filename", "manuscript"))
+                        st.markdown('<div class="apa-green-button-marker"></div>', unsafe_allow_html=True)
+                        st.download_button(
+                            label="Download Diagnostic Report",
+                            data=docx_bytes,
+                            file_name=f"{safe_name}_diagnostic_report.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                            key="download_apa_correction_docx",
+                        )
+                    except Exception as exc:
+                        st.error(f"Could not build DOCX report: {exc}")
