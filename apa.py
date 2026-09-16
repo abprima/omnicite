@@ -1643,11 +1643,14 @@ def render():
     client = OpenAI(api_key=openai_key)
 
     # ---- Uploader ----
+    if "apa_uploader_version" not in st.session_state:
+        st.session_state["apa_uploader_version"] = 0
+
     uploaded_files = st.file_uploader(
         "Upload manuscript PDFs",
         type=["pdf"],
         accept_multiple_files=True,
-        key="apa_uploader",
+        key=f"apa_uploader_{st.session_state['apa_uploader_version']}",
     )
 
     if "pdf_batches" not in st.session_state:
@@ -1895,3 +1898,55 @@ def render():
         )
     except Exception as exc:
         st.error(f"Could not build DOCX report: {exc}")
+
+    # ---- Start Fresh button (red, below download) ----
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-reset_btn"] button {
+            background-color: #dc2626 !important;
+            color: #ffffff !important;
+            border: 1px solid #b91c1c !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-reset_btn"] button:hover {
+            background-color: #b91c1c !important;
+            color: #ffffff !important;
+            border-color: #991b1b !important;
+        }
+        div[class*="st-key-reset_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(220, 38, 38, 0.4) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button(
+        "🔄 Start Fresh — Clear All Uploads & Results",
+        use_container_width=True,
+        key="reset_btn_start_fresh",
+    ):
+        # 1. Wipe every APA-related session-state entry.
+        for k in list(st.session_state.keys()):
+            if k == "pdf_batches" or k.startswith("pdf_batches"):
+                del st.session_state[k]
+            if k.startswith("dbg_ref_"):
+                del st.session_state[k]
+            if k == "selected_pdf_key":
+                del st.session_state[k]
+
+        # 2. Recreate the batch dict empty.
+        st.session_state["pdf_batches"] = {}
+
+        # 3. Bump the uploader version → new key → empty uploader.
+        st.session_state["apa_uploader_version"] = (
+            st.session_state.get("apa_uploader_version", 0) + 1
+        )
+
+        # 4. Optional: reset the manuscript year back to current year.
+        st.session_state["apa_manuscript_year"] = datetime.now().year
+
+        # 5. Rerun so everything re-renders clean.
+        st.rerun()
