@@ -2077,21 +2077,39 @@ def build_apa_reference_comparison(references, ai_results, manuscript_year):
             source_type = normalize_source_type(
                 ai.get("source_type") or _source_type_from_openalex(meta)
             )
-            oa_ref, oa_note = build_apa_reference_from_openalex(
-                meta, parsed, original_clean
+
+            # ── Step 1: OpenAI formats the APA reference from OpenAlex data
+            ai_formatted = format_apa_with_ai(
+                meta, original_clean, source_type
             )
-            if oa_ref:
-                corrected = oa_ref
-                correction_note = oa_note
+
+            if ai_formatted.get("corrected_reference"):
+                corrected       = ai_formatted["corrected_reference"]
+                italic_elements = ai_formatted["italic_elements"]
+                source_type     = ai_formatted["source_type"]
+                correction_note = (
+                    ai_formatted.get("explanation")
+                    or "Formatted from OpenAlex metadata via OpenAI."
+                )
+                placeholders = {}
+
             else:
-                local = build_local_apa_reference_correction(base_text)
-                corrected = local["Corrected"]
-                correction_note = local.get("Note", "")
-                placeholders = local.get("Placeholders", {})
-            italic_elements = derive_italic_elements_from_reference(
-                corrected, source_type
-            )
-            placeholders = {}
+                # ── Step 2: fallback to deterministic skeleton
+                oa_ref, oa_note = build_apa_reference_from_openalex(
+                    meta, parsed, original_clean
+                )
+                if oa_ref:
+                    corrected = oa_ref
+                    correction_note = oa_note
+                else:
+                    local = build_local_apa_reference_correction(base_text)
+                    corrected = local["Corrected"]
+                    correction_note = local.get("Note", "")
+                    placeholders = local.get("Placeholders", {})
+
+                italic_elements = derive_italic_elements_from_reference(
+                    corrected, source_type
+                )
 
         else:
             local = build_local_apa_reference_correction(base_text)
@@ -2233,6 +2251,152 @@ def build_apa_reference_from_openalex(meta, parsed_reference, original_reference
     note = "Corrected using OpenAlex bibliographic record."
     return reconstructed, note
 
+def format_apa_with_ai(openalex_meta, original_reference, source_type):
+    """
+    Feed verified OpenAlex metadata to OpenAI and receive:
+      - a complete APA 7 reference string
+      - the exact literal substrings that should be italicized
+      - the confirmed source type
+
+    The AI is FORBIDDEN from inventing or altering any bibliographic fact.
+    It may only reshape facts into APA 7 format.
+    """
+    client = _get_openai_client()
+    if client is None:
+        return {
+            "corrected_reference": "",
+            "italic_elements": "",
+            "source_type": source_type,
+            "explanation": "OpenAI client unavailable",
+        }
+
+    # ── Preserve [translation] bracket from the original reference
+    translation = ""
+    m = re.search(r"\[([^\]]+)\]", original_reference)
+    if m:
+        translation = m.group(0)
+
+    # ── Build the ground-truth payload for OpenAI
+    ground_truth = {
+        "title":        openalex_meta.get("title"),
+        "year":         openalex_meta.get("year"),
+        "authors":      openalex_meta.get("authors") or [],
+        "journal":      openalex_meta.get("journal"),
+        "volume":       openalex_meta.get("volume"),
+        "issue":        openalex_meta.get("issue"),
+        "first_page":   openalex_meta.get("first_page"),
+        "last_page":    openalex_meta.get("last_page"),
+        "doi":          openalex_meta.get("doi"),
+        "source_type":  source_type,
+        "translation_bracket_from_original": translation,
+    }
+
+    prompt = f"""
+You are formatting ONE APA 7th edition REFERENCE-LIST entry.
+
+The bibliographic facts below come from a VERIFIED OpenAlex record.
+You MUST NOT change any of these fields:
+  - Author surnames, initials, or ordering
+  - Publication year
+  - Title text
+  - Journal / book / source name
+  - Volume, issue, page numbers
+  - DOI or URL
+
+You MAY only:
+  1. Reorder fields into correct APA 7 order.
+  2. Fix punctuation (periods, commas, ampersands, en dashes).
+  3. Convert the author list to APA 7 form.
+  4. Apply APA 7 capitalization:
+       - Article/book title → sentence case
+       - Journal name → title case
+  5. Preserve the translation bracket from the original if present.
+  6. Decide the exact italic spans.
+
+SOURCE TYPE (choose one):
+  "Journal Article", "Book", "Book Chapter", "Conference Proceeding",
+  "Report", "Webpage / Online Document", "Other"
+
+APA 7 ITALIC RULES:
+  - Journal Article  → journal name + volume number (issue NOT italic, pages NOT italic)
+  - Book             → book title
+  - Book Chapter     → book title
+  - Report           → report title
+  - Webpage          → webpage title
+  - Conference       → proceedings title
+
+CRITICAL — `italic_elements` MUST be a comma-separated list of LITERAL
+substrings that appear VERBATIM inside your `corrected_reference`.
+Do NOT return generic phrases like "journal title" or "volume".
+For a journal article the value should look like:
+  "Journal of Education Research, 5"
+Note that the comma and space between journal and volume are INCLUDED in
+the substring, so the volume number gets italicized together with the
+journal name.
+
+Return JSON ONLY:
+{{
+  "corrected_reference": "the full APA 7 reference string",
+  "italic_elements":     "literal, substrings, to, italicize",
+  "source_type":         "one of the source types above",
+  "explanation":         "short note"
+}}
+
+GROUND TRUTH (do NOT alter these values):
+{json.dumps(ground_truth, ensure_ascii=False, indent=2)}
+
+ORIGINAL REFERENCE (for reference only — do NOT copy its errors):
+{original_reference}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system",
+                 "content": "You format APA 7 references. Never invent "
+                            "bibliographic facts. Return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        data = _safe_json_loads(response.choices[0].message.content)
+
+        corrected = (data.get("corrected_reference") or "").strip()
+        italics   = (data.get("italic_elements") or "").strip()
+        stype     = normalize_source_type(data.get("source_type") or source_type)
+        note      = data.get("explanation") or ""
+
+        # ── Safety 1: reject if AI invented numbers/DOIs/URLs
+        if corrected and _reference_is_hallucinated(original_reference, corrected):
+            return {
+                "corrected_reference": "",
+                "italic_elements": "",
+                "source_type": source_type,
+                "explanation": "AI output rejected (invented data).",
+            }
+
+        # ── Safety 2: keep only italic tokens that appear verbatim
+        if italics:
+            tokens = [t.strip() for t in italics.split(",") if t.strip()]
+            tokens = [t for t in tokens if t in corrected]
+            italics = ", ".join(tokens)
+
+        return {
+            "corrected_reference": corrected,
+            "italic_elements": italics,
+            "source_type": stype,
+            "explanation": note,
+        }
+
+    except Exception as exc:
+        return {
+            "corrected_reference": "",
+            "italic_elements": "",
+            "source_type": source_type,
+            "explanation": f"OpenAI error: {exc}",
+        }
 
 def _source_type_from_openalex(meta):
     if not meta:
