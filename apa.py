@@ -44,10 +44,187 @@ TITLE_SEARCH_YEAR_BONUS = 0.3
 DOI_RESOLVER_URL     = "https://doi.org"
 DOI_RESOLVER_TIMEOUT = 10
 
+# ── FIX: large token budget so long reference lists don't get truncated
+EXTRACTION_MAX_TOKENS = 16000
+
 CACHE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".cache", "apa_v3"
 )
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+# =========================================================
+# REFERENCE SECTION DETECTION HEADINGS
+# =========================================================
+
+# Section headings that START the reference list.
+REFERENCE_HEADINGS = [
+    # English
+    "references", "reference", "reference list", "reference section",
+    "literature cited", "literature", "works cited", "works consulted",
+    "bibliography", "bibliographies", "cited references",
+    # Indonesian / Malay
+    "daftar pustaka", "daftar rujukan", "daftar bacaan",
+    "rujukan", "rujukan pustaka", "bahan rujukan",
+    "bibliografi", "referensi", "kepustakaan",
+    "sumber rujukan", "sumber pustaka", "sumber referensi",
+    # Short forms
+    "ref", "refs",
+]
+
+
+# Headings that TERMINATE the reference list.
+POST_REFERENCE_HEADINGS = {
+    # Acknowledgments
+    "acknowledgement", "acknowledgements",
+    "acknowledgment", "acknowledgments",
+    "acknowledgement of funding", "acknowledgment of funding",
+    "acknowledgement section", "acknowledgment section",
+    "ucapan terima kasih", "ucapan terimakasih",
+    "ucapan terima kasih dan apresiasi",
+
+    # Author contribution
+    "author contribution", "author contributions",
+    "authors contribution", "authors contributions",
+    "author's contribution", "author's contributions",
+    "authors' contribution", "authors' contributions",
+    "author’s contribution", "author’s contributions",
+    "authors’ contribution", "authors’ contributions",
+    "contribution", "contributions",
+    "credit author statement", "credit authorship contribution statement",
+    "author contribution statement", "authorship statement",
+    "kontribusi penulis", "kontribusi author",
+    "pernyataan kontribusi penulis",
+    "pernyataan kontribusi",
+
+    # Author profile / bios
+    "author profile", "authors profile",
+    "author profiles", "authors profiles",
+    "profile", "profiles",
+    "biography", "biographies",
+    "author biography", "author biographies",
+    "about the authors", "about the author",
+    "author bio", "authors bio",
+    "biodata penulis", "profil penulis",
+
+    # Conflicts / competing interests
+    "conflict of interest", "conflicts of interest",
+    "conflict of interests", "conflicts of interests",
+    "competing interest", "competing interests",
+    "declaration of competing interest",
+    "declaration of competing interests",
+    "declaration of interest", "declaration of interests",
+    "declarations of interest", "declarations of interests",
+    "declaration", "declarations",
+    "pernyataan konflik kepentingan", "konflik kepentingan",
+    "pernyataan kepentingan",
+
+    # Funding
+    "funding", "funding information", "funding statement",
+    "funding sources", "funding acknowledgements",
+    "financial support", "financial disclosure",
+    "sources of funding", "role of the funding source",
+    "pendanaan", "pernyataan pendanaan",
+    "sumber pendanaan", "sumber dana",
+
+    # Data / code availability
+    "data availability", "data availability statement",
+    "availability of data", "availability of data and materials",
+    "data and code availability", "data sharing statement",
+    "code availability", "supplementary data",
+    "ketersediaan data",
+
+    # Ethics / consent
+    "ethical approval", "ethics approval",
+    "ethics statement", "ethical statement",
+    "ethics declarations", "ethical declarations",
+    "informed consent", "consent for publication",
+    "consent to participate", "consent statement",
+    "persetujuan etik", "persetujuan etis",
+    "pernyataan etik", "keterangan etik",
+    "informed consent statement",
+
+    # Disclosures / AI use
+    "disclosure", "disclosures", "disclosure statement",
+    "declaration of generative ai",
+    "declaration of generative ai use",
+    "use of ai", "ai use statement",
+    "penggunaan teknologi ai", "pernyataan penggunaan ai",
+    "pernyataan penggunaan teknologi ai",
+
+    # Appendices
+    "appendix", "appendices", "appendix a", "appendix b", "appendix c",
+    "supplementary material", "supplementary materials",
+    "supplemental material", "supplemental materials",
+    "supplementary information", "supporting information",
+    "supporting information file",
+    "lampiran", "lampiran a", "lampiran b",
+
+    # Notes / misc
+    "notes", "note",
+    "author note", "author notes",
+    "endnotes", "endnote",
+    "footnotes", "footnote",
+    "catatan", "catatan kaki",
+
+    # Correspondence
+    "corresponding author", "corresponding author details",
+    "correspondence", "address correspondence to",
+    "reprint requests", "reprints",
+    "orcid",
+}
+
+
+def normalize_heading(text):
+    text = text.strip().lower()
+    text = re.sub(r"^\s*(?:\d+(?:\.\d+)*)[\.\s:-]+", "", text)
+    text = re.sub(r"^[\*\#•\-\s]+|[\*\#•\-\s]+$", "", text)
+    text = re.sub(r"\s+", " ", text).rstrip(":").strip()
+    text = text.rstrip(".:-—–").strip()
+    return text
+
+
+def is_post_reference_heading(line):
+    normalized = normalize_heading(line)
+    if not normalized:
+        return False
+    if normalized in POST_REFERENCE_HEADINGS:
+        return True
+    for heading in POST_REFERENCE_HEADINGS:
+        if normalized.startswith(heading + " "):
+            return True
+    return False
+
+
+def find_reference_section(text):
+    lines = text.splitlines()
+    start_index = None
+    end_index = None
+    heading_found = None
+
+    for i, line in enumerate(lines):
+        if normalize_heading(line) in REFERENCE_HEADINGS:
+            start_index = i
+            heading_found = line.strip()
+            break
+
+    if start_index is None:
+        return None, None, text
+
+    for i in range(start_index + 1, len(lines)):
+        line = lines[i].strip()
+        if not line:
+            continue
+        if is_post_reference_heading(line):
+            end_index = i
+            break
+
+    body_text = "\n".join(lines[:start_index])
+    if end_index is not None:
+        reference_text = "\n".join(lines[start_index + 1:end_index])
+    else:
+        reference_text = "\n".join(lines[start_index + 1:])
+    return reference_text, heading_found, body_text
 
 
 # =========================================================
@@ -97,12 +274,77 @@ def _esc(value):
     return re.escape(str(value))
 
 
+# =========================================================
+# ROBUST JSON PARSER
+# =========================================================
+
 def _safe_json_loads(text):
-    text = (text or "").strip()
+    """
+    Parse JSON from an AI response, with multiple recovery strategies:
+      1. Strip markdown fences
+      2. Try straight parse
+      3. Extract first balanced {...} object
+      4. Repair common issues (trailing commas, BOM)
+      5. Raise a clear ValueError with a preview
+    """
+    if text is None:
+        raise ValueError("Empty AI response (None).")
+
+    text = str(text).strip()
+
+    if text.startswith("\ufeff"):
+        text = text[1:]
+
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-        text = re.sub(r"\s*```$", "", text)
-    return json.loads(text)
+        text = re.sub(r"\s*```\s*$", "", text)
+        text = text.strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if start is None:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    start = None
+                    depth = 0
+
+    repaired = re.sub(r",(\s*[}\]])", r"\1", text)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    preview = text[:300].replace("\n", "\\n")
+    raise ValueError(
+        f"Could not parse JSON from AI response. "
+        f"Length={len(text)} chars. Preview: {preview!r}"
+    )
 
 
 # =========================================================
@@ -210,25 +452,15 @@ REFERENCE LIST RULES
 IN-TEXT CITATION RULES
 - Include both parenthetical "(Author, 2020)" and narrative "Author (2020)".
 - Do NOT include citations inside the reference list itself.
-- Preserve the exact text of each citation, e.g. "(BKKBN, 2021)" or "Astuti et al. (2023)".
+- Preserve the exact text of each citation.
 - Multiple sources inside one parenthetical are ONE citation string.
 - Report "type" as "parenthetical" or "narrative".
 
-OUTPUT FORMAT (JSON only, no markdown)
+OUTPUT FORMAT (JSON only, no markdown, no indentation)
 {
-  "references": [
-    "Angraini, D. I., Karyus, A., ... https://doi.org/10.47841/snamun.v2i2.3",
-    "Astuti, R., Damayanti, F. N., & Hasanah, N. (2023). Program e-KIE ...",
-    ...
-  ],
-  "citations": [
-    {"raw": "(BKKBN, 2021)", "type": "parenthetical"},
-    {"raw": "Astuti et al. (2023)", "type": "narrative"},
-    ...
-  ],
-  "uncertain": [
-    {"text": "...", "reason": "why you were unsure"}
-  ]
+  "references": ["...", "..."],
+  "citations": [{"raw": "...", "type": "parenthetical"}, {"raw": "...", "type": "narrative"}],
+  "uncertain": [{"text": "...", "reason": "..."}]
 }
 
 FULL MANUSCRIPT TEXT
@@ -241,18 +473,18 @@ FULL MANUSCRIPT TEXT
 def _extract_with_ai(manuscript_text):
     """
     Stage 1: AI extracts references + in-text citations from the full manuscript.
-    Cached by content hash. Returns dict or None on failure.
+    Cached by content hash. Returns dict or {"error": "..."} on failure.
     """
     client = _get_openai_client()
     if client is None:
-        return None
+        return {"error": "OpenAI client unavailable (missing key)."}
 
     model = _openai_model()
-    cache_key = f"{model}::{manuscript_text[:2000]}::{len(manuscript_text)}"
+    cache_key = f"{model}::{len(manuscript_text)}::{manuscript_text[:2000]}"
     path = _cache_path("extract", cache_key)
 
     cached = _cache_get(path)
-    if cached:
+    if cached and isinstance(cached, dict) and "references" in cached:
         return cached
 
     prompt = EXTRACTION_PROMPT.format(manuscript_text=manuscript_text)
@@ -263,44 +495,62 @@ def _extract_with_ai(manuscript_text):
             messages=[
                 {"role": "system",
                  "content": "You extract references and in-text citations "
-                            "from academic manuscripts. Return JSON only."},
+                            "from academic manuscripts. "
+                            "Return compact JSON only."},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
             temperature=0,
             seed=42,
+            max_tokens=EXTRACTION_MAX_TOKENS,
         )
-        data = _safe_json_loads(response.choices[0].message.content)
-
-        references = data.get("references", []) or []
-        citations  = data.get("citations", []) or []
-
-        references = [r.strip() for r in references
-                      if isinstance(r, str) and r.strip()]
-        references = [r for r in references if len(r) > 15]
-
-        cleaned_citations = []
-        for c in citations:
-            if not isinstance(c, dict):
-                continue
-            raw = (c.get("raw") or "").strip()
-            ctype = (c.get("type") or "").strip().lower()
-            if not raw:
-                continue
-            if ctype not in ("parenthetical", "narrative"):
-                ctype = "parenthetical" if raw.startswith("(") else "narrative"
-            cleaned_citations.append({"raw": raw, "type": ctype})
-
-        result = {
-            "references": references,
-            "citations": cleaned_citations,
-            "uncertain": data.get("uncertain", []) or [],
-        }
-        _cache_set(path, result)
-        return result
-
+        raw_content = response.choices[0].message.content
     except Exception as exc:
-        return {"error": f"Extraction API error: {exc}"}
+        return {"error": f"Extraction API call failed: {exc}"}
+
+    try:
+        data = _safe_json_loads(raw_content)
+    except ValueError as exc:
+        preview = (raw_content or "")[:200].replace("\n", "\\n")
+        return {
+            "error": (
+                f"AI returned non-JSON output. "
+                f"Preview: {preview!r} | parse error: {exc}"
+            )
+        }
+
+    if not isinstance(data, dict):
+        return {"error": "AI returned JSON but not an object at the top level."}
+
+    references = data.get("references", []) or []
+    citations  = data.get("citations", []) or []
+
+    references = [r.strip() for r in references
+                  if isinstance(r, str) and r.strip()]
+    references = [r for r in references if len(r) > 15]
+
+    cleaned_citations = []
+    for c in citations:
+        if not isinstance(c, dict):
+            continue
+        raw = (c.get("raw") or "").strip()
+        ctype = (c.get("type") or "").strip().lower()
+        if not raw:
+            continue
+        if ctype not in ("parenthetical", "narrative"):
+            ctype = "parenthetical" if raw.startswith("(") else "narrative"
+        cleaned_citations.append({"raw": raw, "type": ctype})
+
+    result = {
+        "references": references,
+        "citations": cleaned_citations,
+        "uncertain": data.get("uncertain", []) or [],
+    }
+
+    if references or cleaned_citations:
+        _cache_set(path, result)
+
+    return result
 
 
 # =========================================================
@@ -1084,7 +1334,7 @@ def _reference_is_hallucinated(original, corrected):
 
 
 # =========================================================
-# IN-TEXT CITATION CORRECTION (deterministic + optional AI)
+# IN-TEXT CITATION CORRECTION
 # =========================================================
 
 _YEAR_TOKEN_RE = re.compile(r"\b((?:19|20)\d{2}[a-z]?)\b")
@@ -1129,7 +1379,6 @@ def revise_narrative_citation_local(raw):
         return raw
     year = ym.group(1)
     before = raw[:ym.start()].strip(" ,")
-    after = raw[ym.end():].strip()
     surnames = re.findall(
         r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\b", before
     )
@@ -1138,7 +1387,6 @@ def revise_narrative_citation_local(raw):
     if not surnames:
         return raw
     if len(surnames) >= 2:
-        # Two-author narrative → "Surname1 and Surname2 (year)"
         if "&" in before:
             return f"{surnames[0]} and {surnames[1]} ({year})"
         return raw
@@ -1158,10 +1406,6 @@ def build_citation_correction(citation):
 
 
 def review_citations_with_ai(citations):
-    """
-    Optional: AI-assisted correction of in-text citations.
-    Each citation is corrected in isolation. Rejects hallucinations.
-    """
     client = _get_openai_client()
     if client is None or not citations:
         return []
@@ -1316,7 +1560,6 @@ def build_reference_comparison(references, manuscript_year):
                 else:
                     status = "VERIFIED_TITLE_MATCH"
         else:
-            # No external metadata — local tidy-up only
             corrected = original_clean.rstrip(".") + "."
             correction_note = "No canonical metadata found; reference kept as-is."
             status = "UNVERIFIED"
@@ -1377,7 +1620,6 @@ def _source_type_from_openalex(meta):
 
 
 def detect_apa_source_type(reference):
-    """Local heuristic for source type when no OpenAlex metadata."""
     low = (reference or "").lower()
     if re.search(r"\(eds?\.\)", reference, re.I):
         return "Book Chapter"
@@ -1645,7 +1887,7 @@ def build_correction_docx(result):
 
 
 # =========================================================
-# MAIN PIPELINE — run after the button click
+# MAIN PIPELINE
 # =========================================================
 
 def analyze_manuscript(uploaded_file, manuscript_year):
@@ -1678,10 +1920,7 @@ def analyze_manuscript(uploaded_file, manuscript_year):
 
     citations = [parse_citation(c) for c in raw_citations]
 
-    # Verify each reference against OpenAlex + build formatted rows
     reference_rows = build_reference_comparison(references, manuscript_year)
-
-    # Citation comparison (local + optional AI)
     citation_ai = review_citations_with_ai(citations)
     citation_rows = build_citation_comparison(citations, citation_ai)
 
@@ -1812,7 +2051,6 @@ def render():
 
     st.caption(f"References: {total_refs}  |  In-text citations: {total_cits}")
 
-    # ── Metric table
     metric_rows = [
         {"Metric": "Total References", "Value": total_refs},
         {"Metric": "References > 15",
@@ -1850,7 +2088,6 @@ def render():
     with col2:
         st.dataframe(source_df, use_container_width=True, hide_index=True)
 
-    # ── In-text citation correction
     if st.toggle("Show In-text Citation Correction", value=False,
                  key="show_intext"):
         st.markdown("#### In-text Citation Correction")
@@ -1869,7 +2106,6 @@ def render():
         else:
             st.info("No in-text citations available.")
 
-    # ── Reference correction
     if st.toggle("Show Reference Correction", value=False,
                  key="show_reference"):
         st.markdown("#### Reference Correction")
@@ -1905,7 +2141,6 @@ def render():
         else:
             st.info("No references available.")
 
-    # ── Download
     try:
         docx_bytes = build_correction_docx(result)
         safe = re.sub(r"[^\w\-]+", "_", result.get("filename", "manuscript"))
