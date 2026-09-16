@@ -379,6 +379,17 @@ CANONICAL_SOURCE_TYPES = [
     "Report", "Webpage / Online Document", "Other",
 ]
 
+APA_REQUIRED_ELEMENTS = {
+    "Journal Article": ["Author(s)", "Year", "Article title", "Journal title", "Volume", "Issue (when assigned)", "Page range or article number", "DOI when available"],
+    "Book": ["Author(s) or editor(s)", "Year", "Book title", "Publisher", "DOI or URL when applicable"],
+    "Book Chapter": ["Chapter author(s)", "Year", "Chapter title", "Editor(s)", "Book title", "Page range", "Publisher", "DOI or URL when applicable"],
+    "Conference Proceeding": ["Author(s)", "Year", "Paper title", "Proceedings or conference title", "Publisher or organizer when applicable", "Page range when available", "DOI or URL when applicable"],
+    "Report": ["Author or organization", "Year", "Report title", "Publisher or issuing organization when different from author", "Report number when available", "URL when applicable"],
+    "Webpage / Online Document": ["Author or organization", "Date or n.d.", "Page/document title", "Website name when different from author", "URL"],
+    "Other": ["Author or responsible organization", "Date when available", "Title", "Source information"],
+}
+
+
 _SOURCE_TYPE_ALIASES = {
     "journal": "Journal Article", "journal article": "Journal Article",
     "article": "Journal Article", "research article": "Journal Article",
@@ -483,358 +494,6 @@ def detect_apa_source_type(reference):
     if re.search(r"https?://", reference) and "doi.org" not in low:
         return "Webpage / Online Document"
     return "Other"
-
-
-# ============================================================
-# NEW — DOI / PAGE RANGE / AUTHOR-FORM PRESENCE HELPERS
-# ============================================================
-
-def _reference_has_doi(reference: str) -> bool:
-    """True if the reference string contains a DOI (10.xxxx/...)."""
-    if not reference:
-        return False
-    return bool(re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", reference, re.I))
-
-
-def _reference_has_page_range(reference: str) -> bool:
-    """
-    True if the reference contains a page range like 2209-2216, 45–52,
-    or 12—19 (APA journal article shape: '..., 15(2), 2209-2216').
-    A single page number (e.g. '15(2), 45.') does NOT count.
-    A year range inside parentheses (e.g. '(2015-2020)') does NOT count.
-    """
-    if not reference:
-        return False
-    if re.search(r",\s*\d{1,5}\s*[–—\-]\s*\d{1,5}\b", reference):
-        return True
-    if re.search(
-        r"\(\d+\)\s*,\s*\d{1,5}\s*[–—\-]\s*\d{1,5}\b", reference
-    ):
-        return True
-    return False
-
-
-def _first_author_is_apa_form(ref: str) -> bool:
-    """
-    APA reference list requires 'Surname, F. M.' or 'Surname, F.' form.
-    Corporate authors, editors, etc. are allowed but rare.
-    """
-    if not ref:
-        return False
-    m = re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)", ref)
-    if not m:
-        return False
-    head = ref[: m.start()].strip().rstrip(".")
-
-    # Corporate authors (ALL CAPS, longer than 3 chars)
-    if head.isupper() and len(head) > 3:
-        return True
-
-    # APA form: first author block contains ", <initial>."
-    if re.search(r",\s+[A-Z]\.", head):
-        return True
-
-    # Single-token name (mononym) is accepted: "Suharto. (2020)"
-    tokens = head.split()
-    if len(tokens) == 1 and tokens[0].istitle():
-        return True
-
-    return False
-
-
-# ============================================================
-# NEW — APA 7 MANDATORY ELEMENTS PER SOURCE TYPE
-# ============================================================
-
-MANDATORY_ELEMENTS = {
-    "Journal Article": [
-        "author_apa_form", "year", "title",
-        "journal_name", "volume", "pages", "doi_or_url",
-    ],
-    "Book": [
-        "author_apa_form", "year", "title", "publisher",
-    ],
-    "Book Chapter": [
-        "author_apa_form", "year", "chapter_title",
-        "book_title", "pages", "publisher",
-    ],
-    "Conference Proceeding": [
-        "author_apa_form", "year", "title",
-        "proceedings_name", "pages", "doi_or_url",
-    ],
-    "Report": [
-        "author_apa_form", "year", "title",
-        "publisher", "url_or_doi",
-    ],
-    "Webpage / Online Document": [
-        "author_apa_form", "year", "title", "url",
-    ],
-    "Other": [],
-}
-
-# Conservative hard-required subset — only these trigger withholding
-# when STRICT_VALIDATION is False.
-HARD_REQUIRED = {
-    "Journal Article": ["doi_or_url"],
-    "Conference Proceeding": ["doi_or_url"],
-    "Report": ["url_or_doi"],
-    "Webpage / Online Document": ["url"],
-}
-
-# Flip to True once you've validated heuristics against real refs.
-STRICT_VALIDATION = False
-
-
-def _has_author(ref: str) -> bool:
-    if not ref:
-        return False
-    m = re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)", ref)
-    if not m:
-        return False
-    head = ref[: m.start()].strip()
-    return len(head) >= 3 and bool(re.search(r"[A-Za-zÀ-ÿ]", head))
-
-
-def _has_year(ref: str) -> bool:
-    return bool(re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)", ref, re.I))
-
-
-def _has_title(ref: str) -> bool:
-    m = re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)\.\s*([^.]+)\.", ref)
-    return bool(m and len(m.group(1).strip()) >= 3)
-
-
-def _has_publisher(ref: str) -> bool:
-    ref_no_url = re.sub(r"https?://\S+", "", ref)
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ref_no_url) if s.strip()]
-    if not sentences:
-        return False
-    last = sentences[-1]
-    return bool(re.match(r"^[A-ZÀ-Ý]", last)) and len(last.split()) >= 2
-
-
-def _has_journal_name(ref: str) -> bool:
-    return bool(
-        re.search(
-            r"[A-ZÀ-Ý][^.]{2,80},\s*\d+(?:\(\d+\))?\s*,\s*\d+",
-            ref,
-        )
-    )
-
-
-def _has_volume(ref: str) -> bool:
-    return bool(re.search(r",\s*\d+\s*(?:\(\d+\))?\s*,", ref))
-
-
-def _has_pages(ref: str) -> bool:
-    return _reference_has_page_range(ref)
-
-
-def _has_doi_or_url(ref: str) -> bool:
-    return bool(
-        re.search(r"10\.\d{4,9}/", ref, re.I)
-        or re.search(r"https?://\S+", ref, re.I)
-    )
-
-
-def _has_url(ref: str) -> bool:
-    return bool(re.search(r"https?://\S+", ref, re.I))
-
-
-def _has_book_title(ref: str) -> bool:
-    m = re.search(
-        r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)\.\s*[^.]+\.\s*([^.]+)\.",
-        ref,
-    )
-    return bool(m and len(m.group(1).strip()) >= 3)
-
-
-def _has_chapter_title(ref: str) -> bool:
-    return bool(re.search(r"In\s+[A-Z]", ref)) or _has_title(ref)
-
-
-def _has_proceedings_name(ref: str) -> bool:
-    return bool(
-        re.search(r"(Proceedings|Conference|Symposium|Workshop)", ref, re.I)
-    )
-
-
-def _has_author_or_site(ref: str) -> bool:
-    return _has_author(ref) or bool(
-        re.search(r"\((?:(?:19|20)\d{2}|n\.d\.)\)", ref)
-    )
-
-
-_ELEMENT_CHECKERS = {
-    "author": _has_author,
-    "author_or_site": _has_author_or_site,
-    "author_apa_form": _first_author_is_apa_form,
-    "year": _has_year,
-    "title": _has_title,
-    "journal_name": _has_journal_name,
-    "volume": _has_volume,
-    "pages": _has_pages,
-    "doi_or_url": _has_doi_or_url,
-    "url": _has_url,
-    "url_or_doi": _has_doi_or_url,
-    "publisher": _has_publisher,
-    "book_title": _has_book_title,
-    "chapter_title": _has_chapter_title,
-    "proceedings_name": _has_proceedings_name,
-}
-
-_ELEMENT_LABELS = {
-    "author": "author",
-    "author_or_site": "author or site name",
-    "author_apa_form": "first author not in APA form (expected \"Surname, F.\")",
-    "year": "year",
-    "title": "title",
-    "journal_name": "journal name",
-    "volume": "volume number",
-    "pages": "page range",
-    "doi_or_url": "DOI or URL (mandatory for this source type)",
-    "url": "URL (mandatory for this source type)",
-    "url_or_doi": "URL or DOI (mandatory for this source type)",
-    "publisher": "publisher",
-    "book_title": "book title",
-    "chapter_title": "chapter title",
-    "proceedings_name": "proceedings name",
-}
-
-
-def validate_reference(reference: str, source_type: str) -> dict:
-    """
-    Validate the reference against APA 7 mandatory elements.
-
-    With STRICT_VALIDATION=False, only HARD_REQUIRED elements are enforced.
-    With STRICT_VALIDATION=True, all MANDATORY_ELEMENTS are enforced.
-    """
-    if STRICT_VALIDATION:
-        required = MANDATORY_ELEMENTS.get(source_type, [])
-    else:
-        required = HARD_REQUIRED.get(source_type, [])
-
-    missing = []
-    for elem in required:
-        checker = _ELEMENT_CHECKERS.get(elem)
-        if checker is None:
-            continue
-        if not checker(reference):
-            missing.append(_ELEMENT_LABELS.get(elem, elem))
-    return {"valid": len(missing) == 0, "missing": missing}
-
-
-# ============================================================
-# NEW — CITATION POST-PROCESSING
-# ============================================================
-
-def _enforce_parenthetical_ampersand(citation_text: str, is_parenthetical: bool) -> str:
-    """
-    APA 7 connector rule:
-      - parenthetical → "&"
-      - narrative     → "and"
-    Also normalizes non-English connectors ("dan", "und", "y", "e", "et").
-    """
-    if not citation_text:
-        return citation_text
-
-    if is_parenthetical:
-        # Normalize foreign connectors to ampersand first
-        s = re.sub(r"\s+(?:dan|und|y|e|et)\s+", " & ", citation_text)
-        # Then turn any bare " and " into " & "
-        s = re.sub(r"\s+and\s+", " & ", s)
-        return s
-    else:
-        # Narrative: ampersand → "and"
-        s = re.sub(r"\s*&\s*", " and ", citation_text)
-        return s
-
-
-def _reduce_two_author_citation(citation_text: str) -> str:
-    """
-    "(First1 Last1 dan First2 Last2, YEAR)" → "(Last1 & Last2, YEAR)"
-    Handles parenthetical two-author with 'dan'/'and'/'&'.
-    """
-    if not citation_text:
-        return citation_text
-
-    m = re.match(
-        r"^\(\s*([^,&()]+?)\s*(?:&|dan|and)\s*([^,&()]+?)\s*,\s*"
-        r"(\d{4}[a-z]?(?:\s*,\s*p{1,2}\.\s*\d+)?)\s*\)$",
-        citation_text.strip(),
-        re.I,
-    )
-    if not m:
-        return citation_text
-    a1, a2, year = m.group(1).strip(), m.group(2).strip(), m.group(3)
-    last1 = a1.split()[-1] if a1 else a1
-    last2 = a2.split()[-1] if a2 else a2
-    return f"({last1} & {last2}, {year})"
-
-
-def _reduce_citation_to_surname(citation_text: str) -> str:
-    """
-    Reduce "(First Last, YEAR)" → "(Last, YEAR)".
-    Reduce narrative "First Last (YEAR)" → "Last (YEAR)".
-    Does NOT touch:
-      - already-APA "(Last, YEAR)" forms
-      - citations with "et al."
-      - citations with "&" or "and" (multi-author)
-    """
-    if not citation_text:
-        return citation_text
-
-    if re.search(r"\bet\s+al\.?", citation_text, re.I):
-        return citation_text
-    if "&" in citation_text or re.search(r"\band\b", citation_text):
-        return citation_text
-
-    # Parenthetical: "(AuthorPart, YEAR)" — no internal comma in author
-    m = re.match(
-        r"^\(\s*([^,()]+?)\s*,\s*(\d{4}[a-z]?(?:\s*,\s*p{1,2}\.\s*\d+)?)\s*\)$",
-        citation_text.strip(),
-    )
-    if m:
-        author_part, year_part = m.group(1).strip(), m.group(2)
-        tokens = author_part.split()
-        if len(tokens) <= 1:
-            return citation_text
-        surname = tokens[-1]
-        return f"({surname}, {year_part})"
-
-    # Narrative: "AuthorPart (YEAR)"
-    m2 = re.match(
-        r"^([^()]+?)\s+\((\d{4}[a-z]?)\)\s*$",
-        citation_text.strip(),
-    )
-    if m2:
-        author_part, year_part = m2.group(1).strip(), m2.group(2)
-        tokens = author_part.split()
-        if len(tokens) <= 1:
-            return citation_text
-        surname = tokens[-1]
-        return f"{surname} ({year_part})"
-
-    return citation_text
-
-
-def _reduce_two_author_narrative(citation_text: str) -> str:
-    """
-    "First1 Last1 and First2 Last2 (YEAR)" → "Last1 and Last2 (YEAR)"
-    """
-    if not citation_text:
-        return citation_text
-    m = re.match(
-        r"^([^()]+?)\s*(?:and|&)\s*([^()]+?)\s+\((\d{4}[a-z]?)\)\s*$",
-        citation_text.strip(),
-        re.I,
-    )
-    if not m:
-        return citation_text
-    a1, a2, year = m.group(1).strip(), m.group(2).strip(), m.group(3)
-    last1 = a1.split()[-1] if a1 else a1
-    last2 = a2.split()[-1] if a2 else a2
-    return f"{last1} and {last2} ({year})"
 
 
 # ============================================================
@@ -1147,28 +806,6 @@ Each input item has:
       - "biblio_volume"        (volume number)
       - "biblio_issue"         (issue number)
 
-AUTHOR NAME HANDLING (APA 7 reference list — CRITICAL):
-
-1. Every author must be in "Surname, Initials." form.
-   - "Ana Ittihada"       -> "Ittihada, A."
-   - "Aji Sofanudin"      -> "Sofanudin, A."
-   - "Darius Ru'ung"      -> "Ru'ung, D."
-   - "Wahab"              -> "Wahab" (mononym, single token)
-   - "Al-Attas, S. M. N." -> "Al-Attas, S. M. N." (already correct)
-
-2. If the reference already has "Surname, Initials." form, do NOT
-   reorder it.
-
-3. If the reference has "First Last" form for a personal author:
-   - Assume Western order (last token = surname) UNLESS the author is
-     Indonesian with a single-token name or a known title prefix
-     (Haji, Hj., Kyai, KH., Ustadz, Ustadzah, Raden, R., Mas, Mbah).
-   - Reorder to "Last, F.".
-
-4. Do NOT translate author names.
-
-5. In the "explanation" field, briefly state any name reordering you did.
-
 RULES:
 
 1. If "openalex" is present with a title:
@@ -1267,47 +904,65 @@ INPUT:
 # OPENAI — APA IN-TEXT CITATION REVIEW
 # ============================================================
 
-def review_apa_citations_with_ai(citations, client):
+def enforce_apa_citation_rules(original, revised, citation_type):
+    """Deterministically enforce APA 7 conjunction rules after AI review."""
+    text = (revised or original or "").strip()
+    if citation_type == "parenthetical":
+        text = re.sub(r"\s+(?:and|dan)\s+", " & ", text, flags=re.I)
+    elif citation_type == "narrative":
+        text = re.sub(r"\s+(?:&|dan)\s+", " and ", text, flags=re.I)
+    return text
+
+
+def review_apa_citations_with_ai(citations, reference_rows, client):
     if not citations:
         return []
+
     payload = [
         {"number": i, "citation": c.get("raw", ""), "type": c.get("type", "")}
         for i, c in enumerate(citations, start=1)
     ]
+
+    reference_context = []
+    for row in reference_rows:
+        ref_text = row.get("Corrected Version", "")
+        if not ref_text or ref_text.startswith("— WITHHELD"):
+            ref_text = row.get("Original Reference", "")
+        parsed = parse_reference(ref_text)
+        reference_context.append({
+            "year": parsed.get("year"),
+            "authors": parsed.get("authors", []),
+            "reference": ref_text,
+        })
 
     prompt = f"""
 You are checking APA 7th edition IN-TEXT citations.
 
 Each item is ALREADY a separate citation. Correct each IN ISOLATION.
 Do not merge sources. Do not invent authors or years.
+Use the matching REFERENCE LIST CONTEXT to identify author surnames whenever possible.
 
-APA 7 AUTHOR-CONNECTOR RULE (CRITICAL — do not invert this):
+APA 7 AUTHOR RULES:
+- Use AUTHOR SURNAMES from the matching reference-list entry.
+- Never preserve a full personal name in an in-text citation when the matching reference identifies the surname.
+- 1 author: parenthetical (Surname, 2024); narrative Surname (2024).
+- 2 authors: parenthetical MUST use "&"; narrative MUST use "and".
+- 3+ authors: FirstSurname et al.
+- Do not guess surnames merely from word position when the reference list provides the surname.
 
-- 1 author: surname only. No connector.
-- 2 authors:
-    * PARENTHETICAL citation -> use "&"  (ampersand)
-        Example: (Smith & Jones, 2020)
-    * NARRATIVE citation     -> use "and" (word)
-        Example: Smith and Jones (2020) found ...
-- 3+ authors: "FirstSurname et al." from the first citation onward.
-    * Parenthetical: (Smith et al., 2020)
-    * Narrative:     Smith et al. (2020)
-
-Do NOT translate non-English connectors ("dan", "und", "et", "y", "e",
-"和") to "and" in a PARENTHETICAL citation. They must become "&".
-Do NOT leave a bare "and" inside parentheses. Always "&" inside ( ).
-
-NAME REDUCTION RULE:
-- Never put a first name inside a citation.
-- "(Ana Ittihada, 2026)" -> "(Ittihada, 2026)"
-- "(Darius Ru'ung, 2021)" -> "(Ru'ung, 2021)"
-- Narrative: "Ana Ittihada (2026)" -> "Ittihada (2026)"
+Examples:
+(Ana Ittihada, 2026) + reference "Ittihada, A. (2026)" -> (Ittihada, 2026)
+(Darius Ru'ung, 2021) + reference "Ru'ung, D. (2021)" -> (Ru'ung, 2021)
+(Aji Sofanudin dan Wahab, 2020) -> (Sofanudin & Wahab, 2020)
 
 Return JSON only:
 {{"results": [
   {{"number": int, "status": "OK"|"REVISED"|"MANUAL_CHECK",
     "revised_citation": str, "explanation": str}}
 ]}}
+
+REFERENCE LIST CONTEXT:
+{json.dumps(reference_context, ensure_ascii=False)}
 
 INPUT CITATIONS:
 {json.dumps(payload, ensure_ascii=False)}
@@ -1316,19 +971,15 @@ INPUT CITATIONS:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system",
-                 "content": "You are a precise APA 7 citation editor. JSON only."},
+                {"role": "system", "content": "You are a precise APA 7 citation editor. JSON only."},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
             temperature=0,
         )
-        return _safe_json_loads(
-            response.choices[0].message.content
-        ).get("results", [])
+        return _safe_json_loads(response.choices[0].message.content).get("results", [])
     except Exception as exc:
-        return [{"number": 0, "status": "MANUAL_CHECK",
-                 "revised_citation": "",
+        return [{"number": 0, "status": "MANUAL_CHECK", "revised_citation": "",
                  "explanation": f"OpenAI API error: {exc}"}]
 
 
@@ -1449,6 +1100,10 @@ def _compute_citation_pages(full_text, citations, page_break_tag="<<<PAGE_BREAK"
 
 
 def build_apa_report_docx(result):
+    """
+    `result` is the batch dict. `manuscript_year` inside it controls
+    the trailing-10-year window (inclusive of that year).
+    """
     doc = Document()
     _docx_set_default_font(doc)
 
@@ -1526,29 +1181,7 @@ def build_apa_report_docx(result):
         1 for r in reference_rows if r.get("Source") == "OpenAlex"
     )
 
-    journal_rows = [
-        r for r in reference_rows
-        if r.get("Source Type") == "Journal Article"
-    ]
-    journals_missing_doi = sum(
-        1 for r in journal_rows
-        if not _reference_has_doi(r.get("Corrected Version", ""))
-        and not r.get("Corrected Version", "").startswith("— WITHHELD")
-    )
-    journals_missing_pages = sum(
-        1 for r in journal_rows
-        if not _reference_has_page_range(r.get("Corrected Version", ""))
-        and not r.get("Corrected Version", "").startswith("— WITHHELD")
-    )
-
-    # FIX: withheld_total computed here (was referenced but never defined)
-    withheld_total = sum(
-        1 for r in reference_rows
-        if r.get("Corrected Version", "").startswith("— WITHHELD")
-        or r.get("DOI Suspicious") != "—"
-        or bool(r.get("Missing Elements"))
-    )
-
+    # --- Revised: last-10-year window now anchored to manuscript_year ---
     window_start = manuscript_year - 9
     window_end = manuscript_year
     recent = sum(
@@ -1577,15 +1210,6 @@ def build_apa_report_docx(result):
         ("DOI suspicious (possible fabricated references)",
          f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
          doi_suspicious > 0),
-        ("Journal Articles missing DOI",
-         f"{journals_missing_doi} / {len(journal_rows)}",
-         journals_missing_doi > 0),
-        ("Journal Articles missing page range",
-         f"{journals_missing_pages} / {len(journal_rows)}",
-         journals_missing_pages > 0),
-        ("References withheld (missing elements / DOI mismatch)",
-         f"{withheld_total} / {total_refs}",
-         withheld_total > 0),
         (f"% references within last 10 years "
          f"({window_start}-{window_end})",
          f"{recent_pct:.1f}%", False),
@@ -1738,12 +1362,12 @@ def build_apa_report_docx(result):
         for row in reference_rows:
             not_cited = row["No."] not in cited_ref_nos
 
-            # ==== CHANGED: header now shows [Source Type] ====
             head = doc.add_paragraph()
             head.paragraph_format.space_before = Pt(4)
             head.paragraph_format.space_after = Pt(2)
-            htext = f"{row.get('No.', '')}. [{row.get('Source Type', 'Other')}]"
-            _add_run(head, htext, size_pt=11, bold=True)
+            hrun = head.add_run(f"{row.get('No.', '')}.")
+            _set_run_font(hrun, size_pt=11, bold=True)
+
             if not_cited:
                 _add_red_italic_run(head, "  [NOT CITED IN TEXT]")
 
@@ -1754,67 +1378,30 @@ def build_apa_report_docx(result):
             _add_run(p_orig, "Original:  ", bold=True, size_pt=11)
 
             original = row.get("Original Reference", "")
-            # ==== CHANGED: red if withheld/missing/not-cited ====
-            if (
-                row.get("DOI Suspicious") != "—"
-                or not_cited
-                or bool(row.get("Missing Elements"))
-            ):
+            if row.get("DOI Suspicious") != "—" or not_cited:
                 _add_run(p_orig, original, size_pt=11, red=True)
             else:
                 _add_run(p_orig, original, size_pt=11)
 
-            # ==== CHANGED: unified withheld test ====
-            is_withheld = (
-                row.get("Corrected Version", "").startswith("— WITHHELD")
-                or row.get("DOI Suspicious") != "—"
-                or bool(row.get("Missing Elements"))
-            )
-
-            if is_withheld:
+            if row.get("Status") == "WITHHELD":
+                withheld = doc.add_paragraph()
+                withheld.paragraph_format.left_indent = Inches(0.25)
+                withheld.paragraph_format.space_after = Pt(6)
+                _add_run(
+                    withheld,
+                    row.get("Explanation") or "Automated correction withheld.",
+                    size_pt=10, italic=True, bold=True, red=True,
+                )
+            elif row.get("DOI Suspicious") != "—":
                 withheld = doc.add_paragraph()
                 withheld.paragraph_format.left_indent = Inches(0.25)
                 withheld.paragraph_format.space_after = Pt(6)
                 withheld.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-
                 _add_run(
                     withheld,
-                    f"Corrected version withheld — the reference does not "
-                    f"conform to APA 7 requirements for a "
-                    f"{row.get('Source Type', 'source')}:",
-                    size_pt=10, italic=True, bold=True, red=True,
-                )
-
-                missing_list = [
-                    m.strip()
-                    for m in (row.get("Missing Elements") or "").split(",")
-                    if m.strip()
-                ]
-                # If DOI mismatch is the reason (not missing elements),
-                # still print a bullet explaining it.
-                if not missing_list and row.get("DOI Suspicious") != "—":
-                    bullet = doc.add_paragraph()
-                    bullet.paragraph_format.left_indent = Inches(0.5)
-                    bullet.paragraph_format.space_after = Pt(2)
-                    _add_run(
-                        bullet,
-                        "• DOI in this reference does not match the claimed "
-                        "title/authors.",
-                        size_pt=10, red=True,
-                    )
-
-                for m in missing_list:
-                    bullet = doc.add_paragraph()
-                    bullet.paragraph_format.left_indent = Inches(0.5)
-                    bullet.paragraph_format.space_after = Pt(2)
-                    _add_run(bullet, f"• {m}", size_pt=10, red=True)
-
-                end_p = doc.add_paragraph()
-                end_p.paragraph_format.left_indent = Inches(0.25)
-                end_p.paragraph_format.space_after = Pt(6)
-                _add_run(
-                    end_p,
-                    "Manual verification required.",
+                    "Corrected version withheld — the DOI in this reference "
+                    "does not match the claimed title/authors. Manual "
+                    "verification required.",
                     size_pt=10, italic=True, bold=True, red=True,
                 )
             else:
@@ -1844,7 +1431,6 @@ def build_apa_report_docx(result):
                         size_pt=10, italic=True,
                     )
 
-            # DOI-mismatch detailed warning
             if row.get("DOI Suspicious") != "—":
                 warn = doc.add_paragraph()
                 warn.paragraph_format.left_indent = Inches(0.25)
@@ -1863,21 +1449,35 @@ def build_apa_report_docx(result):
                         size_pt=10, italic=True,
                     )
 
+            # Source-type-specific APA requirements
+            req_p = doc.add_paragraph()
+            req_p.paragraph_format.left_indent = Inches(0.25)
+            _add_run(req_p, f"Source Type: {row.get('Source Type', 'Other')}", size_pt=10, bold=True)
+
+            req2 = doc.add_paragraph()
+            req2.paragraph_format.left_indent = Inches(0.25)
+            _add_run(req2, "Mandatory Elements: ", size_pt=10, bold=True)
+            _add_run(req2, "; ".join(row.get("Required Elements", [])), size_pt=10)
+
+            missing = row.get("Missing Required Elements", [])
+            miss_p = doc.add_paragraph()
+            miss_p.paragraph_format.left_indent = Inches(0.25)
+            if missing:
+                _add_run(miss_p, "Missing Mandatory Elements: ", size_pt=10, bold=True, red=True)
+                _add_run(miss_p, "; ".join(missing), size_pt=10, red=True)
+            else:
+                _add_run(miss_p, "Missing Mandatory Elements: None detected", size_pt=10)
+
+            if row.get("Status") == "WITHHELD" and row.get("Explanation"):
+                note_p = doc.add_paragraph()
+                note_p.paragraph_format.left_indent = Inches(0.25)
+                _add_run(note_p, row.get("Explanation"), size_pt=10, italic=True, red=True)
+
             status = row.get("Status", "")
             if status and status != "OK":
                 sp = doc.add_paragraph()
                 sp.paragraph_format.left_indent = Inches(0.25)
                 _add_run(sp, f"Status: {status}", size_pt=10, italic=True)
-
-            # ==== NEW: AI explanation as a Note line ====
-            explanation = row.get("Explanation", "")
-            if explanation and status != "OK":
-                exp_p = doc.add_paragraph()
-                exp_p.paragraph_format.left_indent = Inches(0.25)
-                _add_run(
-                    exp_p, f"Note: {explanation}",
-                    size_pt=10, italic=True,
-                )
 
             _add_divider(doc)
 
@@ -1895,6 +1495,8 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
     """
     Run the full APA pipeline for ONE PDF's batch dict.
     Mutates `batch` in place with the AI results.
+    `manuscript_year` is the user-supplied year, used for the
+    10-year recency window.
     """
     # ---- Stage A: extract references ----
     (
@@ -1918,11 +1520,38 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
         v = verify_reference_against_openalex(ref, parsed, openalex_api_key)
         verification_rows.append(v)
 
-    # ---- Stage C: build AI payload ----
+    # ---- Stage C: decide which references are eligible for AI review ----
+    # Cost-control policy:
+    #   * Journal + no DOI: withhold; do NOT send to OpenAI.
+    #   * Journal + suspicious/unresolved DOI: manual check; do NOT send to OpenAI.
+    #   * Journal + verified DOI: eligible for AI reconstruction/correction.
+    #   * Non-journal sources: manual check for now; do NOT send to OpenAI.
     review_payload = []
-    for i, (ref, v) in enumerate(zip(reference_list, verification_rows), start=1):
-        openalex_block = None
-        if v.get("resolved") and v.get("openalex_title"):
+    preclassified_results = {}
+
+    for i, (ref, parsed, source_type, v) in enumerate(
+        zip(reference_list, parsed_refs, local_source_types, verification_rows), start=1
+    ):
+        if source_type == "Journal Article":
+            if not parsed.get("doi"):
+                preclassified_results[i] = {
+                    "number": i, "status": "WITHHELD", "revised_reference": "",
+                    "source_type": source_type, "italic_elements": "",
+                    "year": parsed.get("year"), "missing_required_elements": [],
+                    "explanation": "DOI not provided — automated verification/correction withheld.",
+                }
+                continue
+
+            if v.get("suspicious") or not v.get("resolved"):
+                reason = " | ".join(v.get("reasons", [])) or "DOI metadata could not be independently verified."
+                preclassified_results[i] = {
+                    "number": i, "status": "MANUAL_CHECK", "revised_reference": "",
+                    "source_type": source_type, "italic_elements": "",
+                    "year": parsed.get("year"), "missing_required_elements": [],
+                    "explanation": reason,
+                }
+                continue
+
             openalex_block = {
                 "title": v["openalex_title"],
                 "authors": v.get("openalex_authors") or [],
@@ -1931,61 +1560,34 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
                 "biblio_volume": v.get("openalex_biblio_volume"),
                 "biblio_issue": v.get("openalex_biblio_issue"),
             }
-        review_payload.append({
-            "number": i,
-            "reference": ref,
-            "openalex": openalex_block,
-        })
+            review_payload.append({"number": i, "reference": ref, "openalex": openalex_block})
+            continue
 
-    # ---- Stage D: AI reference review ----
-    ref_ai = review_apa_references_with_ai(review_payload, client)
+        preclassified_results[i] = {
+            "number": i, "status": "MANUAL_CHECK", "revised_reference": "",
+            "source_type": source_type, "italic_elements": "",
+            "year": parsed.get("year"), "missing_required_elements": [],
+            "explanation": "No independently verified metadata workflow is configured for this source type; manual verification required.",
+        }
+
+    # ---- Stage D: AI review only for eligible, independently verified references ----
+    ref_ai = review_apa_references_with_ai(review_payload, client) if review_payload else []
 
     by_no = {
         int(x.get("number", -1)): x
         for x in (ref_ai or [])
         if str(x.get("number", "")).isdigit()
     }
-
-    # ---- Stage D.5: validate mandatory elements ----
-    for i, ref in enumerate(reference_list, start=1):
-        ai = by_no.get(i, {})
-        stype = ai.get("source_type") or local_source_types[i - 1]
-        corrected = (ai.get("revised_reference") or "").strip() or ref
-
-        validation = validate_reference(corrected, stype)
-        ai["_validation"] = validation
-        ai["_source_type"] = stype
-        ai["_corrected"] = corrected
+    by_no.update(preclassified_results)
 
     # ---- Stage E: build ref rows ----
     ref_rows = []
     for i, ref in enumerate(reference_list, start=1):
         ai = by_no.get(i, {})
-        stype = (
-            ai.get("_source_type")
-            or ai.get("source_type")
-            or local_source_types[i - 1]
-        )
-        corrected = (
-            ai.get("_corrected")
-            or ((ai.get("revised_reference") or "").strip() or ref)
-        )
-        validation = ai.get("_validation") or {"valid": True, "missing": []}
+        ai_revised = (ai.get("revised_reference") or "").strip()
+        corrected = ai_revised or ref
+        stype = ai.get("source_type") or local_source_types[i - 1]
         v = verification_rows[i - 1]
-
-        doi_mismatch = v["suspicious"]
-        missing_elements = validation["missing"]
-        withhold = doi_mismatch or bool(missing_elements)
-
-        if doi_mismatch:
-            withhold_reason = "DOI mismatch"
-        elif missing_elements:
-            withhold_reason = (
-                f"Missing mandatory element(s) for {stype}: "
-                + ", ".join(missing_elements)
-            )
-        else:
-            withhold_reason = ""
 
         reconstructed = (
             v.get("resolved")
@@ -2021,11 +1623,11 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
             "Year": ai.get("year") or extract_reference_year(corrected),
             "Original Reference": ref,
             "Corrected Version": (
-                "— WITHHELD —" if withhold else corrected
+                "— WITHHELD —"
+                if ai.get("status") == "WITHHELD"
+                else ("— WITHHELD (DOI mismatch) —" if v["suspicious"] else corrected)
             ),
-            "Withhold Reason": withhold_reason,
-            "Missing Elements": ", ".join(missing_elements),
-            "Source": "OpenAlex" if reconstructed else "AI",
+            "Source": ("OpenAlex" if reconstructed else ("AI" if ai_revised else "Manual")),
             "DOI Checked": "YES" if v["checked"] else "NO",
             "DOI Suspicious": "⚠️ YES" if v["suspicious"] else "—",
             "OpenAlex Title": (v.get("openalex_title") or "")[:60],
@@ -2033,10 +1635,12 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
             "Status": (ai.get("status") or "MANUAL CHECK").upper(),
             "Explanation": ai.get("explanation", ""),
             "Italicized in APA": ", ".join(combined),
+            "Missing Required Elements": ai.get("missing_required_elements", []),
+            "Required Elements": APA_REQUIRED_ELEMENTS.get(stype, APA_REQUIRED_ELEMENTS["Other"]),
         })
 
     # ---- Stage F: AI citation review ----
-    cit_ai = review_apa_citations_with_ai(batch["citations"], client)
+    cit_ai = review_apa_citations_with_ai(batch["citations"], ref_rows, client)
 
     cit_by_no = {
         int(x.get("number", -1)): x
@@ -2044,27 +1648,11 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
         if str(x.get("number", "")).isdigit()
     }
 
-    # ==== NEW: apply post-processing helpers to every citation ====
     cit_rows = []
     for i, c in enumerate(batch["citations"], start=1):
         ai = cit_by_no.get(i, {})
         revised = (ai.get("revised_citation") or "").strip() or c["raw"]
-        is_parenthetical = (c["type"] == "parenthetical")
-
-        # 1. Two-author reduction (handles "First1 Last1 dan First2 Last2")
-        if is_parenthetical:
-            revised = _reduce_two_author_citation(revised)
-        else:
-            revised = _reduce_two_author_narrative(revised)
-
-        # 2. Single-author surname reduction
-        revised = _reduce_citation_to_surname(revised)
-
-        # 3. Connector enforcement (& for parenthetical, "and" for narrative)
-        revised = _enforce_parenthetical_ampersand(
-            revised, is_parenthetical=is_parenthetical
-        )
-
+        revised = enforce_apa_citation_rules(c["raw"], revised, c["type"])
         cit_rows.append({
             "No.": i,
             "Type": c["type"].title(),
@@ -2129,9 +1717,11 @@ def _get_openai_api_key():
 
 
 def _get_openalex_api_key():
+    # 1) Preferred: key captured by app.py login
     key = st.session_state.get("openalex_api_key", "").strip()
     if key:
         return key
+    # 2) Fallback: secrets.toml / env
     try:
         if "OPENALEX_API_KEY" in st.secrets:
             return st.secrets["OPENALEX_API_KEY"]
@@ -2147,6 +1737,7 @@ def _get_openalex_api_key():
 def render():
     st.title("OmniCite Auditor — APA Style")
 
+    # ---- API keys ----
     openai_key = _get_openai_api_key()
     if not openai_key:
         st.error(
@@ -2163,6 +1754,7 @@ def render():
 
     client = OpenAI(api_key=openai_key)
 
+    # ---- Uploader ----
     if "apa_uploader_version" not in st.session_state:
         st.session_state["apa_uploader_version"] = 0
 
@@ -2179,37 +1771,35 @@ def render():
     if not uploaded_files:
         return
 
+    # ---- Manual manuscript publication year (drives the 10-year window) ----
     current_year = datetime.now().year
-    if "apa_manuscript_year" not in st.session_state:
-        st.session_state["apa_manuscript_year"] = current_year
-
+    default_year = st.session_state.get("apa_manuscript_year", current_year)
     manuscript_year = st.number_input(
         "Manuscript publication year",
         min_value=1900,
         max_value=current_year + 5,
+        value=int(default_year),
         step=1,
         help=(
-            "Controls the trailing-10-year recency window. "
-            "Example: 2024 -> window 2015-2024 (inclusive)."
+            "Used to compute the % of references published within the last "
+            "10 years. The window is [year-9, year], inclusive."
         ),
-        key="apa_manuscript_year",
+        key="apa_manuscript_year_input",
     )
-    manuscript_year = int(manuscript_year)
-    st.caption(
-        f"10-year recency window: **{manuscript_year - 9}–{manuscript_year}** "
-        f"(inclusive of both ends)"
-    )
+    st.session_state["apa_manuscript_year"] = int(manuscript_year)
 
     file_keys = []
     for idx, uf in enumerate(uploaded_files):
         key = f"{idx}::{uf.name}"
         file_keys.append((key, uf))
 
+    # Drop batches no longer uploaded
     active_keys = {k for k, _ in file_keys}
     for k in list(st.session_state["pdf_batches"].keys()):
         if k not in active_keys:
             del st.session_state["pdf_batches"][k]
 
+    # ---- Run pipeline ----
     if st.button(
         "Extract & Review",
         type="primary",
@@ -2289,22 +1879,10 @@ def render():
     if not any_done:
         return
 
-    selector_options = [
-        k for k, _ in file_keys
-        if k in st.session_state["pdf_batches"]
-    ]
-
-    if not selector_options:
-        st.warning(
-            "No processed manuscripts found in the current session. "
-            "Click **Extract & Review** to process the uploaded files."
-        )
-        return
+    selector_options = [k for k, _ in file_keys]
 
     def _fmt(k):
-        b = st.session_state["pdf_batches"].get(k)
-        if not b:
-            return k
+        b = st.session_state["pdf_batches"][k]
         suffix = "" if b.get("ai_done") else "  (not yet processed)"
         return b["filename"] + suffix
 
@@ -2323,10 +1901,8 @@ def render():
         )
         return
 
-    batch["manuscript_year"] = int(
-        st.session_state.get("apa_manuscript_year", current_year)
-    )
-    manuscript_year = batch["manuscript_year"]
+    # Refresh the batch's manuscript_year with whatever is in the widget now
+    batch["manuscript_year"] = int(st.session_state.get("apa_manuscript_year", current_year))
 
     with st.expander("View reference section (sent to AI)", expanded=False):
         st.text_area(
@@ -2336,10 +1912,12 @@ def render():
             key=f"dbg_ref_{selected_key}",
         )
 
+    # ---- Metrics ----
     reference_rows = batch["reference_rows"]
     citation_rows = batch["citation_rows"]
     stats = batch["citation_stats"]
     citations = batch["citations"]
+    manuscript_year = batch["manuscript_year"]
 
     total_refs = len(reference_rows)
     total_cits = stats["total"]
@@ -2368,28 +1946,7 @@ def render():
             if (p["first_author"].lower(), p["year"]) not in cit_keys:
                 missing_refs += 1
 
-    journal_rows = [
-        r for r in reference_rows if r.get("Source Type") == "Journal Article"
-    ]
-    journals_missing_doi = sum(
-        1 for r in journal_rows
-        if not _reference_has_doi(r.get("Corrected Version", ""))
-        and not r.get("Corrected Version", "").startswith("— WITHHELD")
-    )
-    journals_missing_pages = sum(
-        1 for r in journal_rows
-        if not _reference_has_page_range(r.get("Corrected Version", ""))
-        and not r.get("Corrected Version", "").startswith("— WITHHELD")
-    )
-
-    # ==== NEW: withheld total for metrics ====
-    withheld_total = sum(
-        1 for r in reference_rows
-        if r.get("Corrected Version", "").startswith("— WITHHELD")
-        or r.get("DOI Suspicious") != "—"
-        or bool(r.get("Missing Elements"))
-    )
-
+    # ---- Revised: window anchored to manuscript_year, inclusive ----
     window_start = manuscript_year - 9
     window_end = manuscript_year
     recent = sum(
@@ -2415,12 +1972,6 @@ def render():
         ("DOI Suspicious (possible fabrication)",
          f"{doi_suspicious} "
          f"({doi_suspicious / total_refs * 100:.1f}%)" if total_refs else "0"),
-        ("Journal Articles missing DOI",
-         f"{journals_missing_doi} / {len(journal_rows)}"),
-        ("Journal Articles missing page range",
-         f"{journals_missing_pages} / {len(journal_rows)}"),
-        ("References withheld (missing elements / DOI mismatch)",
-         f"{withheld_total} / {total_refs}"),
     ]
 
     metric_df = pd.DataFrame(metrics, columns=["Metric", "Value"])
@@ -2442,6 +1993,7 @@ def render():
     with right:
         st.dataframe(src_df, use_container_width=True, hide_index=True)
 
+    # ---- Download ----
     try:
         docx_bytes = build_apa_report_docx(batch)
         safe_name = re.sub(r"[^\w\-]+", "_", batch.get("filename", "manuscript"))
@@ -2459,6 +2011,7 @@ def render():
     except Exception as exc:
         st.error(f"Could not build DOCX report: {exc}")
 
+    # ---- Start Fresh button (red, below download) ----
     st.markdown(
         """
         <style>
@@ -2487,6 +2040,7 @@ def render():
         use_container_width=True,
         key="reset_btn_start_fresh",
     ):
+        # 1. Wipe every APA-related session-state entry.
         for k in list(st.session_state.keys()):
             if k == "pdf_batches" or k.startswith("pdf_batches"):
                 del st.session_state[k]
@@ -2495,9 +2049,16 @@ def render():
             if k == "selected_pdf_key":
                 del st.session_state[k]
 
+        # 2. Recreate the batch dict empty.
         st.session_state["pdf_batches"] = {}
+
+        # 3. Bump the uploader version → new key → empty uploader.
         st.session_state["apa_uploader_version"] = (
             st.session_state.get("apa_uploader_version", 0) + 1
         )
+
+        # 4. Optional: reset the manuscript year back to current year.
         st.session_state["apa_manuscript_year"] = datetime.now().year
+
+        # 5. Rerun so everything re-renders clean.
         st.rerun()
