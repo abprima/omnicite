@@ -587,14 +587,16 @@ def split_glued_reference_line(line):
     Split a PDF-extracted physical line when two or more APA references
     have been collapsed onto the same line.
 
-    The heuristic:
-      - Find candidate positions where a new reference appears to begin
-        (author/org name followed by a parenthesized year).
-      - For each candidate, reuse is_strong_reference_start() to confirm.
-      - Cut the line at each confirmed candidate.
+    Only splits at positions that satisfy BOTH:
+      (a) The text IMMEDIATELY BEFORE the candidate looks like the end
+          of a reference — i.e. a DOI/URL, or a page range followed by
+          a period.
+      (b) The candidate text itself is a strong reference start
+          (verified via is_strong_reference_start).
 
-    Returns a list of strings (>= 1 element). If no boundary is found,
-    returns [line] unchanged.
+    This prevents splitting in the middle of an author list such as
+    "Angraini, D. I., Karyus, A., ... (2021)" where "Sari, M. I.,"
+    could otherwise be mistaken for a new reference.
     """
     if not line:
         return []
@@ -603,7 +605,18 @@ def split_glued_reference_line(line):
     if not line:
         return []
 
-    # Look for whitespace + AuthorName(s), ... (YEAR)
+    # Where could a boundary be? Right after a DOI, a URL, or a
+    # completed page range that ends a reference.
+    boundary_re = re.compile(
+        r"(?:"
+        r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/\S+"   # DOI
+        r"|https?://\S+"                                # any URL
+        r"|\.\s+\d+\s*[–-]\s*\d+\s*\."                  # ". 123–130."
+        r"|\b\d+\s*[–-]\s*\d+\s*\."                     # "123–130."
+        r")"
+    )
+
+    # Candidate: whitespace + Author + optional more authors + (YYYY)
     candidate_re = re.compile(
         r"(?=\s+"
         r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
@@ -614,24 +627,40 @@ def split_glued_reference_line(line):
         r")"
     )
 
-    starts = [m.start() for m in candidate_re.finditer(line)]
-
-    if not starts:
+    # 1. Collect all boundary anchors (positions where a reference could end)
+    anchors = [m.end() for m in boundary_re.finditer(line)]
+    if not anchors:
         return [line]
 
+    # 2. Collect all candidate starts
+    candidates = [m.start() for m in candidate_re.finditer(line)]
+    if not candidates:
+        return [line]
+
+    # 3. Keep only candidates that start at (or immediately after)
+    #    a boundary anchor, allowing whitespace in between.
+    valid_cuts = []
+    for cand in candidates:
+        # Is there a boundary anchor ending just before this candidate?
+        for anchor in anchors:
+            gap = line[anchor:cand]
+            if len(gap) <= 3 and gap.strip() == "":
+                candidate_text = line[cand:].strip()
+                if is_strong_reference_start(candidate_text):
+                    valid_cuts.append(cand)
+                    break
+
+    if not valid_cuts:
+        return [line]
+
+    # 4. Cut at each validated position
     pieces = []
     last = 0
-
-    for pos in starts:
-        candidate_text = line[pos:].strip()
-
-        # Reuse the strong detector we already trust.
-        if is_strong_reference_start(candidate_text):
-            before = line[last:pos].strip()
-            if before:
-                pieces.append(before)
-            last = pos
-
+    for pos in valid_cuts:
+        before = line[last:pos].strip()
+        if before:
+            pieces.append(before)
+        last = pos
     remainder = line[last:].strip()
     if remainder:
         pieces.append(remainder)
