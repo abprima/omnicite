@@ -750,10 +750,16 @@ def split_references(reference_text):
         if not current:
             return False
         previous = current[-1].strip()
-        return (
-            bool(re.search(r"(?:&|,\s*&|,)\s*$", previous))
-            and not contains_apa_date(" ".join(current))
-        )
+        # Ends with a comma, ampersand, or "and"
+        if re.search(r"(?:,|&|\band)\s*$", previous):
+            return True
+        # Ends mid-sentence — no terminal punctuation at all
+        # (this catches "Michaeli, T.," fragments)
+        if previous and not re.search(r"[.!?:]$", previous):
+            # But only if the fragment looks like an author list fragment
+            if re.search(r"[A-ZÀ-ÖØ-Ý][a-z]+\s*,\s*(?:[A-Z]\.\s*)+$", previous):
+                return True
+        return False
 
     def looks_reference_complete(text):
         if not contains_apa_date(text):
@@ -793,6 +799,15 @@ def split_references(reference_text):
         # inside save_current, so they must not be treated as content).
         if is_page_break(line):
             continue
+
+        # ── NEW GUARD: if the previous line ends with a connector,
+        #    the current line is a continuation of the same author list.
+        if current:
+            prev = current[-1].strip()
+            if re.search(r"(?:,|&|\band)\s*$", prev):
+                current.append(line)
+                current_has_year = current_has_year or contains_apa_date(line)
+                continue
 
         # ── 1. STRONG boundary ─────────────────────────────────────
         # Author/organization + (year) → almost certainly a new reference.
