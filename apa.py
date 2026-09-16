@@ -748,11 +748,14 @@ def split_references(reference_text):
         # ── 2. WEAKER boundary ─────────────────────────────────────
         # Personal or corporate author start, but only split when the
         # previous reference already looks complete.
-        # ── 2. WEAKER boundary
         if starts_personal_author(line) or starts_corporate_author(line):
-            save_current()
-            current = [line]
-            current_has_year = contains_apa_date(line)
+            if looks_reference_complete(" ".join(current)):
+                save_current()
+                current = [line]
+                current_has_year = contains_apa_date(line)
+            else:
+                current.append(line)
+                current_has_year = current_has_year or contains_apa_date(line)
             continue
 
         # Author connector at end of the previous line (e.g. "& ")
