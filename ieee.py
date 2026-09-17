@@ -1692,7 +1692,12 @@ def _fallback_ieee_italic_elements(source_type, parsed):
 # STAGED PIPELINE
 # =========================================================
 
-def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
+def extract_ieee_pdf(uploaded_file, batch, manuscript_year):
+    """
+    Stage 1: read PDF, pull text + style spans, clean, find reference
+    section, split references, extract citations. No DOI/OpenAlex calls,
+    no AI calls.
+    """
     uploaded_file.seek(0)
     full_text, pages, removed_running_text = extract_pdf_text(uploaded_file)
     uploaded_file.seek(0)
@@ -1711,11 +1716,42 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
     for c in citations:
         c["page"] = _page_for_offset(full_text, c.get("offset"))
 
+    batch.update({
+        "filename": uploaded_file.name,
+        "reference_text": reference_text,
+        "heading": heading,
+        "references": references,
+        "parsed_references": parsed_refs,
+        "local_source_types": local_source_types,
+        "citations": citations,
+        "citation_clusters": clusters,
+        "removed_running_text": removed_running_text,
+        "style_spans": style_spans,
+        "manuscript_year": int(manuscript_year),
+        "ai_done": False,
+    })
+    return batch
+
+
+def process_ieee_references_and_citations(batch, client, manuscript_year):
+    """
+    Stage 2: verify DOIs via OpenAlex, run AI reference + citation review,
+    build all final rows and statistics. Assumes batch was already
+    populated by extract_ieee_pdf().
+    """
+    references = batch["references"]
+    parsed_refs = batch["parsed_references"]
+    local_source_types = batch["local_source_types"]
+    citations = batch["citations"]
+    clusters = batch["citation_clusters"]
+
+    # ---- DOI verification via OpenAlex ----
     verification_rows = []
     for ref, parsed in zip(references, parsed_refs):
         v = verify_reference_against_openalex(ref, parsed)
         verification_rows.append(v)
 
+    # ---- Pre-classification + AI reference review ----
     review_payload, preclassified = preclassify_ieee_references(
         references, verification_rows, local_source_types
     )
@@ -1795,6 +1831,7 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
             "Placeholders": local.get("Placeholders", {}),
         })
 
+    # ---- AI citation cluster review ----
     cit_ai = review_ieee_citations_with_ai(clusters, rows) if clusters else []
     cit_by_no = {
         int(x.get("number", -1)): x for x in (cit_ai or [])
@@ -1816,6 +1853,7 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
             "Reason": " | ".join(reasons) or ai.get("explanation", ""),
         })
 
+    # ---- Statistics / matching ----
     citation_stats = calculate_citation_statistics(citations, clusters)
     matching = match_citations_to_references(citations, parsed_refs)
     orphan = find_orphan_citations(citations, parsed_refs)
@@ -1824,27 +1862,19 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
     recency = calculate_reference_recency(references, manuscript_year)
 
     batch.update({
-        "filename": uploaded_file.name,
-        "reference_text": reference_text,
-        "heading": heading,
-        "references": references,
-        "parsed_references": parsed_refs,
-        "citations": citations,
-        "citation_clusters": clusters,
         "citation_stats": citation_stats,
         "matching_results": matching,
         "orphan_citations": orphan,
         "uncited_references": uncited,
         "duplicates": duplicates,
         "recency": recency,
-        "removed_running_text": removed_running_text,
-        "manuscript_year": int(manuscript_year),
         "reference_comparison": rows,
         "cluster_rows": cluster_rows,
         "verification_rows": verification_rows,
         "ai_done": True,
         "ai_complete": True,
     })
+    return batch
 
 
 # =========================================================
@@ -2118,31 +2148,38 @@ def build_ieee_docx(result):
     hr = h1.add_run("1. Summary")
     _set_run_font(hr, size_pt=14, bold=True)
 
+    window_start = recency.get("start_year", manuscript_year - 9)
+    window_end = recency.get("end_year", manuscript_year)
+    recent = recency.get("recent_count", 0)
+    recent_pct = recency.get("recent_percentage", 0)
+
+    # IEEE never reconstructs references from OpenAlex
+    doi_reconstructed = 0
+
     summary_rows = [
-        ("Manuscript publication year", str(manuscript_year), False),
-        ("Total references", str(total_refs), False),
-        ("Total in-text citation markers", str(total_cits), False),
-        ("  • Unique cited references", str(stats.get("unique", 0)), False),
-        ("  • Grouped citation clusters", str(stats.get("clusters", 0)), False),
-        ("Crowded clusters needing collapse",
+        ("Total References", str(total_refs), False),
+        ("References > 15",
+         f"Yes ({total_refs})" if total_refs > 15 else f"No ({total_refs})",
+         total_refs > 15),
+        ("Total Unique In-text Citations",
+         str(stats.get("unique", 0)), False),
+        ("Collapse Corrected",
          str(stats.get("crowded_clusters", 0)),
          stats.get("crowded_clusters", 0) > 0),
-        ("Orphan citations (no matching reference)",
+        (f"% Last 10 Years ({window_start}–{window_end})",
+         f"{recent_pct:.1f}% ({recent}/{total_refs})"
+         if total_refs else "0.0%", False),
+        ("Citations Missing from References",
          str(len(orphan)), len(orphan) > 0),
-        ("Uncited references",
+        ("References Missing from Citations",
          str(len(uncited)), len(uncited) > 0),
-        ("DOI checked via OpenAlex", str(doi_checked), False),
-        ("DOI suspicious (possible fabricated references)",
-         f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
+        ("DOI Checked", str(doi_checked), False),
+        ("References Reconstructed", str(doi_reconstructed), False),
+        ("DOI Suspicious (possible fabrication)",
+         f"{doi_suspicious} "
+         f"({doi_suspicious / total_refs * 100:.1f}%)"
+         if total_refs else "0",
          doi_suspicious > 0),
-        ("Corrections withheld due to DOI mismatch",
-         str(withheld_count), withheld_count > 0),
-        ("References flagged MANUAL CHECK",
-         str(manual_count), manual_count > 0),
-        ("References with placeholder fields",
-         str(placeholder_count), placeholder_count > 0),
-        (f"% references within last 10 years ({window_start}-{window_end})",
-         f"{recency.get('recent_percentage', 0):.1f}%", False),
     ]
 
     summary_table = doc.add_table(rows=1, cols=2)
@@ -2574,23 +2611,49 @@ def render():
 
         for i, (key, uf) in enumerate(file_keys, start=1):
             base_pct = int((i - 1) * step)
-            overall.progress(base_pct + int(step * 0.10),
-                             text=f"[{i}/{n}] Extracting references & verifying DOIs...")
 
-            batch = {"filename": uf.name, "manuscript_year": int(manuscript_year),
-                     "ai_done": False}
+            # ---- Stage 1: extract PDF ----
+            overall.progress(
+                base_pct + int(step * 0.10),
+                text=f"[{i}/{n}] Extracting {uf.name}...",
+            )
+            batch = {
+                "filename": uf.name,
+                "manuscript_year": int(manuscript_year),
+                "ai_done": False,
+            }
             try:
-                process_single_ieee_pdf(uf, batch, client, int(manuscript_year))
+                uf.seek(0)
+                extract_ieee_pdf(uf, batch, int(manuscript_year))
+            except Exception as exc:
+                st.error(f"{uf.name} extraction failed: {exc}")
+                batch["error"] = str(exc)
+                st.session_state["ieee_batches"][key] = batch
+                continue
+
+            # ---- Stage 2: extract references & verify DOIs ----
+            overall.progress(
+                base_pct + int(step * 0.35),
+                text=f"[{i}/{n}] Extracting references & verifying DOIs...",
+            )
+            try:
+                process_ieee_references_and_citations(
+                    batch, client, int(manuscript_year)
+                )
             except Exception as exc:
                 st.error(f"{uf.name} IEEE check failed: {exc}")
                 batch["error"] = str(exc)
+
             st.session_state["ieee_batches"][key] = batch
-            overall.progress(base_pct + int(step * 1.00),
-                             text=f"[{i}/{n}] {uf.name} done.")
+
+            # ---- Stage 3: done ----
+            overall.progress(
+                base_pct + int(step * 1.00),
+                text=f"[{i}/{n}] {uf.name} done.",
+            )
 
         overall.progress(100, text="All manuscripts processed.")
         overall.empty()
-        st.success(f"Processed {n} manuscript{'s' if n != 1 else ''}.")
 
     any_done = any(b.get("ai_done") for b in st.session_state["ieee_batches"].values())
     if not any_done:
@@ -2710,26 +2773,33 @@ def render():
 
     window_start = recency.get("start_year", int(manuscript_year) - 9)
     window_end = recency.get("end_year", int(manuscript_year))
+    recent = recency.get("recent_count", 0)
+    recent_pct = recency.get("recent_percentage", 0)
 
-    metric_rows = [
-        {"Metric": "Manuscript publication year", "Value": str(manuscript_year)},
-        {"Metric": "Total references", "Value": total_refs_now},
-        {"Metric": "Total in-text citation markers", "Value": stats.get("total", 0)},
-        {"Metric": "Unique cited references", "Value": stats.get("unique", 0)},
-        {"Metric": "Grouped citation clusters", "Value": stats.get("clusters", 0)},
-        {"Metric": "Crowded clusters (needs collapse)", "Value": stats.get("crowded_clusters", 0)},
-        {"Metric": "Orphan citations (no matching reference)", "Value": len(orphan)},
-        {"Metric": "Uncited references", "Value": len(uncited)},
-        {"Metric": "DOI checked via OpenAlex", "Value": doi_checked},
-        {"Metric": "DOI suspicious (possible fabrication)",
-         "Value": f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)"},
-        {"Metric": "Corrections withheld due to DOI mismatch", "Value": withheld_count},
-        {"Metric": "References flagged MANUAL CHECK", "Value": manual_count},
-        {"Metric": "References with placeholder fields", "Value": placeholder_count},
-        {"Metric": f"% references within last 10 years ({window_start}-{window_end})",
-         "Value": f"{recency.get('recent_percentage', 0):.1f}%"},
+    # IEEE never reconstructs references from OpenAlex
+    doi_reconstructed = 0
+
+    metrics = [
+        ("Total References", total_refs_now),
+        ("References > 15",
+         f"Yes ({total_refs_now})" if total_refs_now > 15
+         else f"No ({total_refs_now})"),
+        ("Total Unique In-text Citations", stats.get("unique", 0)),
+        ("Collapse Corrected", stats.get("crowded_clusters", 0)),
+        (f"% Last 10 Years ({window_start}–{window_end})",
+         f"{recent_pct:.1f}% ({recent}/{total_refs_now})"
+         if total_refs_now else "0.0%"),
+        ("Citations Missing from References", len(orphan)),
+        ("References Missing from Citations", len(uncited)),
+        ("DOI Checked", doi_checked),
+        ("References Reconstructed", doi_reconstructed),
+        ("DOI Suspicious (possible fabrication)",
+         f"{doi_suspicious} "
+         f"({doi_suspicious / total_refs_now * 100:.1f}%)"
+         if total_refs_now else "0"),
     ]
-    metric_df = pd.DataFrame(metric_rows)
+
+    metric_df = pd.DataFrame(metrics, columns=["Metric", "Value"])
 
     source_counts = Counter(
         (row.get("Source Type") or "Other") for row in reference_rows
