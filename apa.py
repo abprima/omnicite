@@ -1743,8 +1743,8 @@ def build_apa_report_docx(result):
          str(cits_missing_from_refs), cits_missing_from_refs > 0),
         ("References NOT cited in text",
          str(refs_missing_from_cits), refs_missing_from_cits > 0),
-        ("DOI checked via OpenAlex", str(doi_checked), False),
-        ("References reconstructed from OpenAlex",
+        ("DOI checked", str(doi_checked), False),
+        ("References reconstructed",
          str(doi_reconstructed), False),
         ("DOI suspicious (possible fabricated references)",
          f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
@@ -2344,7 +2344,7 @@ def render():
     openalex_key = _get_openalex_api_key()
     if not openalex_key:
         st.warning(
-            "OpenAlex API key was not found — DOI verification will be skipped."
+            "OA key was not found — DOI verification will be skipped."
         )
 
     client = OpenAI(api_key=openai_key)
@@ -2546,8 +2546,8 @@ def render():
          f"{recent_pct:.1f}% ({recent}/{total_refs})" if total_refs else "0.0%"),
         ("Citations Missing from References", missing_cits),
         ("References Missing from Citations", missing_refs),
-        ("DOI Checked (OpenAlex)", doi_checked),
-        ("References Reconstructed from OpenAlex", doi_reconstructed),
+        ("DOI Checked", doi_checked),
+        ("References Reconstructed", doi_reconstructed),
         ("DOI Suspicious (possible fabrication)",
          f"{doi_suspicious} "
          f"({doi_suspicious / total_refs * 100:.1f}%)" if total_refs else "0"),
