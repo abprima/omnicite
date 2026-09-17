@@ -136,31 +136,129 @@ def strip_running_headers_footers(text: str) -> str:
 # SECTION SLICERS
 # ============================================================
 
+# ------------------------------------------------------------
+# APA reference-line heuristics (used for section-quality gating)
+# ------------------------------------------------------------
+
+_APA_YEAR_IN_LINE_RE = re.compile(r"\((?:19|20)\d{2}[a-z]?\)")
+
+
+def _looks_like_apa_reference(line: str) -> bool:
+    """
+    Heuristic: does this line look like an APA reference entry?
+
+    Accepts lines that:
+      - Contain a parenthetical year, e.g. (2020) or (2019a), OR
+      - Are continuation lines (start with a DOI or URL), OR
+      - Start with an author-like token followed by a year.
+
+    Rejects lines that look like table captions, figure legends,
+    or section headings.
+    """
+    s = line.strip()
+    if not s or len(s) < 15:
+        return False
+
+    # Reject table/figure captions
+    if re.match(r"^\s*(Table|Figure|Fig\.|Tab\.)\s+\d+", s, re.I):
+        return False
+
+    # Reject standalone numbered section headings like "1.2 Methods"
+    if re.match(r"^\s*\d+(?:\.\d+)+\s+[A-Z][a-z]", s):
+        return False
+
+    # Accept DOI-only or URL-only continuation lines
+    if re.match(r"^https?://", s):
+        return True
+    if re.match(r"^10\.\d{4,9}/", s):
+        return True
+
+    # Accept if there's a parenthetical year somewhere
+    if _APA_YEAR_IN_LINE_RE.search(s):
+        return True
+
+    return False
+
+
+def _reference_section_quality(text_block: str, cap: int = 300) -> int:
+    """Count reference-shaped lines in the first `cap` lines of the block."""
+    count = 0
+    for line in text_block.splitlines()[:cap]:
+        if _looks_like_apa_reference(line):
+            count += 1
+    return count
+
+
+def _is_plausible_reference_heading(line: str) -> bool:
+    """
+    Stricter check than `_normalize_heading in REFERENCE_HEADINGS`:
+    the heading must be short (≤ 4 words) and not end with sentence
+    punctuation. Catches in-table "References" column headers.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if len(stripped.split()) > 4:
+        return False
+    if stripped.endswith((".", "?", "!", ",", ";")):
+        return False
+    norm = _normalize_heading(stripped)
+    return norm in REFERENCE_HEADINGS
+
+
 def slice_reference_section(text: str):
+    """
+    Bottom-up anchor with quality gating.
+
+    1. Collect ALL lines that look like reference headings.
+    2. Try them bottom-up (the LAST one wins if it passes quality).
+    3. For each candidate, count how many reference-shaped lines follow.
+       Accept the first candidate with >= 5 real references below it.
+    4. Stop the slice at the first POST_REFERENCE_HEADING encountered
+       AFTER at least 3 non-empty lines (protects against stray headings).
+
+    Returns:
+      (sliced_text, ref_found, post_found)
+
+      - On success: (block, True, <whether a post-heading was found>)
+      - On failure: ("", False, False)   <-- empty string, not the whole doc
+    """
     lines = text.splitlines()
-    ref_index = None
-    post_index = None
 
+    # ---- Step 1: collect all candidate reference-heading positions ----
+    candidates = []
     for i, line in enumerate(lines):
-        norm = _normalize_heading(line)
-        if not norm:
-            continue
+        if _is_plausible_reference_heading(line):
+            candidates.append(i)
 
-        if ref_index is None and norm in REFERENCE_HEADINGS:
-            ref_index = i
-            continue
+    if not candidates:
+        return "", False, False
 
-        if ref_index is not None and norm in POST_REFERENCE_HEADINGS:
-            post_index = i
-            break
+    # ---- Step 2: try candidates bottom-up, keep first passing ----
+    for ref_index in reversed(candidates):
+        # Slice from this heading down to the next post-reference heading
+        post_index = None
+        non_empty_seen = 0
+        for j in range(ref_index + 1, len(lines)):
+            stripped = lines[j].strip()
+            if not stripped:
+                continue
+            non_empty_seen += 1
+            norm = _normalize_heading(stripped)
+            if non_empty_seen >= 3 and norm in POST_REFERENCE_HEADINGS:
+                post_index = j
+                break
 
-    if ref_index is None:
-        return text, False, False
+        end = post_index if post_index is not None else len(lines)
+        block = "\n".join(lines[ref_index:end]).strip()
 
-    end = post_index if post_index is not None else len(lines)
-    sliced = "\n".join(lines[ref_index:end]).strip()
+        # ---- Quality gate: does the block look like real references? ----
+        quality = _reference_section_quality(block, cap=300)
+        if quality >= 5:
+            return block, True, (post_index is not None)
 
-    return sliced, True, post_index is not None
+    # No candidate passed the quality gate
+    return "", False, False
 
 
 def slice_body_section(text: str):
@@ -2419,6 +2517,16 @@ def render():
                 ) = extract_pdf_text(uf)
             except Exception as exc:
                 st.error(f"{uf.name} extraction failed: {exc}")
+                continue
+
+            # ---- HARD STOP: no valid reference section detected ----
+            if not ref_found:
+                st.error(
+                    f"{uf.name}: No valid 'References' section could be "
+                    f"identified. The heading may be missing, or the "
+                    f"section contains too few reference entries. "
+                    f"This manuscript cannot be audited."
+                )
                 continue
 
             citations = extract_all_citations(body_text)
