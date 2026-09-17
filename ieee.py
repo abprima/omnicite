@@ -2,13 +2,13 @@
 # OmniCite Auditor — IEEE Style Module
 # Imported and rendered by app.py via:  import ieee; ieee.render()
 #
-# Flow mirrors apa.py:
-#   - One "Extract & Review" button
-#   - Per-file batch dict in st.session_state["ieee_batches"]
-#   - process_single_ieee_pdf() runs Stages A-G
-#   - Pre-classification gates AI calls (cost control)
-#   - Deterministic citation/cluster rules override AI
-#   - "Start Fresh" reset button
+# Full pipeline:
+#   - Bottom-up reference section detection (anchored at the last [n] marker)
+#   - Bottom-up reference splitting (anchored at the highest [n] marker)
+#   - Staged per-file pipeline process_single_ieee_pdf (Stages A-G)
+#   - Pre-classification gating for AI calls
+#   - Deterministic placeholder insertion with clean formatting
+#   - Wahyudin-style DOCX report (Summary table -> Citations -> References)
 
 import re
 import os
@@ -25,6 +25,8 @@ import fitz  # PyMuPDF
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 from openalex_config import get_openalex_api_key
 
@@ -213,64 +215,13 @@ def normalize_style_text(text):
     return text
 
 
-def _normalized_page_char_map(spans, page_number):
-    chars, styles, fonts = [], [], []
-    last_space = True
-    for span in spans:
-        if span["page"] != page_number:
-            continue
-        raw = (span.get("text") or "").replace("\u00ad", "")
-        raw = raw.replace("‐", "-").replace("‑", "-").replace("–", "-").replace("—", "-")
-        for ch in raw:
-            if ch.isspace():
-                if not last_space and chars:
-                    chars.append(" "); styles.append(False); fonts.append("")
-                last_space = True
-            else:
-                chars.append(ch.lower())
-                styles.append(bool(span.get("italic")))
-                fonts.append(span.get("font", ""))
-                last_space = False
-        if chars and not last_space:
-            chars.append(" "); styles.append(False); fonts.append(""); last_space = True
-    text = "".join(chars).strip()
-    if len(text) < len(chars):
-        chars = list(text); styles = styles[:len(text)]; fonts = fonts[:len(text)]
-    return text, styles, fonts
-
-
-def _style_for_exact_range(page_text, styles, fonts, start, end):
-    positions = [i for i in range(start, end) if i < len(page_text) and not page_text[i].isspace()]
-    if not positions:
-        return None
-    italic_count = sum(1 for i in positions if styles[i])
-    ratio = italic_count / len(positions)
-    used_fonts = sorted({fonts[i] for i in positions if fonts[i]})
-    return {"found": True, "italic": ratio >= 0.80, "italic_ratio": ratio, "fonts": used_fonts}
-
-
-def find_phrase_style(spans, phrase):
-    target = normalize_style_text(phrase)
-    if not target or len(target) < 2:
-        return None
-    for page in sorted({s["page"] for s in spans}):
-        page_text, styles, fonts = _normalized_page_char_map(spans, page)
-        idx = page_text.find(target)
-        if idx >= 0:
-            result = _style_for_exact_range(page_text, styles, fonts, idx, idx + len(target))
-            if result:
-                result["page"] = page
-                return result
-    return {"found": False, "italic": None, "italic_ratio": None, "fonts": [], "page": None}
-
-
 # =========================================================
 # TEXT CLEANING
 # =========================================================
 
 def clean_text(text):
     text = text.replace("\u00ad", "")
-    text = text.replace("\u2013", "–").replace("\u2014", "—")
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
     return text
 
@@ -284,6 +235,11 @@ def strip_markdown_markers(text):
     text = _safe_sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", r"\1", text, flags=re.S)
     text = re.sub(r"[ \t]{2,}", " ", text).strip()
     return text
+
+
+# =========================================================
+# REFERENCE SECTION DETECTION — bottom-up anchor
+# =========================================================
 
 REFERENCE_HEADINGS = {
     "references", "reference", "reference list", "reference section",
@@ -320,24 +276,17 @@ def normalize_heading(text):
 
 
 def _heading_matches_reference_vocab(line):
-    """True if the line is a heading-like match for reference vocabulary."""
     stripped = line.strip()
     if not stripped:
         return False
-
-    # Reject obvious table rows: multiple wide gaps or tabs
+    # Reject table rows: multiple wide gaps or tabs
     if "\t" in stripped or re.search(r"\s{3,}\S+\s{3,}\S+\s{3,}", stripped):
         return False
-
-    # Reject very long lines (headings are short)
     if len(stripped) > 60:
         return False
-
     norm = normalize_heading(stripped)
     if not norm:
         return False
-
-    # Exact match or startswith "<heading> "
     if norm in REFERENCE_HEADINGS:
         return True
     for h in REFERENCE_HEADINGS:
@@ -346,22 +295,26 @@ def _heading_matches_reference_vocab(line):
     return False
 
 
+def is_post_reference_heading(line):
+    normalized = normalize_heading(line)
+    if not normalized:
+        return False
+    if normalized in POST_REFERENCE_HEADINGS:
+        return True
+    for h in POST_REFERENCE_HEADINGS:
+        if normalized.startswith(h + " "):
+            return True
+    return False
+
+
 def find_reference_section(text):
     """
-    Bottom-up detection:
-
-      1. Find the LAST [n] reference marker in the document.
-         This anchors the bottom of the reference list.
-      2. Walk UP from that anchor. The FIRST line that matches
-         reference-heading vocabulary is the section start.
-      3. Slice from (heading_line + 1) to end-of-document (or first
-         post-reference heading, whichever comes first).
-
-    Returns (reference_text, heading_found, body_text).
+    Bottom-up detection: find the LAST [n] marker, then walk UP until
+    a reference-vocabulary heading is found. This avoids table headers
+    like 'Reference' inside body sections.
     """
     lines = text.splitlines()
 
-    # ---- Step 1: find the last bracketed marker ----
     marker_re = re.compile(r"^\s*\[?\s*(\d{1,3})\s*\]")
     last_marker_idx = None
     for i in range(len(lines) - 1, -1, -1):
@@ -369,11 +322,9 @@ def find_reference_section(text):
             last_marker_idx = i
             break
 
-    # Fallback: no markers at all → try the old top-down detection
     if last_marker_idx is None:
         return _find_reference_section_topdown(text)
 
-    # ---- Step 2: walk UP from the last marker to find the heading ----
     heading_idx = None
     for i in range(last_marker_idx, -1, -1):
         if _heading_matches_reference_vocab(lines[i]):
@@ -381,14 +332,10 @@ def find_reference_section(text):
             break
 
     if heading_idx is None:
-        # No heading found above the markers — still return the marker region
         reference_text = "\n".join(lines[last_marker_idx:])
         body_text = "\n".join(lines[:last_marker_idx])
         return reference_text, None, body_text
 
-    # ---- Step 3: find the end boundary ----
-    # Walk DOWN from heading. Stop at the first post-reference heading
-    # that comes AFTER at least one reference marker.
     end_idx = None
     saw_marker = False
     for i in range(heading_idx + 1, len(lines)):
@@ -415,20 +362,7 @@ def find_reference_section(text):
     return reference_text, heading_found, body_text
 
 
-def is_post_reference_heading(line):
-    normalized = normalize_heading(line)
-    if not normalized:
-        return False
-    if normalized in POST_REFERENCE_HEADINGS:
-        return True
-    for h in POST_REFERENCE_HEADINGS:
-        if normalized.startswith(h + " "):
-            return True
-    return False
-
-
 def _find_reference_section_topdown(text):
-    """Fallback used only when the document has NO [n] markers anywhere."""
     lines = text.splitlines()
     start_index = None
     for i, line in enumerate(lines):
@@ -453,62 +387,100 @@ def _find_reference_section_topdown(text):
 
 
 # =========================================================
-# IEEE REFERENCE SPLITTING
+# IEEE REFERENCE SPLITTING — bottom-up anchor
 # =========================================================
 
-IEEE_MARKER_RE = re.compile(r"^\s*\[(\d+)\]\s*")
-IEEE_PLAIN_NUM_RE = re.compile(r"^\s*(\d{1,3})\.\s+(?=[A-Z])")
+# Matches [12], 12], [12, or ]12] at a token boundary
+_MARKER_TOKEN_RE = re.compile(
+    r"(?:(?<=\s)|^)"
+    r"\[?\s*(\d{1,3})\s*\]"
+    r"(?=\s|[A-Z]|$)"
+)
 
 
-def is_page_break(line):
-    return bool(re.fullmatch(r"<<<PAGE_BREAK:\d+>>>", line.strip()))
+def _find_all_markers(line):
+    hits = []
+    for m in _MARKER_TOKEN_RE.finditer(line):
+        try:
+            num = int(m.group(1))
+        except ValueError:
+            continue
+        if 1900 <= num <= 2099:
+            continue
+        if num > 500:
+            continue
+        hits.append((m.start(), num))
+    return hits
+
+
+def _looks_like_reference_start(text_after_marker):
+    tail = text_after_marker.lstrip()
+    if not tail:
+        return False
+    if tail[0].isupper() or tail[0] in '"\u201c':
+        return True
+    return False
 
 
 def split_references(reference_text):
-    raw_lines = reference_text.splitlines()
-    lines = []
-    for raw_line in raw_lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        if is_page_break(line):
-            continue
-        line = line.replace("\u00ad", "")
-        line = re.sub(r"\s+", " ", line).strip()
-        if line:
-            lines.append(line)
+    """
+    Bottom-up IEEE reference splitter:
+      1. Flatten (remove page breaks, normalize whitespace).
+      2. Find every [n] / n] token.
+      3. Keep the longest strictly-increasing run.
+      4. Cut references between consecutive markers.
+      5. Discard prefix before the first marker.
+    """
+    if not reference_text:
+        return []
 
-    references = []
+    text = reference_text
+    text = re.sub(r"<<<PAGE_BREAK:\d+>>>", " ", text)
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("\u00ad", "")
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Repair common PDF extraction artifacts where the '[' was lost
+    text = re.sub(r"([a-z])(\d{1,3})\]\s", r"\1 [\2] ", text)
+
+    all_hits = _find_all_markers(text)
+    if not all_hits:
+        return []
+
+    sequences = []
     current = []
-
-    def flush():
-        nonlocal current
+    for pos, num in all_hits:
         if not current:
-            return
-        ref = re.sub(r"\s+", " ", " ".join(current)).strip()
-        ref = re.sub(r"\s*\[(\d+)\]\s*$", "", ref).strip()
-        if ref:
-            references.append(ref)
-        current = []
+            current = [(pos, num)]
+            continue
+        prev_num = current[-1][1]
+        if num == prev_num + 1:
+            current.append((pos, num))
+        elif num > prev_num + 1:
+            sequences.append(current)
+            current = [(pos, num)]
 
-    for line in lines:
-        if IEEE_MARKER_RE.match(line) or IEEE_PLAIN_NUM_RE.match(line):
-            flush()
-            current = [line]
-        else:
-            if not current:
-                current = [line]
-            else:
-                current.append(line)
-    flush()
+    if current:
+        sequences.append(current)
 
-    cleaned = []
-    for ref in references:
-        ref = re.sub(r"^\s*\[\d+\]\s*", "", ref).strip()
-        ref = re.sub(r"^\s*\d{1,3}\.\s+", "", ref).strip()
-        if ref:
-            cleaned.append(ref)
-    return cleaned
+    if not sequences:
+        return []
+    best = max(sequences, key=lambda s: (len(s), s[-1][0]))
+
+    markers = best
+    references = []
+    for i, (pos, num) in enumerate(markers):
+        start = pos
+        end = markers[i + 1][0] if i + 1 < len(markers) else len(text)
+        chunk = text[start:end].strip()
+        chunk = re.sub(r"^\[?\s*\d{1,3}\s*\]\s*", "", chunk).strip()
+        chunk = re.sub(r"\s+\d{1,3}\s*$", "", chunk).strip()
+        if chunk:
+            references.append(chunk)
+
+    numbered = sorted(zip([n for _, n in markers], references), key=lambda x: x[0])
+    return [ref for _, ref in numbered]
 
 
 # =========================================================
@@ -723,7 +695,7 @@ def parse_ieee_reference(reference):
     if no_match:
         result["issue"] = no_match.group(1)
 
-    pp_match = re.search(r"\bpp\.\s*([\w\-–—]+(?:\s*[–—-]\s*[\w\-–—]+)?)", reference)
+    pp_match = re.search(r"\bpp\.\s*([\w\-]+(?:\s*[-–—]\s*[\w\-]+)?)", reference)
     if pp_match:
         result["pages"] = pp_match.group(1).strip()
 
@@ -929,27 +901,6 @@ def _guess_author_count_from_text(reference):
     return len(entries)
 
 
-def _insert_placeholder_after_venue(ref, placeholder):
-    m = re.search(r",\s*(?:vol\.|no\.|pp\.|doi:|https?://)", ref, re.I)
-    if m:
-        return ref[:m.start()] + f", {placeholder}" + ref[m.start():]
-    return ref.rstrip(".").rstrip() + f", {placeholder}."
-
-
-def _insert_placeholder_after_volume(ref, placeholder):
-    m = re.search(r"\bvol\.\s*\S+", ref, re.I)
-    if m:
-        return ref[:m.end()] + f", {placeholder}" + ref[m.end():]
-    return _insert_placeholder_after_venue(ref, placeholder)
-
-
-def _insert_placeholder_after_issue(ref, placeholder):
-    m = re.search(r"\bno\.\s*\S+", ref, re.I)
-    if m:
-        return ref[:m.end()] + f", {placeholder}" + ref[m.end():]
-    return _insert_placeholder_after_volume(ref, placeholder)
-
-
 # =========================================================
 # IEEE IN-TEXT CITATION EXTRACTION
 # =========================================================
@@ -1079,7 +1030,6 @@ def evaluate_cluster(cluster):
 
 
 def enforce_ieee_citation_rules(cluster):
-    """Final hard guard: canonical form can never be overridden by AI."""
     return collapse_citation_cluster(cluster["numbers"])
 
 
@@ -1366,6 +1316,7 @@ def build_local_ieee_reference_correction(reference):
     author_block = ref[:cut].strip().rstrip(",.")
     rest = ref[cut:]
 
+    # ---- Authors ----
     if author_block:
         author_block = _ET_AL_RE.sub("", author_block).strip(" ,")
         new_authors, changed, author_notes = normalize_ieee_authors(author_block)
@@ -1387,6 +1338,7 @@ def build_local_ieee_reference_correction(reference):
         ref = re.sub(r"\s{2,}", " ", ref).strip()
         notes.append("Removed 'et al.' — IEEE requires all authors to be listed.")
 
+    # ---- DOI normalization ----
     dm = _IEEE_DOI_RE.search(ref)
     if dm:
         doi = dm.group(0).rstrip(".,;")
@@ -1401,50 +1353,123 @@ def build_local_ieee_reference_correction(reference):
         if ref != old:
             notes.append("DOI converted to 'doi: ...' form.")
 
+    # ---- Journal-article placeholders (rebuilt cleanly) ----
     parsed_now = parse_ieee_reference(ref)
+    original_parsed = parse_ieee_reference(original)
 
     if parsed_now["source_type"] == "Journal Article":
-        if not parsed_now["volume"] and "vol." not in ref.lower():
-            ref = _insert_placeholder_after_venue(ref, PLACEHOLDER_VOL)
-            placeholder_flags["missing_vol"] = True
-            notes.append(f"Missing volume — placeholder inserted: {PLACEHOLDER_VOL}")
+        missing_vol = not original_parsed["volume"]
+        missing_no = not original_parsed["issue"]
+        missing_pp = not original_parsed["pages"]
 
-        if not parsed_now["issue"] and "no." not in ref.lower():
-            ref = _insert_placeholder_after_volume(ref, PLACEHOLDER_NO)
-            placeholder_flags["missing_no"] = True
-            notes.append(f"Missing issue — placeholder inserted: {PLACEHOLDER_NO}")
+        # Strip old placeholder artifacts so we don't stack them
+        ref = re.sub(r",?\s*vol\.\s*\?{3}", "", ref)
+        ref = re.sub(r",?\s*no\.\s*\?{3}", "", ref)
+        ref = re.sub(r",?\s*pp\.\s*\?{3}-\?{3}", "", ref)
+        ref = re.sub(r",?\s*pp\.\s*(\d+)-\?{3}", r" pp. \1", ref)
+        ref = re.sub(r"\s{2,}", " ", ref)
+        ref = re.sub(r",\s*,", ",", ref)
+        ref = ref.strip().rstrip(", ")
 
-        if not parsed_now["pages"] and "pp." not in ref.lower():
-            ref = _insert_placeholder_after_issue(ref, PLACEHOLDER_PAGES)
-            placeholder_flags["missing_pp"] = True
-            notes.append(f"Missing pages — placeholder inserted: {PLACEHOLDER_PAGES}")
-        elif _is_single_page_range(parsed_now["pages"]):
-            single = re.search(
-                r"\b(p+p?\.)\s*(\d+)\b",
-                ref,
-                re.I,
-            )
-            if single:
-                ref = (
-                    ref[:single.start()]
-                    + f"pp. {single.group(2)}-???"
-                    + ref[single.end():]
-                )
+        parsed_now = parse_ieee_reference(ref)
+
+        # Find the trailing year (with optional month) to anchor the tail
+        year_tail_match = re.search(
+            r"(,\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s*)?((?:19|20)\d{2})",
+            ref,
+        )
+        if year_tail_match:
+            tail_start = year_tail_match.start()
+            head = ref[:tail_start].rstrip(", ")
+            tail = ref[tail_start:]
+
+            # Strip existing vol/no/pp from head — we rebuild in order
+            head = re.sub(r",?\s*vol\.\s*[\w\-?]+", "", head)
+            head = re.sub(r",?\s*no\.\s*[\w\-?]+", "", head)
+            head = re.sub(r",?\s*pp?\.\s*[\w\-–—?]+(?:\s*[-–—]\s*[\w\-–—?]+)?", "", head)
+            head = re.sub(r"\s{2,}", " ", head).rstrip(", ")
+
+            pieces = []
+
+            vol = parsed_now["volume"]
+            if vol:
+                pieces.append(f"vol. {vol}")
+            elif missing_vol:
+                pieces.append("vol. ???")
+                placeholder_flags["missing_vol"] = True
+                notes.append("Missing volume — placeholder inserted: vol. ???")
+
+            no = parsed_now["issue"]
+            if no:
+                pieces.append(f"no. {no}")
+            elif missing_no:
+                pieces.append("no. ???")
+                placeholder_flags["missing_no"] = True
+                notes.append("Missing issue — placeholder inserted: no. ???")
+
+            pages = parsed_now["pages"]
+            if pages:
+                if _is_single_page_range(pages):
+                    pages = f"{pages}-???"
+                    placeholder_flags["missing_pp"] = True
+                    notes.append(
+                        f"Single page number — expanded to range placeholder: "
+                        f"pp. {pages}"
+                    )
+                pieces.append(f"pp. {pages}")
+            elif missing_pp:
+                pieces.append("pp. ???-???")
                 placeholder_flags["missing_pp"] = True
-                notes.append(
-                    f"Single page number — expanded to range placeholder: "
-                    f"pp. {single.group(2)}-???"
-                )
+                notes.append("Missing pages — placeholder inserted: pp. ???-???")
 
+            ref = head + (", " + ", ".join(pieces) if pieces else "") + tail
+        else:
+            # No year found — fall back to appending placeholders at the end
+            if missing_vol and "vol." not in ref.lower():
+                ref = ref.rstrip(".").rstrip(", ") + ", vol. ???"
+                placeholder_flags["missing_vol"] = True
+                notes.append("Missing volume — placeholder inserted: vol. ???")
+            if missing_no and "no." not in ref.lower():
+                ref = ref.rstrip(".").rstrip(", ") + ", no. ???"
+                placeholder_flags["missing_no"] = True
+                notes.append("Missing issue — placeholder inserted: no. ???")
+            if missing_pp and "pp." not in ref.lower():
+                ref = ref.rstrip(".").rstrip(", ") + ", pp. ???-???"
+                placeholder_flags["missing_pp"] = True
+                notes.append("Missing pages — placeholder inserted: pp. ???-???")
+
+    # ---- DOI/URL placeholder ----
+    parsed_now = parse_ieee_reference(ref)
     if not parsed_now["doi"] and not parsed_now["url"]:
         if "doi:" not in ref.lower() and "http" not in ref.lower():
-            ref = ref.rstrip(".").rstrip() + f", {PLACEHOLDER_DOI}."
+            ref = ref.rstrip(".").rstrip(", ") + f", {PLACEHOLDER_DOI}."
             placeholder_flags["missing_doi"] = True
             notes.append(f"Missing DOI/URL — placeholder inserted: {PLACEHOLDER_DOI}")
 
-    ref = ref.rstrip()
+    # ---- Final normalization pass ----
+    ref = re.sub(r",\s*,", ",", ref)
+    ref = re.sub(r"\s+,", ",", ref)
+    ref = re.sub(r",\s*", ", ", ref)
+    ref = re.sub(r"\s{2,}", " ", ref)
+    ref = re.sub(r",\s*\.", ".", ref)
+    ref = re.sub(r"\s+\.", ".", ref)
+    ref = re.sub(r"\.\.+$", ".", ref)
+
+    # Ensure placeholder tokens are followed by a comma when more text follows
+    ref = re.sub(
+        r"(\b(?:vol|no)\.\s*\?{3})(?!\s*[,.])(\s+)(?!\d)",
+        r"\1, \2",
+        ref,
+    )
+    ref = re.sub(
+        r"(\bpp\.\s*(?:\?{3}|\d+-\?{3}|\?{3}-\?{3}))(?!\s*[,.])(\s+)(?!\d)",
+        r"\1, \2",
+        ref,
+    )
+
+    ref = ref.strip().rstrip(",")
     if ref and not ref.endswith("."):
-        ref = ref + "."
+        ref += "."
         notes.append("Trailing period added.")
 
     changed = ref != original
@@ -1488,7 +1513,8 @@ def review_ieee_references_with_ai(references):
     if client is None or not references:
         return []
 
-    payload = [{"number": i, "reference": clean_text(r)} for i, r in enumerate(references, start=1)]
+    payload = [{"number": i, "reference": clean_text(r)}
+               for i, r in enumerate(references, start=1)]
 
     prompt = f"""
 You are checking IEEE-style REFERENCE-LIST entries.
@@ -1605,7 +1631,7 @@ INPUT CLUSTERS:
 
 
 # =========================================================
-# PRE-CLASSIFICATION (cost control, mirrors APA Stage C)
+# PRE-CLASSIFICATION (cost control)
 # =========================================================
 
 def preclassify_ieee_references(references, verification_rows, local_source_types):
@@ -1661,7 +1687,7 @@ def preclassify_ieee_references(references, verification_rows, local_source_type
 
 
 # =========================================================
-# AI STATUS LABEL
+# STATUS / FALLBACK LABELS
 # =========================================================
 
 def _ieee_status_label(status):
@@ -1684,15 +1710,10 @@ def _fallback_ieee_italic_elements(source_type, parsed):
 
 
 # =========================================================
-# STAGED PIPELINE — process_single_ieee_pdf
+# STAGED PIPELINE
 # =========================================================
 
 def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
-    """
-    Run the full IEEE pipeline for ONE PDF's batch dict.
-    Mutates `batch` in place (mirrors APA's process_single_pdf).
-    """
-
     # ---- Stage A: local extraction ----
     uploaded_file.seek(0)
     full_text, pages, removed_running_text = extract_pdf_text(uploaded_file)
@@ -1718,7 +1739,7 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
         v = verify_reference_against_openalex(ref, parsed)
         verification_rows.append(v)
 
-    # ---- Stage C: pre-classification (cost control) ----
+    # ---- Stage C: pre-classification ----
     review_payload, preclassified = preclassify_ieee_references(
         references, verification_rows, local_source_types
     )
@@ -1800,7 +1821,7 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
             "Placeholders": local.get("Placeholders", {}),
         })
 
-    # ---- Stage F: AI citation cluster review + deterministic enforcement ----
+    # ---- Stage F: AI citation cluster review ----
     cit_ai = review_ieee_citations_with_ai(clusters, rows) if clusters else []
     cit_by_no = {
         int(x.get("number", -1)): x for x in (cit_ai or [])
@@ -1810,7 +1831,7 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
     cluster_rows = []
     for i, cl in enumerate(clusters, start=1):
         ai = cit_by_no.get(i, {})
-        revised = enforce_ieee_citation_rules(cl)  # deterministic wins
+        revised = enforce_ieee_citation_rules(cl)
         needs_fix, reasons = evaluate_cluster(cl)
         cluster_rows.append({
             "No.": i,
@@ -1854,8 +1875,11 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
 
 
 # =========================================================
-# DOCX EXPORT
+# DOCX EXPORT — Wahyudin-style layout
 # =========================================================
+
+RED = RGBColor(0xC0, 0x00, 0x00)
+
 
 def _set_run_font(run, size_pt=11, bold=False, italic=False, color=None):
     run.font.size = Pt(size_pt)
@@ -1865,19 +1889,34 @@ def _set_run_font(run, size_pt=11, bold=False, italic=False, color=None):
         run.font.color.rgb = color
 
 
-RED = RGBColor(0xC0, 0x00, 0x00)
-
-
 def _add_run(paragraph, text, size_pt=11, bold=False, italic=False, red=False):
     r = paragraph.add_run(text)
     _set_run_font(
-        r,
-        size_pt=size_pt,
-        bold=bold,
-        italic=italic,
+        r, size_pt=size_pt, bold=bold, italic=italic,
         color=RED if red else None,
     )
     return r
+
+
+def _docx_set_default_font(document, font_name="Times New Roman", size_pt=11):
+    style = document.styles["Normal"]
+    style.font.name = font_name
+    style.font.size = Pt(size_pt)
+
+
+def _add_divider(doc):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(2)
+    p.paragraph_format.space_after = Pt(6)
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "BFBFBF")
+    pBdr.append(bottom)
+    pPr.append(pBdr)
 
 
 _PLACEHOLDER_RE = re.compile(
@@ -1894,57 +1933,83 @@ _PLACEHOLDER_RE = re.compile(
 _PAGE_PARTIAL_RE = re.compile(r"pp\.\s*(\d+)-\?{3}", re.I)
 
 
-def _emit_with_placeholders(paragraph, text, italic=False):
+def _emit_with_placeholders(paragraph, text, italic=False, size_pt=11):
     pos = 0
     for m in _PLACEHOLDER_RE.finditer(text):
         if m.start() > pos:
-            _add_run(paragraph, text[pos:m.start()], size_pt=11, italic=italic)
+            _add_run(paragraph, text[pos:m.start()], size_pt=size_pt, italic=italic)
 
         matched = m.group(0)
-
         page_partial = _PAGE_PARTIAL_RE.match(matched)
         if page_partial:
             known = page_partial.group(1)
             prefix = matched[: matched.index(known)]
-            _add_run(paragraph, prefix, size_pt=11, italic=italic)
-            _add_run(paragraph, f"{known}-???", size_pt=11,
+            _add_run(paragraph, prefix, size_pt=size_pt, italic=italic)
+            _add_run(paragraph, f"{known}-???", size_pt=size_pt,
                      italic=True, bold=True, red=True)
         else:
-            _add_run(paragraph, matched, size_pt=11,
+            _add_run(paragraph, matched, size_pt=size_pt,
                      italic=True, bold=True, red=True)
 
         pos = m.end()
     if pos < len(text):
-        _add_run(paragraph, text[pos:], size_pt=11, italic=italic)
+        _add_run(paragraph, text[pos:], size_pt=size_pt, italic=italic)
 
 
-def _add_ieee_reference_with_italics(paragraph, text, italic_elements):
+def _add_ieee_reference_with_italics(paragraph, text, italic_elements, size_pt=11):
+    """Emit corrected reference; italicize venue/title tokens; skip DOI spans;
+    highlight placeholders in red bold italic."""
+    doi_spans = []
+    for m in re.finditer(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text):
+        doi_spans.append((m.start(), m.end()))
+
+    def _in_doi(pos):
+        return any(s <= pos < e for s, e in doi_spans)
+
     tokens = [t.strip() for t in (italic_elements or "").split(",") if t.strip()]
     if not tokens:
-        _emit_with_placeholders(paragraph, text, italic=False)
+        _emit_with_placeholders(paragraph, text, italic=False, size_pt=size_pt)
         return
 
     flat = [_esc(t) for t in tokens]
     pattern_str = "|".join(sorted(flat, key=len, reverse=True))
     pattern = _safe_compile(pattern_str, re.I)
     if pattern is None:
-        _emit_with_placeholders(paragraph, text, italic=False)
+        _emit_with_placeholders(paragraph, text, italic=False, size_pt=size_pt)
         return
 
     pos = 0
     for m in pattern.finditer(text):
+        if _in_doi(m.start()):
+            continue
         if m.start() > pos:
-            _emit_with_placeholders(paragraph, text[pos:m.start()], italic=False)
-        _emit_with_placeholders(paragraph, m.group(0), italic=True)
+            _emit_with_placeholders(paragraph, text[pos:m.start()],
+                                    italic=False, size_pt=size_pt)
+        _emit_with_placeholders(paragraph, m.group(0),
+                                italic=True, size_pt=size_pt)
         pos = m.end()
+
     if pos < len(text):
-        _emit_with_placeholders(paragraph, text[pos:], italic=False)
+        _emit_with_placeholders(paragraph, text[pos:],
+                                italic=False, size_pt=size_pt)
 
 
-def _docx_set_default_font(document, font_name="Times New Roman", size_pt=11):
-    style = document.styles["Normal"]
-    style.font.name = font_name
-    style.font.size = Pt(size_pt)
+def _ref_is_withheld(row):
+    cv = (row.get("Corrected Version") or "").strip()
+    return cv.startswith("— WITHHELD")
+
+
+def _ref_is_suspicious(row):
+    return bool(row.get("DOI Suspicious"))
+
+
+def _ref_is_manual(row):
+    return str(row.get("Status", "")).upper().strip() == "MANUAL CHECK"
+
+
+def _ref_has_placeholder(row):
+    ph = row.get("Placeholders") or {}
+    return any(bool(v) for v in ph.values())
 
 
 def build_ieee_docx(result):
@@ -1952,220 +2017,395 @@ def build_ieee_docx(result):
     _docx_set_default_font(doc)
 
     filename = result.get("filename", "manuscript.pdf")
+    manuscript_year = result.get("manuscript_year", datetime.now().year)
 
+    reference_rows = result.get("reference_comparison") or []
+    cluster_rows = result.get("cluster_rows") or []
+    citations = result.get("citations", [])
+    references = result.get("references", [])
+    stats = result.get("citation_stats", {})
+    recency = result.get("recency", {})
+    orphan = result.get("orphan_citations", []) or []
+    uncited = result.get("uncited_references", []) or []
+    matching = result.get("matching_results", []) or []
+
+    total_refs = len(references)
+    total_cits = stats.get("total", 0)
+
+    doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
+    doi_suspicious = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
+    doi_suspicious_pct = (doi_suspicious / total_refs * 100) if total_refs else 0
+
+    withheld_count = sum(1 for r in reference_rows if _ref_is_withheld(r))
+    manual_count = sum(1 for r in reference_rows if _ref_is_manual(r))
+    placeholder_count = sum(1 for r in reference_rows if _ref_has_placeholder(r))
+
+    window_start = recency.get("start_year", manuscript_year - 9)
+    window_end = recency.get("end_year", manuscript_year)
+
+    # ---- Title block ----
     title = doc.add_heading(level=0)
     tr = title.add_run(filename)
     _set_run_font(tr, size_pt=18, bold=True)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     subtitle = doc.add_paragraph()
-    sr = subtitle.add_run("IEEE Reference Style — Citation & Reference Correction Report")
+    sr = subtitle.add_run("IEEE Reference Style — Citation & Reference Diagnostic Report")
     _set_run_font(sr, size_pt=11, italic=True)
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     meta = doc.add_paragraph()
-    mr = meta.add_run(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    mr = meta.add_run(
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: IEEE-P1-P4-v2"
+    )
     _set_run_font(mr, size_pt=9, italic=True)
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     doc.add_paragraph()
 
-    # ---------- Section 1: In-text Citation List ----------
+    # ========================================================
+    # 1. SUMMARY
+    # ========================================================
     h1 = doc.add_heading(level=1)
-    hr = h1.add_run("1. In-text Citation List")
+    hr = h1.add_run("1. Summary")
     _set_run_font(hr, size_pt=14, bold=True)
 
-    cluster_rows = result.get("cluster_rows", [])
-    citations = result.get("citations", [])
+    summary_rows = [
+        ("Manuscript publication year", str(manuscript_year), False),
+        ("Total references", str(total_refs), False),
+        ("Total in-text citation markers", str(total_cits), False),
+        ("  • Unique cited references", str(stats.get("unique", 0)), False),
+        ("  • Grouped citation clusters", str(stats.get("clusters", 0)), False),
+        ("Crowded clusters needing collapse",
+         str(stats.get("crowded_clusters", 0)),
+         stats.get("crowded_clusters", 0) > 0),
+        ("Orphan citations (no matching reference)",
+         str(len(orphan)), len(orphan) > 0),
+        ("Uncited references",
+         str(len(uncited)), len(uncited) > 0),
+        ("DOI checked via OpenAlex", str(doi_checked), False),
+        ("DOI suspicious (possible fabricated references)",
+         f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
+         doi_suspicious > 0),
+        ("Corrections withheld due to DOI mismatch",
+         str(withheld_count), withheld_count > 0),
+        ("References flagged MANUAL CHECK",
+         str(manual_count), manual_count > 0),
+        ("References with placeholder fields",
+         str(placeholder_count), placeholder_count > 0),
+        (f"% references within last 10 years ({window_start}-{window_end})",
+         f"{recency.get('recent_percentage', 0):.1f}%", False),
+    ]
 
-    if not cluster_rows:
-        _add_run(doc.add_paragraph(), "No bracketed in-text citations were detected.", italic=True)
-    else:
-        for row in cluster_rows:
-            p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(3)
-            _add_run(p, f"Page {row.get('Page') or '?'}  ", bold=True, size_pt=11)
-            _add_run(p, f"Lookup: {row['Original Form']}", size_pt=11,
-                     red=(row["Status"] == "REVISED"))
-            if row["Status"] == "REVISED":
-                _add_run(p, f"   ← {row['Reason']}", italic=True, size_pt=10, red=True)
+    summary_table = doc.add_table(rows=1, cols=2)
+    summary_table.style = "Light Grid Accent 1"
+    hdr = summary_table.rows[0].cells
+    for cell, text in zip(hdr, ["Metric", "Value"]):
+        cell.text = ""
+        _set_run_font(cell.paragraphs[0].add_run(text), size_pt=10, bold=True)
 
-            p2 = doc.add_paragraph()
-            p2.paragraph_format.space_after = Pt(8)
-            _add_run(p2, "Original : ", bold=True, size_pt=11)
-            _add_run(p2, row["Original Form"], size_pt=11,
-                     red=(row["Status"] == "REVISED"))
-            p3 = doc.add_paragraph()
-            p3.paragraph_format.space_after = Pt(8)
-            _add_run(p3, "Corrected: ", bold=True, size_pt=11)
-            _add_run(p3, row["Corrected Form"], size_pt=11)
+    for label, value, warn in summary_rows:
+        cells = summary_table.add_row().cells
+        cells[0].text = ""
+        cells[1].text = ""
+        _set_run_font(
+            cells[0].paragraphs[0].add_run(label),
+            size_pt=10, bold=warn, color=RED if warn else None,
+        )
+        _set_run_font(
+            cells[1].paragraphs[0].add_run(value),
+            size_pt=10, bold=warn, color=RED if warn else None,
+        )
+
+    doc.add_paragraph()
+
+    # ========================================================
+    # 1.1 SOURCE TYPE DISTRIBUTION
+    # ========================================================
+    h11 = doc.add_heading(level=2)
+    hr11 = h11.add_run("1.1 Source Type Distribution")
+    _set_run_font(hr11, size_pt=12, bold=True)
+
+    src_counts = Counter((r.get("Source Type") or "Other") for r in reference_rows)
+    tbl = doc.add_table(rows=1, cols=3)
+    tbl.style = "Light Grid Accent 1"
+    for cell, text in zip(tbl.rows[0].cells,
+                          ["Source Type", "Count", "Percentage"]):
+        cell.text = ""
+        _set_run_font(cell.paragraphs[0].add_run(text), size_pt=10, bold=True)
+
+    for stype in CANONICAL_SOURCE_TYPES:
+        cnt = src_counts.get(stype, 0)
+        pct = (cnt / total_refs * 100) if total_refs else 0
+        cells = tbl.add_row().cells
+        for cell, val in zip(cells, [stype, str(cnt), f"{pct:.1f}%"]):
+            cell.text = ""
+            _set_run_font(cell.paragraphs[0].add_run(val), size_pt=10)
+
+    cells = tbl.add_row().cells
+    for cell, val in zip(cells, ["Total", str(total_refs), "100.0%"]):
+        cell.text = ""
+        _set_run_font(cell.paragraphs[0].add_run(val), size_pt=10, bold=True)
 
     doc.add_page_break()
 
-    # ---------- Section 2: Reference List ----------
+    # ========================================================
+    # 2. IN-TEXT CITATION CORRECTION
+    # ========================================================
     h2 = doc.add_heading(level=1)
-    hr2 = h2.add_run("2. Reference List (IEEE Style)")
+    hr2 = h2.add_run("2. In-text Citation Correction")
     _set_run_font(hr2, size_pt=14, bold=True)
 
-    reference_rows = result.get("reference_comparison") or []
-    matching = result.get("matching_results", []) or []
-    uncited_numbers = {row.get("Reference #") for row in matching if not row.get("Cited")}
+    caption = doc.add_paragraph()
+    cr = caption.add_run(
+        "Format: original citation — corrected citation — note"
+    )
+    _set_run_font(cr, size_pt=9, italic=True)
 
-    if not reference_rows:
-        _add_run(doc.add_paragraph(), "No references were detected.", italic=True)
+    ref_numbers = set(range(1, total_refs + 1))
+
+    if not cluster_rows:
+        p = doc.add_paragraph()
+        _set_run_font(
+            p.add_run("No bracketed in-text citations were detected."),
+            italic=True,
+        )
     else:
-        for row in reference_rows:
-            p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(6)
-            p.paragraph_format.left_indent = Inches(0.4)
-            p.paragraph_format.first_line_indent = Inches(-0.4)
+        for i, row in enumerate(cluster_rows, start=1):
+            numbers = [int(n) for n in re.findall(r"\d+", row.get("Numbers Cited", ""))]
+            has_orphan = any(n not in ref_numbers for n in numbers)
+            is_revised = row.get("Status") == "REVISED"
 
-            _add_run(p, f"[{row.get('No.')}] ", bold=True, size_pt=11)
+            head = doc.add_paragraph()
+            head.paragraph_format.space_before = Pt(6)
+            head.paragraph_format.space_after = Pt(2)
 
-            original = row.get("Original Reference", "")
-            original_bad = row.get("Original Has Structure Error", False)
-            if original_bad:
-                _add_run(p, original, size_pt=11, red=True)
-                _add_run(
-                    p,
-                    f"   ← IEEE structure issue: {row.get('Original Structure Errors','')}",
-                    size_pt=10, italic=True, red=True,
-                )
+            hrun = head.add_run(f"{i}. ")
+            _set_run_font(hrun, size_pt=11, bold=True)
+
+            type_run = head.add_run("[Bracketed]")
+            _set_run_font(type_run, size_pt=11, bold=True)
+
+            page_no = row.get("Page")
+            if page_no:
+                _add_run(head, f"  — Page {page_no}", size_pt=10, italic=True)
+
+            if has_orphan:
+                _add_run(head, "  [NOT IN REFERENCES]",
+                         size_pt=10, bold=True, italic=True, red=True)
+
+            p_orig = doc.add_paragraph()
+            p_orig.paragraph_format.left_indent = Inches(0.25)
+            p_orig.paragraph_format.space_after = Pt(2)
+            _add_run(p_orig, "Original:  ", bold=True, size_pt=11)
+            if is_revised or has_orphan:
+                _add_run(p_orig, row.get("Original Form", ""),
+                         size_pt=11, red=True)
             else:
-                _add_run(p, original, size_pt=11)
+                _add_run(p_orig, row.get("Original Form", ""), size_pt=11)
 
-            if row.get("No.") in uncited_numbers:
-                _add_run(p, "   ← NOT CITED IN TEXT", size_pt=10, bold=True, italic=True, red=True)
+            p_corr = doc.add_paragraph()
+            p_corr.paragraph_format.left_indent = Inches(0.25)
+            p_corr.paragraph_format.space_after = Pt(2)
+            _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
+            _add_run(p_corr, row.get("Corrected Form", ""), size_pt=11)
 
-            if row.get("DOI Suspicious"):
-                withheld = doc.add_paragraph()
-                withheld.paragraph_format.left_indent = Inches(0.4)
-                withheld.paragraph_format.space_after = Pt(6)
-                _add_run(
-                    withheld,
-                    "Corrected version withheld — the DOI in this reference "
-                    "does not match the claimed title/authors. Manual verification "
-                    "required before any correction is applied.",
-                    size_pt=10, italic=True, bold=True, red=True,
-                )
+            note = (row.get("Reason") or "").strip()
+            if is_revised and note:
+                note_text = note
+            elif is_revised:
+                note_text = "Citation cluster rewritten to IEEE canonical form."
+            elif has_orphan:
+                note_text = "Citation number has no matching reference entry; manual check needed."
             else:
-                p2 = doc.add_paragraph()
-                p2.paragraph_format.space_after = Pt(8)
-                p2.paragraph_format.left_indent = Inches(0.4)
-                _add_run(p2, "Corrected: ", bold=True, size_pt=11)
-                corrected = row.get("Corrected Version", "")
-                italic_elements = row.get("Italicized in IEEE", "")
-                _add_ieee_reference_with_italics(p2, corrected, italic_elements)
+                note_text = "No changes needed; citation is correct."
 
-                correction_note = row.get("Correction Note", "")
-                if correction_note:
-                    note_p = doc.add_paragraph()
-                    note_p.paragraph_format.left_indent = Inches(0.4)
-                    _add_run(note_p, f"Fix applied: {correction_note}",
-                             size_pt=10, italic=True)
+            np = doc.add_paragraph()
+            np.paragraph_format.left_indent = Inches(0.25)
+            np.paragraph_format.space_after = Pt(4)
+            _add_run(np, f"Note: {note_text}", size_pt=10, italic=True,
+                     red=(is_revised or has_orphan))
 
-                placeholders = row.get("Placeholders") or {}
-                active_ph = [k for k, v in placeholders.items() if v]
-                if active_ph:
-                    ph_p = doc.add_paragraph()
-                    ph_p.paragraph_format.left_indent = Inches(0.4)
-                    _add_run(ph_p,
-                             "Placeholder used — fill in before submission: "
-                             + ", ".join(active_ph),
-                             size_pt=10, italic=True, bold=True, red=True)
+            _add_divider(doc)
 
-            if row.get("DOI Suspicious"):
-                warn_p = doc.add_paragraph()
-                warn_p.paragraph_format.left_indent = Inches(0.4)
-                reasons = row.get("DOI Verification Reasons", "")
-                _add_run(warn_p, f"⚠ Possible fabricated reference: {reasons}",
-                         size_pt=10, italic=True, bold=True, red=True)
-                if row.get("OpenAlex Title"):
-                    _add_run(warn_p, f"\n  OpenAlex says: \"{row['OpenAlex Title']}\"",
-                             size_pt=10, italic=True)
-                if row.get("OpenAlex Authors"):
-                    _add_run(warn_p, f"\n  Authors: {row['OpenAlex Authors']}",
-                             size_pt=10, italic=True)
-
-            missing = row.get("Missing Required Elements", "")
-            if missing:
-                note_p = doc.add_paragraph()
-                note_p.paragraph_format.left_indent = Inches(0.4)
-                _add_run(note_p, f"Missing element(s): {missing}",
-                         size_pt=10, italic=True, red=True)
-
-    # ---------- Section 3: Cross-link Discrepancies ----------
     doc.add_page_break()
+
+    # ========================================================
+    # 3. REFERENCE LIST (IEEE STYLE)
+    # ========================================================
     h3 = doc.add_heading(level=1)
-    hr3 = h3.add_run("3. Cross-link Discrepancies")
+    hr3 = h3.add_run("3. Reference List (IEEE Style)")
     _set_run_font(hr3, size_pt=14, bold=True)
 
-    orphan = result.get("orphan_citations", []) or []
-    uncited = result.get("uncited_references", []) or []
+    caption = doc.add_paragraph()
+    cr2 = caption.add_run(
+        "Format: original reference — corrected reference — comment — status"
+    )
+    _set_run_font(cr2, size_pt=9, italic=True)
+
+    cited_numbers = {row.get("Reference #") for row in matching if row.get("Cited")}
+
+    if not reference_rows:
+        p = doc.add_paragraph()
+        _set_run_font(p.add_run("No references were detected."), italic=True)
+    else:
+        for i, row in enumerate(reference_rows, start=1):
+            ref_no = row.get("No.", i)
+            not_cited = ref_no not in cited_numbers
+            withheld = _ref_is_withheld(row)
+            suspicious = _ref_is_suspicious(row)
+            manual = _ref_is_manual(row)
+            has_placeholder = _ref_has_placeholder(row)
+
+            head = doc.add_paragraph()
+            head.paragraph_format.space_before = Pt(8)
+            head.paragraph_format.space_after = Pt(2)
+
+            hrun = head.add_run(f"{ref_no}.")
+            _set_run_font(hrun, size_pt=11, bold=True)
+
+            if not_cited:
+                _add_run(head, "  [NOT CITED IN TEXT]",
+                         size_pt=10, bold=True, italic=True, red=True)
+
+            p_type = doc.add_paragraph()
+            p_type.paragraph_format.left_indent = Inches(0.25)
+            p_type.paragraph_format.space_after = Pt(2)
+            _add_run(p_type, "Source Type: ", bold=True, size_pt=11)
+            _add_run(p_type, row.get("Source Type", "Other"), size_pt=11)
+
+            p_orig = doc.add_paragraph()
+            p_orig.paragraph_format.left_indent = Inches(0.25)
+            p_orig.paragraph_format.space_after = Pt(2)
+            p_orig.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            _add_run(p_orig, "Original: ", bold=True, size_pt=11)
+            original = row.get("Original Reference", "")
+            original_has_error = bool(row.get("Original Has Structure Error"))
+            _add_run(p_orig, original, size_pt=11,
+                     red=(withheld or suspicious or original_has_error))
+
+            if withheld or suspicious:
+                p_w = doc.add_paragraph()
+                p_w.paragraph_format.left_indent = Inches(0.25)
+                p_w.paragraph_format.space_after = Pt(2)
+                _add_run(p_w, "Corrected: ", bold=True, size_pt=11)
+                withheld_label = (
+                    "— WITHHELD (DOI mismatch) —" if suspicious else "— WITHHELD —"
+                )
+                _add_run(p_w, withheld_label, size_pt=11, bold=True, red=True)
+            else:
+                corrected = row.get("Corrected Version", "").strip()
+                if corrected:
+                    p_corr = doc.add_paragraph()
+                    p_corr.paragraph_format.left_indent = Inches(0.25)
+                    p_corr.paragraph_format.space_after = Pt(2)
+                    p_corr.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                    _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
+                    italic_elements = row.get("Italicized in IEEE", "")
+                    _add_ieee_reference_with_italics(
+                        p_corr, corrected, italic_elements, size_pt=11
+                    )
+
+            p_comment = doc.add_paragraph()
+            p_comment.paragraph_format.left_indent = Inches(0.25)
+            p_comment.paragraph_format.space_after = Pt(2)
+            _add_run(p_comment, "Comment: ", bold=True, size_pt=11)
+
+            comment_parts = []
+            if suspicious:
+                reasons = row.get("DOI Verification Reasons", "").strip()
+                comment_parts.append(
+                    f"DOI mismatch — possible fabricated reference. {reasons}"
+                )
+                oa_title = row.get("OpenAlex Title")
+                if oa_title:
+                    comment_parts.append(f'OpenAlex title: "{oa_title}"')
+            elif withheld:
+                comment_parts.append(
+                    "DOI not provided — automated verification/correction withheld."
+                )
+            elif manual:
+                ai_exp = (row.get("AI Explanation") or "").strip()
+                comment_parts.append(
+                    ai_exp or "Manual verification required for this source type."
+                )
+            elif has_placeholder:
+                fixes = (row.get("Correction Note") or "").strip()
+                comment_parts.append(
+                    fixes or "Placeholder fields inserted — fill in before submission."
+                )
+            else:
+                fixes = (row.get("Correction Note") or "").strip()
+                if fixes:
+                    comment_parts.append(fixes)
+                else:
+                    comment_parts.append("Reference is consistent with IEEE style.")
+
+            comment_text = " | ".join(comment_parts)
+            _add_run(p_comment, comment_text, size_pt=10, italic=True,
+                     red=(withheld or suspicious or manual))
+
+            if has_placeholder and not (withheld or suspicious):
+                ph = row.get("Placeholders") or {}
+                active = [k for k, v in ph.items() if v]
+                p_ph = doc.add_paragraph()
+                p_ph.paragraph_format.left_indent = Inches(0.25)
+                p_ph.paragraph_format.space_after = Pt(2)
+                _add_run(
+                    p_ph,
+                    f"Placeholders to fill: {', '.join(active)}",
+                    size_pt=10, italic=True, bold=True, red=True,
+                )
+
+            p_status = doc.add_paragraph()
+            p_status.paragraph_format.left_indent = Inches(0.25)
+            p_status.paragraph_format.space_after = Pt(6)
+            _add_run(p_status, "Status: ", bold=True, size_pt=11)
+
+            status = str(row.get("Status", "MANUAL CHECK")).upper().strip()
+            if status not in {"MATCH", "REVISED", "WITHHELD", "MANUAL CHECK"}:
+                status = "MANUAL CHECK"
+
+            status_red = status in {"WITHHELD", "MANUAL CHECK"}
+            _add_run(p_status, status, size_pt=11, bold=True, red=status_red)
+
+            _add_divider(doc)
+
+    # ========================================================
+    # 4. CROSS-LINK DISCREPANCIES
+    # ========================================================
+    doc.add_page_break()
+    h4 = doc.add_heading(level=1)
+    hr4 = h4.add_run("4. Cross-link Discrepancies")
+    _set_run_font(hr4, size_pt=14, bold=True)
 
     if orphan:
         sub = doc.add_heading(level=2)
-        run = sub.add_run("Citations Missing from References")
-        _set_run_font(run, size_pt=12, bold=True)
+        sr2 = sub.add_run("Citations Missing from References")
+        _set_run_font(sr2, size_pt=12, bold=True)
         for o in orphan:
             p = doc.add_paragraph()
+            p.paragraph_format.left_indent = Inches(0.25)
             _add_run(p, f"{o.get('Citation','')}  ", size_pt=11, red=True)
             _add_run(p, f"— {o.get('Problem','')}", size_pt=10, italic=True, red=True)
 
     if uncited:
         sub = doc.add_heading(level=2)
-        run = sub.add_run("References Missing from Citations")
-        _set_run_font(run, size_pt=12, bold=True)
+        sr3 = sub.add_run("References Missing from Citations")
+        _set_run_font(sr3, size_pt=12, bold=True)
         for u in uncited:
             p = doc.add_paragraph()
+            p.paragraph_format.left_indent = Inches(0.25)
             _add_run(p, f"[{u.get('Reference #')}] {u.get('Reference','')}  ",
                      size_pt=11, red=True)
             _add_run(p, f"— {u.get('Problem','')}", size_pt=10, italic=True, red=True)
 
     if not orphan and not uncited:
-        _add_run(doc.add_paragraph(), "No cross-link discrepancies detected.", italic=True)
+        p = doc.add_paragraph()
+        _set_run_font(p.add_run("No cross-link discrepancies detected."),
+                      italic=True)
 
-    # ---------- Section 4: Summary ----------
-    doc.add_page_break()
-    h4 = doc.add_heading(level=1)
-    hr4 = h4.add_run("4. Summary")
-    _set_run_font(hr4, size_pt=14, bold=True)
-
-    stats = result.get("citation_stats", {})
-    recency = result.get("recency", {})
-
-    total_refs_now = len(result.get("references", []))
-    doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
-    doi_suspicious = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
-    doi_suspicious_pct = (
-        doi_suspicious / total_refs_now * 100 if total_refs_now else 0
-    )
-    withheld_count = doi_suspicious
-    single_page_count = sum(
-        1 for r in reference_rows
-        if (r.get("Placeholders") or {}).get("missing_pp")
-    )
-
-    summary_lines = [
-        f"Total references: {total_refs_now}",
-        f"Total in-text citation markers: {stats.get('total', 0)}",
-        f"Unique cited references: {stats.get('unique', 0)}",
-        f"Grouped citation clusters detected: {stats.get('clusters', 0)}",
-        f"Crowded clusters needing collapse: {stats.get('crowded_clusters', 0)}",
-        f"Orphan citations (no matching reference): {len(orphan)}",
-        f"Uncited references: {len(uncited)}",
-        f"DOI checked via OpenAlex: {doi_checked}",
-        f"DOI suspicious (possible fabricated references): "
-        f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
-        f"Corrections withheld due to DOI mismatch: {withheld_count}",
-        f"References with incomplete page range: {single_page_count}",
-        f"% references within last 10 years "
-        f"({recency.get('start_year')}-{recency.get('end_year')}): "
-        f"{recency.get('recent_percentage', 0):.1f}%",
-    ]
-    for line in summary_lines:
-        _add_run(doc.add_paragraph(), line, size_pt=11)
-
+    # ---- Save ----
     bio = io.BytesIO()
     doc.save(bio)
     bio.seek(0)
@@ -2192,7 +2432,6 @@ def render():
         except Exception:
             client = None
 
-    # ---- Uploader with versioned key (mirrors APA) ----
     if "ieee_uploader_version" not in st.session_state:
         st.session_state["ieee_uploader_version"] = 0
 
@@ -2214,7 +2453,6 @@ def render():
         st.error(f"You uploaded {len(uploaded_files)} manuscripts. Maximum batch size is 5.")
         st.stop()
 
-    # ---- Manuscript year (mirrors APA) ----
     current_year = datetime.now().year
     default_year = st.session_state.get("ieee_manuscript_year", current_year)
     manuscript_year = st.number_input(
@@ -2228,13 +2466,11 @@ def render():
 
     file_keys = [(f"{i}::{uf.name}", uf) for i, uf in enumerate(uploaded_files)]
 
-    # Drop batches no longer uploaded
     active_keys = {k for k, _ in file_keys}
     for k in list(st.session_state["ieee_batches"].keys()):
         if k not in active_keys:
             del st.session_state["ieee_batches"][k]
 
-    # ---- Single Extract & Review button (mirrors APA) ----
     if st.button(
         "Extract & Review",
         type="primary",
@@ -2265,7 +2501,6 @@ def render():
         overall.empty()
         st.success(f"Processed {n} manuscript{'s' if n != 1 else ''}.")
 
-    # ---- Results ----
     any_done = any(b.get("ai_done") for b in st.session_state["ieee_batches"].values())
     if not any_done:
         return
@@ -2289,10 +2524,8 @@ def render():
         st.info("This manuscript has not been processed yet. Click 'Extract & Review' above.")
         return
 
-    # Refresh manuscript year with widget value
     batch["manuscript_year"] = int(st.session_state.get("ieee_manuscript_year", current_year))
 
-    # ---- Debug reference slice ----
     with st.expander("View reference section (processed)", expanded=False):
         st.text_area(
             "Reference slice",
@@ -2316,7 +2549,6 @@ def render():
         f"In-text citation markers: {len(citations)}"
     )
 
-    # ---- Citations expander ----
     with st.expander(f"In-text Citations ({len(citations)})", expanded=False):
         if citations:
             df_cit = pd.DataFrame([
@@ -2332,7 +2564,6 @@ def render():
         else:
             st.info("No bracketed IEEE citations detected in body text.")
 
-    # ---- Clusters expander ----
     if cluster_rows:
         revised_count = sum(1 for r in cluster_rows if r["Status"] == "REVISED")
         with st.expander(
@@ -2343,7 +2574,6 @@ def render():
             st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True,
                          hide_index=True, height=min(320, 38 * (len(cluster_rows) + 1)))
 
-    # ---- Orphan / uncited ----
     if orphan:
         with st.expander(f"Citations Missing from References ({len(orphan)})", expanded=False):
             st.dataframe(pd.DataFrame(orphan), use_container_width=True, hide_index=True)
@@ -2352,7 +2582,6 @@ def render():
         with st.expander(f"References Missing from Citations ({len(uncited)})", expanded=False):
             st.dataframe(pd.DataFrame(uncited), use_container_width=True, hide_index=True)
 
-    # ---- Metrics ----
     total_refs_now = len(references)
     doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
     doi_suspicious = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
@@ -2395,7 +2624,6 @@ def render():
     with right_col:
         st.dataframe(source_df, use_container_width=True, hide_index=True)
 
-    # ---- Reference correction toggle ----
     show_reference = st.toggle(
         "Show Reference Correction",
         value=False,
@@ -2422,7 +2650,6 @@ def render():
         else:
             st.info("No references were available for automated review.")
 
-    # ---- Download ----
     try:
         docx_bytes = build_ieee_docx(batch)
         safe_name = re.sub(r"[^\w\-]+", "_", batch.get("filename", "manuscript"))
@@ -2437,7 +2664,6 @@ def render():
     except Exception as exc:
         st.error(f"Could not build DOCX report: {exc}")
 
-    # ---- Start Fresh (red button, mirrors APA) ----
     st.markdown(
         """
         <style>
