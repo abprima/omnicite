@@ -285,12 +285,11 @@ def strip_markdown_markers(text):
     text = re.sub(r"[ \t]{2,}", " ", text).strip()
     return text
 
-
-# =========================================================
-# REFERENCE SECTION DETECTION
-# =========================================================
-
-REFERENCE_HEADINGS = ["references", "reference", "bibliography", "daftar pustaka"]
+REFERENCE_HEADINGS = {
+    "references", "reference", "reference list", "reference section",
+    "bibliography", "works cited", "literature cited",
+    "daftar pustaka", "daftar rujukan", "rujukan",
+}
 
 POST_REFERENCE_HEADINGS = {
     "acknowledgement", "acknowledgements", "acknowledgment", "acknowledgments",
@@ -320,38 +319,128 @@ def normalize_heading(text):
     return text
 
 
+def _heading_matches_reference_vocab(line):
+    """True if the line is a heading-like match for reference vocabulary."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+
+    # Reject obvious table rows: multiple wide gaps or tabs
+    if "\t" in stripped or re.search(r"\s{3,}\S+\s{3,}\S+\s{3,}", stripped):
+        return False
+
+    # Reject very long lines (headings are short)
+    if len(stripped) > 60:
+        return False
+
+    norm = normalize_heading(stripped)
+    if not norm:
+        return False
+
+    # Exact match or startswith "<heading> "
+    if norm in REFERENCE_HEADINGS:
+        return True
+    for h in REFERENCE_HEADINGS:
+        if norm == h or norm.startswith(h + " "):
+            return True
+    return False
+
+
+def find_reference_section(text):
+    """
+    Bottom-up detection:
+
+      1. Find the LAST [n] reference marker in the document.
+         This anchors the bottom of the reference list.
+      2. Walk UP from that anchor. The FIRST line that matches
+         reference-heading vocabulary is the section start.
+      3. Slice from (heading_line + 1) to end-of-document (or first
+         post-reference heading, whichever comes first).
+
+    Returns (reference_text, heading_found, body_text).
+    """
+    lines = text.splitlines()
+
+    # ---- Step 1: find the last bracketed marker ----
+    marker_re = re.compile(r"^\s*\[?\s*(\d{1,3})\s*\]")
+    last_marker_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if marker_re.match(lines[i]):
+            last_marker_idx = i
+            break
+
+    # Fallback: no markers at all → try the old top-down detection
+    if last_marker_idx is None:
+        return _find_reference_section_topdown(text)
+
+    # ---- Step 2: walk UP from the last marker to find the heading ----
+    heading_idx = None
+    for i in range(last_marker_idx, -1, -1):
+        if _heading_matches_reference_vocab(lines[i]):
+            heading_idx = i
+            break
+
+    if heading_idx is None:
+        # No heading found above the markers — still return the marker region
+        reference_text = "\n".join(lines[last_marker_idx:])
+        body_text = "\n".join(lines[:last_marker_idx])
+        return reference_text, None, body_text
+
+    # ---- Step 3: find the end boundary ----
+    # Walk DOWN from heading. Stop at the first post-reference heading
+    # that comes AFTER at least one reference marker.
+    end_idx = None
+    saw_marker = False
+    for i in range(heading_idx + 1, len(lines)):
+        line = lines[i].strip()
+        if not line:
+            continue
+        if re.fullmatch(r"<<<PAGE_BREAK:\d+>>>", line):
+            continue
+        if marker_re.match(line):
+            saw_marker = True
+            continue
+        if saw_marker and is_post_reference_heading(line):
+            end_idx = i
+            break
+
+    heading_found = lines[heading_idx].strip()
+    body_text = "\n".join(lines[:heading_idx])
+
+    if end_idx is not None:
+        reference_text = "\n".join(lines[heading_idx + 1:end_idx])
+    else:
+        reference_text = "\n".join(lines[heading_idx + 1:])
+
+    return reference_text, heading_found, body_text
+
+
 def is_post_reference_heading(line):
     normalized = normalize_heading(line)
     if not normalized:
         return False
     if normalized in POST_REFERENCE_HEADINGS:
         return True
-    for heading in POST_REFERENCE_HEADINGS:
-        if normalized.startswith(heading + " "):
+    for h in POST_REFERENCE_HEADINGS:
+        if normalized.startswith(h + " "):
             return True
     return False
 
 
-def find_reference_section(text):
+def _find_reference_section_topdown(text):
+    """Fallback used only when the document has NO [n] markers anywhere."""
     lines = text.splitlines()
     start_index = None
-    end_index = None
-    heading_found = None
-
     for i, line in enumerate(lines):
-        if normalize_heading(line) in REFERENCE_HEADINGS:
+        if _heading_matches_reference_vocab(line):
             start_index = i
-            heading_found = line.strip()
             break
-
     if start_index is None:
         return None, None, text
 
+    end_index = None
     for i in range(start_index + 1, len(lines)):
-        line = lines[i].strip()
-        if not line:
-            continue
-        if is_post_reference_heading(line):
+        if is_post_reference_heading(lines[i]):
             end_index = i
             break
 
@@ -360,7 +449,7 @@ def find_reference_section(text):
         reference_text = "\n".join(lines[start_index + 1:end_index])
     else:
         reference_text = "\n".join(lines[start_index + 1:])
-    return reference_text, heading_found, body_text
+    return reference_text, lines[start_index].strip(), body_text
 
 
 # =========================================================
