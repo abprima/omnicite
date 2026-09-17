@@ -188,6 +188,23 @@ def slice_body_section(text: str):
 
 _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}[a-z]?\b")
 
+# ------------------------------------------------------------
+# Multi-word organizational author support
+# ------------------------------------------------------------
+LEADING_STOPWORDS = {
+    "according", "see", "cf", "in", "by", "from", "the", "a", "an",
+    "as", "per", "based", "referring", "following", "citing",
+    "menurut", "berdasarkan", "dalam", "pada", "oleh", "lihat",
+}
+
+CONNECTOR_WORDS = {
+    "of", "and", "dan", "for", "the", "de", "del", "van", "von",
+    "bin", "binti", "di", "ke", "&",
+}
+
+_UPPER_TOKEN = r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*"
+_NAME_WORD = rf"(?:{_UPPER_TOKEN}|(?:{'|'.join(CONNECTOR_WORDS)}))"
+_MULTI_AUTHOR = rf"(?:{_UPPER_TOKEN})(?:\s+{_NAME_WORD}){{1,8}}"
 
 def _inside_parentheses(text, pos):
     depth = 0
@@ -216,16 +233,28 @@ def extract_parenthetical_citations(text):
             author_part_clean = re.sub(
                 r"\bet\s+al\.", "", author_part, flags=re.I
             ).strip()
-            authors = re.findall(
-                r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\b",
-                author_part_clean,
+
+            # Detect "Surname1, Surname2" (multiple authors) vs "One Org Name"
+            has_comma_between_names = bool(
+                re.search(r"[A-Za-z],\s+[A-Z]", author_part_clean)
             )
-            authors = [
-                a for a in authors
-                if a.lower() not in {"and", "according", "see", "cf"}
-            ]
+
+            if not has_comma_between_names and not et_al and author_part_clean:
+                # Treat the whole thing as ONE corporate / multi-word author
+                authors = [author_part_clean]
+            else:
+                authors = re.findall(
+                    r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\b",
+                    author_part_clean,
+                )
+                authors = [
+                    a for a in authors
+                    if a.lower() not in {"and", "according", "see", "cf"}
+                ]
+
             if not authors:
                 continue
+
             citations.append({
                 "author": authors[0],
                 "authors": authors,
@@ -234,6 +263,7 @@ def extract_parenthetical_citations(text):
                 "et_al": et_al,
                 "raw": f"({part})",
                 "parenthetical_content": content.strip(),
+                "corporate": len(authors) == 1 and " " in authors[0],
             })
     return citations
 
@@ -245,6 +275,10 @@ def extract_narrative_citations(text):
     def _overlaps(start, end):
         return any(start >= s and end <= e for s, e in occupied)
 
+    # ------------------------------------------------------------------
+    # Pattern 1: multi-author list + et al. + (year)
+    #   Author1, Author2 et al. (2022)
+    # ------------------------------------------------------------------
     for m in re.finditer(
         r"\b("
         r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
@@ -265,6 +299,10 @@ def extract_narrative_citations(text):
         })
         occupied.append((m.start(), m.end()))
 
+    # ------------------------------------------------------------------
+    # Pattern 2: single author + et al. + (year)
+    #   Author et al. (2022)
+    # ------------------------------------------------------------------
     for m in re.finditer(
         r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s+et\s+al\.\s*"
         r"\(((?:19|20)\d{2})[a-z]?\)",
@@ -279,6 +317,67 @@ def extract_narrative_citations(text):
         })
         occupied.append((m.start(), m.end()))
 
+    # ------------------------------------------------------------------
+    # Pattern 3: MULTI-WORD organizational author + (year)
+    #   SMERU Research Institute (2022)
+    #   Badan Pusat Statistik (2023)
+    #   Kementerian Pendidikan dan Kebudayaan (2020)
+    #
+    # MUST run before the single-word pattern (#4) so it claims the full
+    # span first; #4 will then see the overlap and skip.
+    # ------------------------------------------------------------------
+    for m in re.finditer(
+        rf"\b({_MULTI_AUTHOR})\s+\(((?:19|20)\d{{2}})[a-z]?\)",
+        text,
+    ):
+        if _overlaps(m.start(), m.end()):
+            continue
+
+        raw_name = m.group(1).strip()
+        tokens = raw_name.split()
+
+        # Trim leading stop-words: "According to SMERU ..." -> "SMERU ..."
+        while tokens and tokens[0].lower() in LEADING_STOPWORDS:
+            tokens.pop(0)
+
+        # After trimming we need at least 2 tokens to call it a
+        # multi-word author; otherwise let pattern #4 handle it.
+        if len(tokens) < 2:
+            continue
+
+        # Reject if the final token is a dangling lowercase connector
+        # e.g. "SMERU Research of (2022)" -> discard.
+        if tokens[-1].lower() in CONNECTOR_WORDS:
+            continue
+
+        # Reject sentence fragments: any interior lowercase word that is
+        # NOT a connector means we swept up prose rather than a name.
+        # e.g. "The study was conducted by SMERU Research Institute"
+        #      -> "study", "was", "conducted", "by" all fail -> discard.
+        if any(
+            t[0].islower() and t.lower() not in CONNECTOR_WORDS
+            for t in tokens
+        ):
+            continue
+
+        raw_name = " ".join(tokens)
+        citations.append({
+            "author": raw_name,
+            "authors": [raw_name],
+            "year": m.group(2),
+            "type": "narrative",
+            "et_al": False,
+            "raw": m.group(0),
+            "corporate": True,
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ------------------------------------------------------------------
+    # Pattern 4: single-word author + (year)
+    #   Smith (2022)
+    #   Institute (2022)   <- fragment of a longer org name; only fires
+    #                         when pattern #3 rejected the match.
+    # ------------------------------------------------------------------
     for m in re.finditer(
         r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s+"
         r"\(((?:19|20)\d{2})[a-z]?\)",
@@ -293,6 +392,10 @@ def extract_narrative_citations(text):
         })
         occupied.append((m.start(), m.end()))
 
+    # ------------------------------------------------------------------
+    # Pattern 5: malformed et al. without parens
+    #   Author et al., 2022
+    # ------------------------------------------------------------------
     for m in re.finditer(
         r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
         r"\s+et\s+al\.\s*,\s*"
@@ -311,6 +414,9 @@ def extract_narrative_citations(text):
         })
         occupied.append((m.start(), m.end()))
 
+    # ------------------------------------------------------------------
+    # Pattern 6: malformed "A and B, 2022"
+    # ------------------------------------------------------------------
     for m in re.finditer(
         r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
         r"\s+(?:and|&)\s+"
@@ -331,6 +437,9 @@ def extract_narrative_citations(text):
         })
         occupied.append((m.start(), m.end()))
 
+    # ------------------------------------------------------------------
+    # Pattern 7: malformed "Author, 2022" (outside parens)
+    # ------------------------------------------------------------------
     for m in re.finditer(
         r"(?<![,\.])\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*"
         r"((?:19|20)\d{2})[a-z]?\b",
@@ -1488,9 +1597,16 @@ def build_apa_report_docx(result):
             p_corr.paragraph_format.space_after = Pt(2)
             p_corr.paragraph_format.left_indent = Inches(0.25)
             _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
-            _add_run(
-                p_corr, row.get("Revised Citation", ""), size_pt=11
-            )
+
+            revised_val = row.get("Revised Citation", "").strip()
+            if revised_val:
+                _add_run(p_corr, revised_val, size_pt=11)
+            else:
+                _add_run(
+                    p_corr,
+                    "— withheld (citation not found in reference list) —",
+                    size_pt=11, italic=True, red=True,
+                )
 
             notes = row.get("Notes", "")
             if notes:
@@ -1852,9 +1968,56 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
         if str(x.get("number", "")).isdigit()
     }
 
+    # Build a set of (first_author_lower, year) keys present in the reference list
+    ref_keys = set()
+    for row in ref_rows:
+        p = parse_reference(row.get("Original Reference", ""))
+        if p["first_author"] and p["year"]:
+            ref_keys.add((p["first_author"].lower(), p["year"]))
+        # Also index corporate authors under both full string and first token
+        for a in (p.get("authors") or []):
+            if a:
+                ref_keys.add((a.lower(), p["year"]))
+
     cit_rows = []
     for i, c in enumerate(batch["citations"], start=1):
         ai = cit_by_no.get(i, {})
+
+        # ---- NEW: match against reference list ----
+        author_key = (c["author"] or "").lower()
+        year_key = str(c.get("year") or "")
+
+        in_references = author_key in {k[0] for k in ref_keys} or any(
+            author_key and author_key in k[0] for k in ref_keys
+        )
+        # Stricter check: exact (author, year) pair OR first-author-only match
+        exact_match = (author_key, year_key) in ref_keys
+        loose_match = any(
+            k[0] == author_key and k[1] == year_key for k in ref_keys
+        ) or any(
+            k[0].startswith(author_key + " ") or author_key.startswith(k[0] + " ")
+            for k in ref_keys
+            if k[1] == year_key
+        )
+        missing_from_refs = not (exact_match or loose_match)
+
+        if missing_from_refs:
+            # Do NOT produce a corrected version — we cannot verify the target.
+            cit_rows.append({
+                "No.": i,
+                "Type": c["type"].title(),
+                "Original Citation": c["raw"],
+                "Revised Citation": "",           # <-- intentionally empty
+                "Status": "NOT IN REFERENCES",
+                "Notes": (
+                    "Citation has no matching entry in the reference list. "
+                    "Corrected version withheld — add the source to the "
+                    "reference list first."
+                ),
+            })
+            continue
+
+        # ---- Normal path: only run repair for citations that DO have a match ----
         revised = (ai.get("revised_citation") or "").strip() or c["raw"]
         deterministic = _deterministic_citation_from_reference(c, ref_rows)
         if deterministic:
