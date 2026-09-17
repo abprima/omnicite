@@ -2176,6 +2176,13 @@ def build_ieee_docx(result):
             has_orphan = any(n not in ref_numbers for n in numbers)
             is_revised = row.get("Status") == "REVISED"
 
+            # Blank spacer paragraph before each citation block
+            if i > 1:
+                spacer = doc.add_paragraph()
+                spacer.paragraph_format.space_before = Pt(0)
+                spacer.paragraph_format.space_after = Pt(0)
+                _set_run_font(spacer.add_run(""), size_pt=6)
+
             head = doc.add_paragraph()
             head.paragraph_format.space_before = Pt(6)
             head.paragraph_format.space_after = Pt(2)
@@ -2225,6 +2232,12 @@ def build_ieee_docx(result):
             np.paragraph_format.space_after = Pt(4)
             _add_run(np, f"Note: {note_text}", size_pt=10, italic=True,
                      red=(is_revised or has_orphan))
+
+            # Extra vertical breathing room before the divider
+            spacer2 = doc.add_paragraph()
+            spacer2.paragraph_format.space_before = Pt(0)
+            spacer2.paragraph_format.space_after = Pt(0)
+            _set_run_font(spacer2.add_run(""), size_pt=4)
 
             _add_divider(doc)
 
@@ -2526,81 +2539,112 @@ def render():
 
     batch["manuscript_year"] = int(st.session_state.get("ieee_manuscript_year", current_year))
 
-    with st.expander("View reference section (processed)", expanded=False):
-        st.text_area(
-            "Reference slice",
-            "\n\n".join(f"[{i}] {r}" for i, r in enumerate(batch["references"], start=1)),
-            height=300,
-            key=f"dbg_ref_{selected_key}",
-        )
-
-    citations = batch["citations"]
-    references = batch["references"]
-    matching = batch["matching_results"]
-    orphan = batch["orphan_citations"]
-    uncited = batch["uncited_references"]
-    cluster_rows = batch.get("cluster_rows", [])
     reference_rows = batch.get("reference_comparison", [])
-    stats = batch["citation_stats"]
-    recency = batch["recency"]
+    total_refs_now = len(batch.get("references", []))
 
-    st.caption(
-        f"References: {len(references)}  |  "
-        f"In-text citation markers: {len(citations)}"
+    # ========================================================
+    # BUTTON STYLING — matches APA
+    # ========================================================
+    st.markdown(
+        """
+        <style>
+        /* Green download button */
+        div[class*="st-key-ieee_download_btn"] button {
+            background-color: #16a34a !important;
+            color: #ffffff !important;
+            border: 1px solid #15803d !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-ieee_download_btn"] button:hover {
+            background-color: #15803d !important;
+            color: #ffffff !important;
+            border-color: #166534 !important;
+        }
+        div[class*="st-key-ieee_download_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(22, 163, 74, 0.4) !important;
+        }
+
+        /* Red reset button */
+        div[class*="st-key-ieee_reset_btn"] button {
+            background-color: #dc2626 !important;
+            color: #ffffff !important;
+            border: 1px solid #b91c1c !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-ieee_reset_btn"] button:hover {
+            background-color: #b91c1c !important;
+            color: #ffffff !important;
+            border-color: #991b1b !important;
+        }
+        div[class*="st-key-ieee_reset_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(220, 38, 38, 0.4) !important;
+        }
+
+        /* Blue secondary button ("Need Extra Review") */
+        div[class*="st-key-ieee_extra_review"] button {
+            background-color: #2563eb !important;
+            color: #ffffff !important;
+            border: 1px solid #1d4ed8 !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-ieee_extra_review"] button:hover {
+            background-color: #1d4ed8 !important;
+            color: #ffffff !important;
+            border-color: #1e40af !important;
+        }
+        div[class*="st-key-ieee_extra_review"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(37, 99, 235, 0.4) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    with st.expander(f"In-text Citations ({len(citations)})", expanded=False):
-        if citations:
-            df_cit = pd.DataFrame([
-                {
-                    "Page": c.get("page"),
-                    "Citation": c["raw"],
-                    "Context": (c.get("context") or "").strip(),
-                }
-                for c in citations
-            ])
-            st.dataframe(df_cit, use_container_width=True, hide_index=True,
-                         height=min(300, 38 * (len(citations) + 1)))
-        else:
-            st.info("No bracketed IEEE citations detected in body text.")
+    # ========================================================
+    # METRICS TABLE (compact, matches APA structure)
+    # ========================================================
+    stats = batch["citation_stats"]
+    recency = batch["recency"]
+    orphan = batch["orphan_citations"]
+    uncited = batch["uncited_references"]
 
-    if cluster_rows:
-        revised_count = sum(1 for r in cluster_rows if r["Status"] == "REVISED")
-        with st.expander(
-            f"Grouped In-text Citations ({len(cluster_rows)}) "
-            f"— {revised_count} need collapsing",
-            expanded=False,
-        ):
-            st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True,
-                         hide_index=True, height=min(320, 38 * (len(cluster_rows) + 1)))
-
-    if orphan:
-        with st.expander(f"Citations Missing from References ({len(orphan)})", expanded=False):
-            st.dataframe(pd.DataFrame(orphan), use_container_width=True, hide_index=True)
-
-    if uncited:
-        with st.expander(f"References Missing from Citations ({len(uncited)})", expanded=False):
-            st.dataframe(pd.DataFrame(uncited), use_container_width=True, hide_index=True)
-
-    total_refs_now = len(references)
     doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
     doi_suspicious = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
     doi_suspicious_pct = (
         doi_suspicious / total_refs_now * 100 if total_refs_now else 0
     )
+    withheld_count = sum(
+        1 for r in reference_rows if _ref_is_withheld(r)
+    )
+    manual_count = sum(
+        1 for r in reference_rows if _ref_is_manual(r)
+    )
+    placeholder_count = sum(
+        1 for r in reference_rows if _ref_has_placeholder(r)
+    )
+
+    window_start = recency.get("start_year", int(manuscript_year) - 9)
+    window_end = recency.get("end_year", int(manuscript_year))
 
     metric_rows = [
-        {"Metric": "Total References", "Value": total_refs_now},
-        {"Metric": "Total In-text Citation Markers", "Value": stats.get("total", 0)},
-        {"Metric": "Unique Cited References", "Value": stats.get("unique", 0)},
-        {"Metric": "Grouped Citation Clusters", "Value": stats.get("clusters", 0)},
-        {"Metric": "Crowded Clusters (needs collapse)", "Value": stats.get("crowded_clusters", 0)},
-        {"Metric": "Orphan Citations", "Value": len(orphan)},
-        {"Metric": "Uncited References", "Value": len(uncited)},
-        {"Metric": "DOI Checked (OpenAlex)", "Value": doi_checked},
-        {"Metric": "DOI Suspicious (possible fabrication)",
+        {"Metric": "Manuscript publication year", "Value": str(manuscript_year)},
+        {"Metric": "Total references", "Value": total_refs_now},
+        {"Metric": "Total in-text citation markers", "Value": stats.get("total", 0)},
+        {"Metric": "Unique cited references", "Value": stats.get("unique", 0)},
+        {"Metric": "Grouped citation clusters", "Value": stats.get("clusters", 0)},
+        {"Metric": "Crowded clusters (needs collapse)", "Value": stats.get("crowded_clusters", 0)},
+        {"Metric": "Orphan citations (no matching reference)", "Value": len(orphan)},
+        {"Metric": "Uncited references", "Value": len(uncited)},
+        {"Metric": "DOI checked via OpenAlex", "Value": doi_checked},
+        {"Metric": "DOI suspicious (possible fabrication)",
          "Value": f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)"},
-        {"Metric": f"% Last 10 Years ({recency.get('start_year')}–{recency.get('end_year')})",
+        {"Metric": "Corrections withheld due to DOI mismatch", "Value": withheld_count},
+        {"Metric": "References flagged MANUAL CHECK", "Value": manual_count},
+        {"Metric": "References with placeholder fields", "Value": placeholder_count},
+        {"Metric": f"% references within last 10 years ({window_start}-{window_end})",
          "Value": f"{recency.get('recent_percentage', 0):.1f}%"},
     ]
     metric_df = pd.DataFrame(metric_rows)
@@ -2624,85 +2668,84 @@ def render():
     with right_col:
         st.dataframe(source_df, use_container_width=True, hide_index=True)
 
-    show_reference = st.toggle(
-        "Show Reference Correction",
-        value=False,
-        key="show_ieee_reference_correction_toggle",
-    )
-    if show_reference:
-        reference_display = pd.DataFrame([
-            {
-                "No.": row.get("No."),
-                "Corrected Version (IEEE)": row.get("Corrected Version", ""),
-                "Placeholders": ", ".join(
-                    k for k, v in (row.get("Placeholders") or {}).items() if v
-                ) or "—",
-                "DOI Checked": "YES" if row.get("DOI Verified") else "NO",
-                "DOI Suspicious": "⚠️ YES" if row.get("DOI Suspicious") else "—",
-                "OpenAlex Title": (row.get("OpenAlex Title") or "")[:60],
-                "DOI Issues": row.get("DOI Verification Reasons", ""),
-            }
-            for row in reference_rows
-        ])
-        if not reference_display.empty:
-            st.dataframe(reference_display, use_container_width=True,
-                         hide_index=True, height=280)
-        else:
-            st.info("No references were available for automated review.")
+    # ========================================================
+    # EXTRA REVIEW (blue) — only if withheld/suspicious exist
+    # ========================================================
+    problematic_count = withheld_count + doi_suspicious
+    if problematic_count > 0:
+        with st.container(key="ieee_extra_review"):
+            if st.button(
+                f"🔍 Need Extra Review ({problematic_count} problematic references)",
+                use_container_width=True,
+                key="ieee_extra_review_btn",
+            ):
+                st.session_state["ieee_show_extra"] = not st.session_state.get("ieee_show_extra", False)
 
+        if st.session_state.get("ieee_show_extra", False):
+            flagged_rows = [
+                {
+                    "No.": r.get("No."),
+                    "Source Type": r.get("Source Type"),
+                    "Status": r.get("Status"),
+                    "Original Reference": r.get("Original Reference", ""),
+                    "Comment": (
+                        r.get("DOI Verification Reasons")
+                        or r.get("AI Explanation")
+                        or r.get("Correction Note")
+                        or ""
+                    ),
+                }
+                for r in reference_rows
+                if _ref_is_withheld(r) or _ref_is_suspicious(r) or _ref_is_manual(r)
+            ]
+            if flagged_rows:
+                st.dataframe(
+                    pd.DataFrame(flagged_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(320, 38 * (len(flagged_rows) + 1)),
+                )
+
+    # ========================================================
+    # DOWNLOAD (green)
+    # ========================================================
     try:
         docx_bytes = build_ieee_docx(batch)
         safe_name = re.sub(r"[^\w\-]+", "_", batch.get("filename", "manuscript"))
-        st.download_button(
-            label="📄 Download Diagnostic Report (.docx)",
-            data=docx_bytes,
-            file_name=f"{safe_name}_IEEE_report.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-            key=f"download_ieee_report_docx_{selected_key}",
-        )
+        with st.container(key="ieee_download_btn"):
+            st.download_button(
+                label="📄 Download Diagnostic Report (.docx)",
+                data=docx_bytes,
+                file_name=f"{safe_name}_IEEE_report.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key=f"download_ieee_report_docx_{selected_key}",
+            )
     except Exception as exc:
         st.error(f"Could not build DOCX report: {exc}")
 
-    st.markdown(
-        """
-        <style>
-        div[class*="st-key-ieee_reset_btn"] button {
-            background-color: #dc2626 !important;
-            color: #ffffff !important;
-            border: 1px solid #b91c1c !important;
-            font-weight: 600 !important;
-            transition: background-color 0.15s ease;
-        }
-        div[class*="st-key-ieee_reset_btn"] button:hover {
-            background-color: #b91c1c !important;
-            color: #ffffff !important;
-            border-color: #991b1b !important;
-        }
-        div[class*="st-key-ieee_reset_btn"] button:focus {
-            box-shadow: 0 0 0 0.2rem rgba(220, 38, 38, 0.4) !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # ========================================================
+    # START FRESH (red)
+    # ========================================================
+    with st.container(key="ieee_reset_btn"):
+        if st.button(
+            "🔄 Start Fresh — Clear All Uploads & Results",
+            use_container_width=True,
+            key="ieee_reset_btn_start_fresh",
+        ):
+            for k in list(st.session_state.keys()):
+                if k == "ieee_batches" or k.startswith("ieee_batches"):
+                    del st.session_state[k]
+                if k.startswith("dbg_ref_"):
+                    del st.session_state[k]
+                if k == "ieee_selected_key":
+                    del st.session_state[k]
+                if k == "ieee_show_extra":
+                    del st.session_state[k]
 
-    if st.button(
-        "🔄 Start Fresh — Clear All Uploads & Results",
-        use_container_width=True,
-        key="ieee_reset_btn_start_fresh",
-    ):
-        for k in list(st.session_state.keys()):
-            if k == "ieee_batches" or k.startswith("ieee_batches"):
-                del st.session_state[k]
-            if k.startswith("dbg_ref_"):
-                del st.session_state[k]
-            if k == "ieee_selected_key":
-                del st.session_state[k]
-
-        st.session_state["ieee_batches"] = {}
-        st.session_state["ieee_uploader_version"] = (
-            st.session_state.get("ieee_uploader_version", 0) + 1
-        )
-        st.session_state["ieee_manuscript_year"] = datetime.now().year
-        st.rerun()
+            st.session_state["ieee_batches"] = {}
+            st.session_state["ieee_uploader_version"] = (
+                st.session_state.get("ieee_uploader_version", 0) + 1
+            )
+            st.session_state["ieee_manuscript_year"] = datetime.now().year
+            st.rerun()
