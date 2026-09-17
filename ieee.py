@@ -1,6 +1,14 @@
 # ieee.py
 # OmniCite Auditor — IEEE Style Module
 # Imported and rendered by app.py via:  import ieee; ieee.render()
+#
+# Flow mirrors apa.py:
+#   - One "Extract & Review" button
+#   - Per-file batch dict in st.session_state["ieee_batches"]
+#   - process_single_ieee_pdf() runs Stages A-G
+#   - Pre-classification gates AI calls (cost control)
+#   - Deterministic citation/cluster rules override AI
+#   - "Start Fresh" reset button
 
 import re
 import os
@@ -981,6 +989,11 @@ def evaluate_cluster(cluster):
     return (bool(reasons), reasons)
 
 
+def enforce_ieee_citation_rules(cluster):
+    """Final hard guard: canonical form can never be overridden by AI."""
+    return collapse_citation_cluster(cluster["numbers"])
+
+
 # =========================================================
 # REFERENCE STRUCTURE VALIDATION
 # =========================================================
@@ -1355,7 +1368,7 @@ def build_local_ieee_reference_correction(reference):
 
 
 # =========================================================
-# AI REVIEW (OPTIONAL)
+# OPENAI HELPERS
 # =========================================================
 
 def _get_openai_client():
@@ -1376,6 +1389,10 @@ def _safe_json_loads(text):
         text = re.sub(r"\s*```$", "", text)
     return json.loads(text)
 
+
+# =========================================================
+# OPENAI — IEEE REFERENCE REVIEW
+# =========================================================
 
 def review_ieee_references_with_ai(references):
     client = _get_openai_client()
@@ -1436,23 +1453,207 @@ def _reference_is_hallucinated(original, corrected):
     return False
 
 
-def build_ieee_reference_comparison(references, ai_results=None, manuscript_year=None):
-    ai_results = ai_results or []
+# =========================================================
+# OPENAI — IEEE CITATION CLUSTER REVIEW
+# =========================================================
+
+def review_ieee_citations_with_ai(clusters, reference_rows):
+    client = _get_openai_client()
+    if client is None or not clusters:
+        return []
+
+    payload = [
+        {"number": i, "raw": c["raw"], "canonical": c["canonical"],
+         "numbers": c["numbers"]}
+        for i, c in enumerate(clusters, start=1)
+    ]
+
+    reference_context = [
+        {"no": row["No."], "year": row.get("Year"),
+         "authors": parse_ieee_reference(row.get("Original Reference", "")).get("authors", []),
+         "reference": row.get("Original Reference", "")}
+        for row in reference_rows
+    ]
+
+    prompt = f"""
+You are checking IEEE-style IN-TEXT citation clusters.
+
+Each item is a bracketed cluster already extracted. Correct each IN ISOLATION.
+
+IEEE RULES:
+- Citations must be ascending: [1], [2], [3] — never [3], [1], [2].
+- Three or more consecutive numbers MUST use range form: [1]-[3].
+- Two consecutive numbers stay separate: [1], [2].
+- Non-consecutive stay comma-separated: [1], [3], [5].
+- Do NOT invent numbers. Do NOT merge separate clusters.
+
+Return JSON only:
+{{"results": [
+  {{"number": int, "status": "OK"|"REVISED"|"MANUAL_CHECK",
+    "revised_citation": str, "explanation": str}}
+]}}
+
+REFERENCE LIST CONTEXT:
+{json.dumps(reference_context, ensure_ascii=False)}
+
+INPUT CLUSTERS:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": "You are a precise IEEE citation editor. JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        return _safe_json_loads(response.choices[0].message.content).get("results", [])
+    except Exception as exc:
+        return [{"number": 0, "status": "MANUAL_CHECK", "revised_citation": "",
+                 "explanation": f"OpenAI API error: {exc}"}]
+
+
+# =========================================================
+# PRE-CLASSIFICATION (cost control, mirrors APA Stage C)
+# =========================================================
+
+def preclassify_ieee_references(references, verification_rows, local_source_types):
+    review_payload = []
+    preclassified = {}
+
+    for i, (ref, v, stype) in enumerate(
+        zip(references, verification_rows, local_source_types), start=1
+    ):
+        parsed = parse_ieee_reference(ref)
+
+        if stype == "Journal Article":
+            if not parsed.get("doi"):
+                preclassified[i] = {
+                    "number": i, "status": "WITHHELD", "revised_reference": "",
+                    "source_type": stype, "italic_elements": "", "year": parsed.get("year"),
+                    "missing_required_elements": [],
+                    "explanation": "DOI not provided — automated verification/correction withheld.",
+                }
+                continue
+            if v.get("suspicious") or not v.get("checked"):
+                reason = " | ".join(v.get("reasons", [])) or "DOI metadata could not be independently verified."
+                preclassified[i] = {
+                    "number": i, "status": "MANUAL_CHECK", "revised_reference": "",
+                    "source_type": stype, "italic_elements": "", "year": parsed.get("year"),
+                    "missing_required_elements": [],
+                    "explanation": reason,
+                }
+                continue
+            review_payload.append({"number": i, "reference": ref, "openalex": {
+                "title": v.get("crossref_title"),
+                "authors": v.get("crossref_authors", []),
+                "year": parsed.get("year"),
+            }})
+            continue
+
+        if stype == "Conference Paper" and v.get("checked") and not v.get("suspicious"):
+            review_payload.append({"number": i, "reference": ref, "openalex": {
+                "title": v.get("crossref_title"),
+                "authors": v.get("crossref_authors", []),
+                "year": parsed.get("year"),
+            }})
+            continue
+
+        preclassified[i] = {
+            "number": i, "status": "MANUAL_CHECK", "revised_reference": "",
+            "source_type": stype, "italic_elements": "", "year": parsed.get("year"),
+            "missing_required_elements": [],
+            "explanation": "No independently verified metadata workflow is configured for this source type; manual verification required.",
+        }
+
+    return review_payload, preclassified
+
+
+# =========================================================
+# AI STATUS LABEL
+# =========================================================
+
+def _ieee_status_label(status):
+    status = str(status or "MANUAL_CHECK").upper().strip()
+    if status in {"OK", "PASS", "MATCH"}:
+        return "MATCH"
+    if status in {"REVISED", "NEEDS REVIEW", "NEEDS_REVIEW"}:
+        return "REVISED"
+    if status == "WITHHELD":
+        return "WITHHELD"
+    return "MANUAL CHECK"
+
+
+def _fallback_ieee_italic_elements(source_type, parsed):
+    if source_type in {"Journal Article", "Conference Paper"} and parsed.get("venue"):
+        return parsed["venue"]
+    if source_type in {"Book", "Book Chapter", "Technical Report"} and parsed.get("title"):
+        return parsed["title"]
+    return ""
+
+
+# =========================================================
+# STAGED PIPELINE — process_single_ieee_pdf
+# =========================================================
+
+def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
+    """
+    Run the full IEEE pipeline for ONE PDF's batch dict.
+    Mutates `batch` in place (mirrors APA's process_single_pdf).
+    """
+
+    # ---- Stage A: local extraction ----
+    uploaded_file.seek(0)
+    full_text, pages, removed_running_text = extract_pdf_text(uploaded_file)
+    uploaded_file.seek(0)
+    style_spans = extract_pdf_style_spans(uploaded_file)
+    full_text = clean_text(full_text)
+
+    reference_text, heading, body_text = find_reference_section(full_text)
+    if reference_text is None:
+        raise ValueError("I could not detect a References section.")
+
+    references = split_references(reference_text)
+    parsed_refs = [parse_ieee_reference(r) for r in references]
+    local_source_types = [p.get("source_type", "Other") for p in parsed_refs]
+
+    citations, clusters = extract_ieee_citations(body_text)
+    for c in citations:
+        c["page"] = _page_for_offset(full_text, c.get("offset"))
+
+    # ---- Stage B: DOI verification via OpenAlex ----
+    verification_rows = []
+    for ref, parsed in zip(references, parsed_refs):
+        v = verify_reference_against_openalex(ref, parsed)
+        verification_rows.append(v)
+
+    # ---- Stage C: pre-classification (cost control) ----
+    review_payload, preclassified = preclassify_ieee_references(
+        references, verification_rows, local_source_types
+    )
+
+    # ---- Stage D: AI review of eligible references only ----
+    ref_ai = review_ieee_references_with_ai(
+        [x["reference"] for x in review_payload]
+    ) if review_payload else []
+
     by_no = {
-        int(x.get("number", -1)): x
-        for x in ai_results
+        int(x.get("number", -1)): x for x in (ref_ai or [])
         if str(x.get("number", "")).isdigit()
     }
+    by_no.update(preclassified)
+
+    # ---- Stage E: build reference rows ----
     rows = []
     for i, original in enumerate(references, start=1):
         ai = by_no.get(i, {})
         original_clean = strip_markdown_markers(clean_text(original))
-
         structure_errors = ieee_structure_errors(original_clean)
 
-        corrected = strip_markdown_markers(
-            clean_text(ai.get("revised_reference", ""))
-        ) or original_clean
+        ai_revised = strip_markdown_markers(clean_text(ai.get("revised_reference", "")))
+        corrected = ai_revised or original_clean
         if corrected != original_clean and _reference_is_hallucinated(original_clean, corrected):
             corrected = original_clean
 
@@ -1460,8 +1661,7 @@ def build_ieee_reference_comparison(references, ai_results=None, manuscript_year
         corrected = local["Corrected"]
 
         parsed = parse_ieee_reference(corrected)
-
-        verification = verify_reference_against_openalex(original_clean, parsed)
+        v = verification_rows[i - 1]
 
         source_type = normalize_source_type(ai.get("source_type"))
         if source_type == "Other" and not ai.get("source_type"):
@@ -1481,13 +1681,19 @@ def build_ieee_reference_comparison(references, ai_results=None, manuscript_year
         missing = list({*missing, *ieee_missing_elements(corrected)})
 
         status = _ieee_status_label(ai.get("status")) if ai else "NOT AI CHECKED"
+        if ai.get("status") == "WITHHELD":
+            corrected_display = "— WITHHELD —"
+        elif v.get("suspicious"):
+            corrected_display = "— WITHHELD (DOI mismatch) —"
+        else:
+            corrected_display = corrected
 
         rows.append({
             "No.": i,
             "Source Type": source_type,
             "Year": year,
             "Original Reference": original_clean,
-            "Corrected Version": corrected,
+            "Corrected Version": corrected_display,
             "Italicized in IEEE": italic_elements,
             "Status": status,
             "Missing Required Elements": ", ".join(str(x) for x in missing),
@@ -1495,114 +1701,67 @@ def build_ieee_reference_comparison(references, ai_results=None, manuscript_year
             "Original Structure Errors": " | ".join(structure_errors),
             "Original Has Structure Error": bool(structure_errors),
             "Correction Note": local.get("Note", ""),
-            "DOI Verified": verification["checked"],
-            "DOI Suspicious": verification["suspicious"],
-            "DOI Verification Reasons": " | ".join(verification["reasons"]),
-            "Title Similarity": verification.get("title_similarity"),
-            "Author Overlap": verification.get("author_overlap"),
-            "OpenAlex Title": verification.get("crossref_title"),
-            "OpenAlex Authors": ", ".join(verification.get("crossref_authors", [])[:5]),
+            "DOI Verified": v["checked"],
+            "DOI Suspicious": v["suspicious"],
+            "DOI Verification Reasons": " | ".join(v["reasons"]),
+            "Title Similarity": v.get("title_similarity"),
+            "Author Overlap": v.get("author_overlap"),
+            "OpenAlex Title": v.get("crossref_title"),
+            "OpenAlex Authors": ", ".join(v.get("crossref_authors", [])[:5]),
             "Placeholders": local.get("Placeholders", {}),
         })
-    return rows
 
+    # ---- Stage F: AI citation cluster review + deterministic enforcement ----
+    cit_ai = review_ieee_citations_with_ai(clusters, rows) if clusters else []
+    cit_by_no = {
+        int(x.get("number", -1)): x for x in (cit_ai or [])
+        if str(x.get("number", "")).isdigit()
+    }
 
-def _fallback_ieee_italic_elements(source_type, parsed):
-    if source_type in {"Journal Article", "Conference Paper"} and parsed.get("venue"):
-        return parsed["venue"]
-    if source_type in {"Book", "Book Chapter", "Technical Report"} and parsed.get("title"):
-        return parsed["title"]
-    return ""
-
-
-def _ieee_status_label(status):
-    status = str(status or "MANUAL_CHECK").upper().strip()
-    if status in {"OK", "PASS", "MATCH"}:
-        return "MATCH"
-    if status in {"REVISED", "NEEDS REVIEW", "NEEDS_REVIEW"}:
-        return "REVISED"
-    return "MANUAL CHECK"
-
-
-# =========================================================
-# ANALYZE
-# =========================================================
-
-def analyze_ieee_locally(uploaded_file, manuscript_year):
-    uploaded_file.seek(0)
-    full_text, pages, removed_running_text = extract_pdf_text(uploaded_file)
-    uploaded_file.seek(0)
-    style_spans = extract_pdf_style_spans(uploaded_file)
-    full_text = clean_text(full_text)
-
-    reference_text, heading, body_text = find_reference_section(full_text)
-    if reference_text is None:
-        raise ValueError("I could not detect a References section.")
-
-    references = split_references(reference_text)
-    parsed_references = [parse_ieee_reference(r) for r in references]
-    citations, citation_clusters = extract_ieee_citations(body_text)
-
-    for c in citations:
-        c["page"] = _page_for_offset(full_text, c.get("offset"))
-
-    citation_stats = calculate_citation_statistics(citations, citation_clusters)
-    matching_results = match_citations_to_references(citations, parsed_references)
-    orphan_citations = find_orphan_citations(citations, parsed_references)
-    uncited_references = detect_uncited_references(citations, parsed_references)
-    duplicates = detect_duplicates(parsed_references)
-    recency = calculate_reference_recency(references, manuscript_year)
-
-    local_reference_checks = []
-    for i, ref in enumerate(references, start=1):
-        status, _, _, parsed = check_ieee_reference(ref, style_spans)
-        local_reference_checks.append({
-            "Reference #": i,
-            "IEEE Status": status,
-            "Source Type": parsed.get("source_type", "Other"),
-            "Structure Errors": " | ".join(ieee_structure_errors(ref)),
+    cluster_rows = []
+    for i, cl in enumerate(clusters, start=1):
+        ai = cit_by_no.get(i, {})
+        revised = enforce_ieee_citation_rules(cl)  # deterministic wins
+        needs_fix, reasons = evaluate_cluster(cl)
+        cluster_rows.append({
+            "No.": i,
+            "Page": next((c.get("page") for c in citations if c["number"] in cl["numbers"]), None),
+            "Original Form": cl["raw"],
+            "Corrected Form": revised,
+            "Numbers Cited": ", ".join(str(n) for n in cl["numbers"]),
+            "Status": "REVISED" if needs_fix else "MATCH",
+            "Reason": " | ".join(reasons) or ai.get("explanation", ""),
         })
 
-    return {
+    # ---- Stage G: attach everything to batch ----
+    citation_stats = calculate_citation_statistics(citations, clusters)
+    matching = match_citations_to_references(citations, parsed_refs)
+    orphan = find_orphan_citations(citations, parsed_refs)
+    uncited = detect_uncited_references(citations, parsed_refs)
+    duplicates = detect_duplicates(parsed_refs)
+    recency = calculate_reference_recency(references, manuscript_year)
+
+    batch.update({
         "filename": uploaded_file.name,
         "heading": heading,
         "references": references,
-        "parsed_references": parsed_references,
+        "parsed_references": parsed_refs,
         "citations": citations,
-        "citation_clusters": citation_clusters,
+        "citation_clusters": clusters,
         "citation_stats": citation_stats,
-        "matching_results": matching_results,
-        "orphan_citations": orphan_citations,
-        "uncited_references": uncited_references,
+        "matching_results": matching,
+        "orphan_citations": orphan,
+        "uncited_references": uncited,
         "duplicates": duplicates,
         "recency": recency,
-        "local_reference_checks": local_reference_checks,
         "removed_running_text": removed_running_text,
-        "manuscript_year": manuscript_year,
-        "ai_complete": False,
-    }
-
-
-def check_ieee_reference(reference, style_spans=None):
-    issues = ieee_structure_errors(reference)
-    warnings = []
-    parsed = parse_ieee_reference(reference)
-    if issues:
-        status = "Fail"
-    elif warnings:
-        status = "Review"
-    else:
-        status = "Pass"
-    return status, issues, warnings, parsed
-
-
-def enrich_ieee_with_ai(result):
-    reference_ai = review_ieee_references_with_ai(result["references"])
-    result["reference_comparison"] = build_ieee_reference_comparison(
-        result["references"], reference_ai, result["manuscript_year"]
-    )
-    result["ai_complete"] = bool(_get_openai_client())
-    return result
+        "manuscript_year": int(manuscript_year),
+        "reference_comparison": rows,
+        "cluster_rows": cluster_rows,
+        "verification_rows": verification_rows,
+        "ai_done": True,
+        "ai_complete": True,
+    })
 
 
 # =========================================================
@@ -1642,7 +1801,6 @@ _PLACEHOLDER_RE = re.compile(
     r"|doi: \?{3})",
     re.I,
 )
-
 
 _PAGE_PARTIAL_RE = re.compile(r"pp\.\s*(\d+)-\?{3}", re.I)
 
@@ -1728,42 +1886,30 @@ def build_ieee_docx(result):
     hr = h1.add_run("1. In-text Citation List")
     _set_run_font(hr, size_pt=14, bold=True)
 
+    cluster_rows = result.get("cluster_rows", [])
     citations = result.get("citations", [])
-    clusters = result.get("citation_clusters", [])
 
-    if not citations:
+    if not cluster_rows:
         _add_run(doc.add_paragraph(), "No bracketed in-text citations were detected.", italic=True)
     else:
-        for cluster in clusters:
-            numbers = cluster["numbers"]
-            raw = cluster["raw"]
-            canonical = cluster["canonical"]
-            page = None
-            for n in numbers:
-                for c in citations:
-                    if c["number"] == n:
-                        page = c.get("page")
-                        break
-                if page:
-                    break
-
-            needs_fix, reasons = evaluate_cluster(cluster)
-
+        for row in cluster_rows:
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(3)
-            _add_run(p, f"Page {page if page else '?'}  ", bold=True, size_pt=11)
-            _add_run(p, f"Lookup: {raw}", size_pt=11, red=needs_fix)
-            if needs_fix:
-                _add_run(p, f"   ← {reasons[0]}", italic=True, size_pt=10, red=True)
+            _add_run(p, f"Page {row.get('Page') or '?'}  ", bold=True, size_pt=11)
+            _add_run(p, f"Lookup: {row['Original Form']}", size_pt=11,
+                     red=(row["Status"] == "REVISED"))
+            if row["Status"] == "REVISED":
+                _add_run(p, f"   ← {row['Reason']}", italic=True, size_pt=10, red=True)
 
             p2 = doc.add_paragraph()
             p2.paragraph_format.space_after = Pt(8)
             _add_run(p2, "Original : ", bold=True, size_pt=11)
-            _add_run(p2, raw, size_pt=11, red=needs_fix)
+            _add_run(p2, row["Original Form"], size_pt=11,
+                     red=(row["Status"] == "REVISED"))
             p3 = doc.add_paragraph()
             p3.paragraph_format.space_after = Pt(8)
             _add_run(p3, "Corrected: ", bold=True, size_pt=11)
-            _add_run(p3, canonical, size_pt=11)
+            _add_run(p3, row["Corrected Form"], size_pt=11)
 
     doc.add_page_break()
 
@@ -1772,10 +1918,7 @@ def build_ieee_docx(result):
     hr2 = h2.add_run("2. Reference List (IEEE Style)")
     _set_run_font(hr2, size_pt=14, bold=True)
 
-    reference_rows = result.get("reference_comparison") or build_ieee_reference_comparison(
-        result.get("references", []), [], result.get("manuscript_year")
-    )
-
+    reference_rows = result.get("reference_comparison") or []
     matching = result.get("matching_results", []) or []
     uncited_numbers = {row.get("Reference #") for row in matching if not row.get("Cited")}
 
@@ -1941,258 +2084,310 @@ def build_ieee_docx(result):
 
 
 # =========================================================
-# RENDER (called from app.py)
+# RENDER — called from app.py
 # =========================================================
 
 def render():
-
     st.title("OmniCite Auditor - IEEE Style")
     st.caption("Numbered bracketed in-text citations ↔ IEEE reference list")
+
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai_key:
+        st.warning("OPENAI_API_KEY not set — AI correction will be skipped. Local checks still run.")
+
+    client = None
+    if openai_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=openai_key)
+        except Exception:
+            client = None
+
+    # ---- Uploader with versioned key (mirrors APA) ----
+    if "ieee_uploader_version" not in st.session_state:
+        st.session_state["ieee_uploader_version"] = 0
 
     uploaded_files = st.file_uploader(
         "Upload manuscript PDFs",
         type=["pdf"],
         accept_multiple_files=True,
         help="Upload up to 5 manuscripts in one batch.",
-        key="ieee_file_uploader",
+        key=f"ieee_uploader_{st.session_state['ieee_uploader_version']}",
     )
 
+    if "ieee_batches" not in st.session_state:
+        st.session_state["ieee_batches"] = {}
+
+    if not uploaded_files:
+        return
+
+    if len(uploaded_files) > 5:
+        st.error(f"You uploaded {len(uploaded_files)} manuscripts. Maximum batch size is 5.")
+        st.stop()
+
+    # ---- Manuscript year (mirrors APA) ----
+    current_year = datetime.now().year
+    default_year = st.session_state.get("ieee_manuscript_year", current_year)
     manuscript_year = st.number_input(
-        "Manuscript publication year", min_value=1900, max_value=2100,
-        value=datetime.now().year, step=1,
-        key="ieee_manuscript_year",
+        "Manuscript publication year",
+        min_value=1900, max_value=current_year + 5,
+        value=int(default_year), step=1,
+        help="Used for the % of references within the last 10 years [year-9, year].",
+        key="ieee_manuscript_year_input",
+    )
+    st.session_state["ieee_manuscript_year"] = int(manuscript_year)
+
+    file_keys = [(f"{i}::{uf.name}", uf) for i, uf in enumerate(uploaded_files)]
+
+    # Drop batches no longer uploaded
+    active_keys = {k for k, _ in file_keys}
+    for k in list(st.session_state["ieee_batches"].keys()):
+        if k not in active_keys:
+            del st.session_state["ieee_batches"][k]
+
+    # ---- Single Extract & Review button (mirrors APA) ----
+    if st.button(
+        "Extract & Review",
+        type="primary",
+        use_container_width=True,
+        key="ieee_btn_run_all_pdfs",
+    ):
+        overall = st.progress(0, text="Starting...")
+        n = len(file_keys)
+        step = 100 / max(n, 1)
+
+        for i, (key, uf) in enumerate(file_keys, start=1):
+            base_pct = int((i - 1) * step)
+            overall.progress(base_pct + int(step * 0.10),
+                             text=f"[{i}/{n}] Extracting {uf.name}...")
+
+            batch = {"filename": uf.name, "manuscript_year": int(manuscript_year),
+                     "ai_done": False}
+            try:
+                process_single_ieee_pdf(uf, batch, client, int(manuscript_year))
+            except Exception as exc:
+                st.error(f"{uf.name} IEEE check failed: {exc}")
+                batch["error"] = str(exc)
+            st.session_state["ieee_batches"][key] = batch
+            overall.progress(base_pct + int(step * 1.00),
+                             text=f"[{i}/{n}] {uf.name} done.")
+
+        overall.progress(100, text="All manuscripts processed.")
+        overall.empty()
+        st.success(f"Processed {n} manuscript{'s' if n != 1 else ''}.")
+
+    # ---- Results ----
+    any_done = any(b.get("ai_done") for b in st.session_state["ieee_batches"].values())
+    if not any_done:
+        return
+
+    selector_options = [k for k, _ in file_keys]
+
+    def _fmt(k):
+        b = st.session_state["ieee_batches"].get(k, {})
+        suffix = "" if b.get("ai_done") else "  (not yet processed)"
+        return b.get("filename", k) + suffix
+
+    selected_key = st.selectbox(
+        "Select manuscript to review",
+        selector_options,
+        format_func=_fmt,
+        key="ieee_selected_key",
     )
 
-    if "ieee_batch_results" not in st.session_state:
-        st.session_state["ieee_batch_results"] = {}
+    batch = st.session_state["ieee_batches"].get(selected_key)
+    if not batch or not batch.get("ai_done"):
+        st.info("This manuscript has not been processed yet. Click 'Extract & Review' above.")
+        return
 
-    if uploaded_files:
-        if len(uploaded_files) > 5:
-            st.error(f"You uploaded {len(uploaded_files)} manuscripts. The maximum batch size is 5 PDFs.")
-            st.stop()
+    # Refresh manuscript year with widget value
+    batch["manuscript_year"] = int(st.session_state.get("ieee_manuscript_year", current_year))
 
-        with st.container(key="blue_btn_extract_ieee"):
-            extract_batch = st.button(
-                f"Extract & Review ({len(uploaded_files)} manuscript{'s' if len(uploaded_files) != 1 else ''})",
-                use_container_width=True,
-                key="ieee_extract_button",
-            )
+    # ---- Debug reference slice ----
+    with st.expander("View reference section (processed)", expanded=False):
+        st.text_area(
+            "Reference slice",
+            "\n\n".join(f"[{i}] {r}" for i, r in enumerate(batch["references"], start=1)),
+            height=300,
+            key=f"dbg_ref_{selected_key}",
+        )
 
-        if extract_batch:
-            local_results = {}
-            progress = st.progress(0, text="Extracting IEEE citations and references locally...")
-            for file_index, uploaded_file in enumerate(uploaded_files, start=1):
-                key = f"{file_index}::{uploaded_file.name}"
-                try:
-                    progress.progress(
-                        int(((file_index - 1) / len(uploaded_files)) * 100),
-                        text=f"Extracting {file_index}/{len(uploaded_files)}: {uploaded_file.name}",
-                    )
-                    local_results[key] = analyze_ieee_locally(uploaded_file, int(manuscript_year))
-                except Exception:
-                    st.error(f"{uploaded_file.name} failed:\n\n{traceback.format_exc()}")
-                    local_results[key] = {
-                        "filename": uploaded_file.name,
-                        "error": "see traceback above",
-                        "manuscript_year": int(manuscript_year),
-                    }
-            progress.empty()
-            st.session_state["ieee_batch_results"] = local_results
+    citations = batch["citations"]
+    references = batch["references"]
+    matching = batch["matching_results"]
+    orphan = batch["orphan_citations"]
+    uncited = batch["uncited_references"]
+    cluster_rows = batch.get("cluster_rows", [])
+    reference_rows = batch.get("reference_comparison", [])
+    stats = batch["citation_stats"]
+    recency = batch["recency"]
 
-        results = st.session_state.get("ieee_batch_results", {})
+    st.caption(
+        f"References: {len(references)}  |  "
+        f"In-text citation markers: {len(citations)}"
+    )
 
-        if results:
-            valid_results = {k: v for k, v in results.items() if not v.get("error")}
+    # ---- Citations expander ----
+    with st.expander(f"In-text Citations ({len(citations)})", expanded=False):
+        if citations:
+            df_cit = pd.DataFrame([
+                {
+                    "Page": c.get("page"),
+                    "Citation": c["raw"],
+                    "Context": (c.get("context") or "").strip(),
+                }
+                for c in citations
+            ])
+            st.dataframe(df_cit, use_container_width=True, hide_index=True,
+                         height=min(300, 38 * (len(citations) + 1)))
+        else:
+            st.info("No bracketed IEEE citations detected in body text.")
 
-            if not valid_results:
-                for failed in results.values():
-                    if failed.get("error"):
-                        st.error(f"{failed.get('filename', 'Manuscript')}: {failed['error']}")
-            else:
-                selector_keys = list(valid_results.keys())
-                selected_key = st.selectbox(
-                    "Select manuscript to review",
-                    selector_keys,
-                    format_func=lambda k: valid_results[k].get("filename", k),
-                    key="ieee_selected_manuscript",
-                )
-                result = valid_results[selected_key]
+    # ---- Clusters expander ----
+    if cluster_rows:
+        revised_count = sum(1 for r in cluster_rows if r["Status"] == "REVISED")
+        with st.expander(
+            f"Grouped In-text Citations ({len(cluster_rows)}) "
+            f"— {revised_count} need collapsing",
+            expanded=False,
+        ):
+            st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True,
+                         hide_index=True, height=min(320, 38 * (len(cluster_rows) + 1)))
 
-                citations = result["citations"]
-                references = result["references"]
-                matching = result["matching_results"]
-                orphan = result["orphan_citations"]
-                uncited = result["uncited_references"]
+    # ---- Orphan / uncited ----
+    if orphan:
+        with st.expander(f"Citations Missing from References ({len(orphan)})", expanded=False):
+            st.dataframe(pd.DataFrame(orphan), use_container_width=True, hide_index=True)
 
-                st.caption(
-                    f"References: {len(references)}  |  "
-                    f"In-text citation markers: {len(citations)}"
-                )
+    if uncited:
+        with st.expander(f"References Missing from Citations ({len(uncited)})", expanded=False):
+            st.dataframe(pd.DataFrame(uncited), use_container_width=True, hide_index=True)
 
-                with st.expander(f"In-text Citations ({len(citations)})", expanded=False):
-                    if citations:
-                        df_cit = pd.DataFrame([
-                            {
-                                "Page": c.get("page"),
-                                "Citation": c["raw"],
-                                "Context": (c.get("context") or "").strip(),
-                            }
-                            for c in citations
-                        ])
-                        st.dataframe(df_cit, use_container_width=True, hide_index=True,
-                                     height=min(300, 38 * (len(citations) + 1)))
-                    else:
-                        st.info("No bracketed IEEE citations detected in body text.")
+    # ---- Metrics ----
+    total_refs_now = len(references)
+    doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
+    doi_suspicious = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
+    doi_suspicious_pct = (
+        doi_suspicious / total_refs_now * 100 if total_refs_now else 0
+    )
 
-                clusters = result.get("citation_clusters", [])
-                if clusters:
-                    rows = []
-                    for cl in clusters:
-                        needs_fix, reasons = evaluate_cluster(cl)
-                        page = None
-                        for c in citations:
-                            if c["number"] in cl["numbers"]:
-                                page = c.get("page")
-                                break
-                        rows.append({
-                            "Page": page,
-                            "Original Form": cl["raw"],
-                            "Corrected Form": cl["canonical"],
-                            "Numbers Cited": ", ".join(str(n) for n in cl["numbers"]),
-                            "Status": "REVISED" if needs_fix else "MATCH",
-                            "Reason": " | ".join(reasons),
-                        })
-                    with st.expander(
-                        f"Grouped In-text Citations ({len(clusters)}) "
-                        f"— {sum(1 for r in rows if r['Status']=='REVISED')} need collapsing",
-                        expanded=False,
-                    ):
-                        st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                                     hide_index=True, height=min(320, 38 * (len(rows) + 1)))
+    metric_rows = [
+        {"Metric": "Total References", "Value": total_refs_now},
+        {"Metric": "Total In-text Citation Markers", "Value": stats.get("total", 0)},
+        {"Metric": "Unique Cited References", "Value": stats.get("unique", 0)},
+        {"Metric": "Grouped Citation Clusters", "Value": stats.get("clusters", 0)},
+        {"Metric": "Crowded Clusters (needs collapse)", "Value": stats.get("crowded_clusters", 0)},
+        {"Metric": "Orphan Citations", "Value": len(orphan)},
+        {"Metric": "Uncited References", "Value": len(uncited)},
+        {"Metric": "DOI Checked (OpenAlex)", "Value": doi_checked},
+        {"Metric": "DOI Suspicious (possible fabrication)",
+         "Value": f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)"},
+        {"Metric": f"% Last 10 Years ({recency.get('start_year')}–{recency.get('end_year')})",
+         "Value": f"{recency.get('recent_percentage', 0):.1f}%"},
+    ]
+    metric_df = pd.DataFrame(metric_rows)
 
-                if orphan:
-                    with st.expander(f"Citations Missing from References ({len(orphan)})", expanded=False):
-                        st.dataframe(pd.DataFrame(orphan), use_container_width=True, hide_index=True)
+    source_counts = Counter(
+        (row.get("Source Type") or "Other") for row in reference_rows
+    )
+    source_rows = []
+    for source_type in CANONICAL_SOURCE_TYPES:
+        count = source_counts.get(source_type, 0)
+        pct = count / total_refs_now * 100 if total_refs_now else 0
+        source_rows.append({
+            "Source Type": source_type,
+            "Count / Percentage": f"{count} ({pct:.1f}%)",
+        })
+    source_df = pd.DataFrame(source_rows)
 
-                if uncited:
-                    with st.expander(f"References Missing from Citations ({len(uncited)})", expanded=False):
-                        st.dataframe(pd.DataFrame(uncited), use_container_width=True, hide_index=True)
+    left_col, right_col = st.columns([1, 1], gap="large")
+    with left_col:
+        st.dataframe(metric_df, use_container_width=True, hide_index=True)
+    with right_col:
+        st.dataframe(source_df, use_container_width=True, hide_index=True)
 
-                with st.container(key="green_btn_ai_ieee"):
-                    run_ai = st.button(
-                        "Automated Processing Check",
-                        use_container_width=True,
-                        disabled=not bool(_get_openai_client()),
-                        help=None if _get_openai_client() else "Set OPENAI_API_KEY to enable automated IEEE correction.",
-                        key="run_ieee_ai_review",
-                    )
+    # ---- Reference correction toggle ----
+    show_reference = st.toggle(
+        "Show Reference Correction",
+        value=False,
+        key="show_ieee_reference_correction_toggle",
+    )
+    if show_reference:
+        reference_display = pd.DataFrame([
+            {
+                "No.": row.get("No."),
+                "Corrected Version (IEEE)": row.get("Corrected Version", ""),
+                "Placeholders": ", ".join(
+                    k for k, v in (row.get("Placeholders") or {}).items() if v
+                ) or "—",
+                "DOI Checked": "YES" if row.get("DOI Verified") else "NO",
+                "DOI Suspicious": "⚠️ YES" if row.get("DOI Suspicious") else "—",
+                "OpenAlex Title": (row.get("OpenAlex Title") or "")[:60],
+                "DOI Issues": row.get("DOI Verification Reasons", ""),
+            }
+            for row in reference_rows
+        ])
+        if not reference_display.empty:
+            st.dataframe(reference_display, use_container_width=True,
+                         hide_index=True, height=280)
+        else:
+            st.info("No references were available for automated review.")
 
-                if run_ai:
-                    ai_progress = st.progress(0, text="Running IEEE automated review...")
-                    for idx, (key, batch_result) in enumerate(valid_results.items(), start=1):
-                        ai_progress.progress(
-                            int(((idx - 1) / len(valid_results)) * 100),
-                            text=f"IEEE review {idx}/{len(valid_results)}: {batch_result['filename']}",
-                        )
-                        try:
-                            enriched = enrich_ieee_with_ai(batch_result)
-                        except Exception:
-                            st.error(f"IEEE review failed for {batch_result.get('filename')}:\n\n{traceback.format_exc()}")
-                            enriched = batch_result
-                        st.session_state["ieee_batch_results"][key] = enriched
-                    ai_progress.empty()
-                    st.rerun()
+    # ---- Download ----
+    try:
+        docx_bytes = build_ieee_docx(batch)
+        safe_name = re.sub(r"[^\w\-]+", "_", batch.get("filename", "manuscript"))
+        st.download_button(
+            label="📄 Download Diagnostic Report (.docx)",
+            data=docx_bytes,
+            file_name=f"{safe_name}_IEEE_report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            key=f"download_ieee_report_docx_{selected_key}",
+        )
+    except Exception as exc:
+        st.error(f"Could not build DOCX report: {exc}")
 
-                ai_ready = all(v.get("ai_complete", False) for v in valid_results.values())
-                if ai_ready:
-                    result = valid_results[selected_key]
-                    reference_rows = result.get("reference_comparison") or []
-                    stats = result["citation_stats"]
-                    recency = result["recency"]
+    # ---- Start Fresh (red button, mirrors APA) ----
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-ieee_reset_btn"] button {
+            background-color: #dc2626 !important;
+            color: #ffffff !important;
+            border: 1px solid #b91c1c !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-ieee_reset_btn"] button:hover {
+            background-color: #b91c1c !important;
+            color: #ffffff !important;
+            border-color: #991b1b !important;
+        }
+        div[class*="st-key-ieee_reset_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(220, 38, 38, 0.4) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-                    total_refs_now = len(result["references"])
-                    doi_checked = sum(1 for r in reference_rows if r.get("DOI Verified"))
-                    doi_suspicious = sum(1 for r in reference_rows if r.get("DOI Suspicious"))
-                    doi_suspicious_pct = (
-                        doi_suspicious / total_refs_now * 100 if total_refs_now else 0
-                    )
+    if st.button(
+        "🔄 Start Fresh — Clear All Uploads & Results",
+        use_container_width=True,
+        key="ieee_reset_btn_start_fresh",
+    ):
+        for k in list(st.session_state.keys()):
+            if k == "ieee_batches" or k.startswith("ieee_batches"):
+                del st.session_state[k]
+            if k.startswith("dbg_ref_"):
+                del st.session_state[k]
+            if k == "ieee_selected_key":
+                del st.session_state[k]
 
-                    metric_rows = [
-                        {"Metric": "Total References", "Value": total_refs_now},
-                        {"Metric": "Total In-text Citation Markers", "Value": stats.get("total", 0)},
-                        {"Metric": "Unique Cited References", "Value": stats.get("unique", 0)},
-                        {"Metric": "Grouped Citation Clusters", "Value": stats.get("clusters", 0)},
-                        {"Metric": "Crowded Clusters (needs collapse)", "Value": stats.get("crowded_clusters", 0)},
-                        {"Metric": "Orphan Citations", "Value": len(result["orphan_citations"])},
-                        {"Metric": "Uncited References", "Value": len(result["uncited_references"])},
-                        {"Metric": "DOI Checked (OpenAlex)", "Value": doi_checked},
-                        {"Metric": "DOI Suspicious (possible fabrication)",
-                         "Value": f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)"},
-                        {"Metric": "% Last 10 Years", "Value": f"{recency.get('recent_percentage', 0):.1f}%"},
-                    ]
-                    metric_df = pd.DataFrame(metric_rows)
-
-                    source_counts = Counter(
-                        (row.get("Source Type") or "Other") for row in reference_rows
-                    )
-                    source_rows = []
-                    total_refs = len(result["references"])
-                    for source_type in CANONICAL_SOURCE_TYPES:
-                        count = source_counts.get(source_type, 0)
-                        pct = count / total_refs * 100 if total_refs else 0
-                        source_rows.append({
-                            "Source Type": source_type,
-                            "Count / Percentage": f"{count} ({pct:.1f}%)",
-                        })
-                    source_df = pd.DataFrame(source_rows)
-
-                    left_col, right_col = st.columns([1, 1], gap="large")
-                    with left_col:
-                        st.dataframe(metric_df, use_container_width=True, hide_index=True)
-                    with right_col:
-                        st.dataframe(source_df, use_container_width=True, hide_index=True)
-
-                    show_reference = st.toggle(
-                        "Show Reference Correction",
-                        value=False,
-                        key="show_ieee_reference_correction_toggle",
-                    )
-                    if show_reference:
-                        reference_display = pd.DataFrame([
-                            {
-                                "No.": row.get("No."),
-                                "Corrected Version (IEEE)": (
-                                    "— WITHHELD (DOI mismatch) —"
-                                    if row.get("DOI Suspicious")
-                                    else row.get("Corrected Version", "")
-                                ),
-                                "Placeholders": ", ".join(
-                                    k for k, v in (row.get("Placeholders") or {}).items() if v
-                                ) or "—",
-                                "DOI Checked": "YES" if row.get("DOI Verified") else "NO",
-                                "DOI Suspicious": "⚠️ YES" if row.get("DOI Suspicious") else "—",
-                                "OpenAlex Title": (row.get("OpenAlex Title") or "")[:60],
-                                "DOI Issues": row.get("DOI Verification Reasons", ""),
-                            }
-                            for row in reference_rows
-                        ])
-                        if not reference_display.empty:
-                            st.dataframe(reference_display, use_container_width=True,
-                                         hide_index=True, height=280)
-                        else:
-                            st.info("No references were available for automated review.")
-
-                    try:
-                        docx_bytes = build_ieee_docx(result)
-                        safe_name = re.sub(r"[^\w\-]+", "_", result.get("filename", "manuscript"))
-                        st.markdown('<div class="apa-green-button-marker"></div>', unsafe_allow_html=True)
-                        st.download_button(
-                            label="Download Diagnostic Report",
-                            data=docx_bytes,
-                            file_name=f"{safe_name}_diagnostic_report.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            use_container_width=True,
-                            key="download_ieee_correction_docx",
-                        )
-                    except Exception as exc:
-                        st.error(f"Could not build DOCX report: {exc}")
+        st.session_state["ieee_batches"] = {}
+        st.session_state["ieee_uploader_version"] = (
+            st.session_state.get("ieee_uploader_version", 0) + 1
+        )
+        st.session_state["ieee_manuscript_year"] = datetime.now().year
+        st.rerun()
