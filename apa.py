@@ -797,7 +797,7 @@ def verify_reference_against_openalex(reference, parsed, api_key):
     if meta.get("_not_found"):
         result["checked"] = True
         result["suspicious"] = True
-        result["reasons"].append("DOI does not resolve.")
+        result["reasons"].append("DOI not found.")
         return result
 
     result["checked"] = True
@@ -2271,7 +2271,7 @@ def render():
 
             overall.progress(
                 base_pct + int(step * 0.35),
-                text=f"[{i}/{n}] Extracting references & verifying DOIs via OpenAlex...",
+                text=f"[{i}/{n}] Extracting references & verifying DOIs...",
             )
             try:
                 process_single_pdf(
