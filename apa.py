@@ -428,47 +428,96 @@ APA_DATE_RE = re.compile(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)", re.I)
 
 
 def parse_reference(reference):
-    result = {"raw": reference, "year": None, "first_author": None,
-              "authors": [], "doi": None, "url": None}
+    result = {
+        "raw": reference,
+        "year": None,
+        "first_author": None,
+        "authors": [],
+        "doi": None,
+        "url": None,
+    }
 
-    year_match = re.search(r"\(((?:19|20)\d{2})[a-z]?\)", reference)
+    # ------------------------------------------------------------
+    # YEAR
+    # ------------------------------------------------------------
+    year_match = re.search(
+        r"\(((?:19|20)\d{2})[a-z]?\)",
+        reference
+    )
+
     if not year_match:
-        year_match = re.search(r"\b((?:19|20)\d{2})\b", reference)
+        year_match = re.search(
+            r"\b((?:19|20)\d{2})\b",
+            reference
+        )
+
     if year_match:
         result["year"] = year_match.group(1)
 
-    author_block = (reference[:year_match.start()].strip()
-                    if year_match else reference[:250])
+    # ------------------------------------------------------------
+    # AUTHORS
+    # ------------------------------------------------------------
+    author_block = (
+        reference[:year_match.start()].strip()
+        if year_match
+        else reference[:250]
+    )
 
     author_matches = re.findall(
-        r"(?:^|,\s*)&?\s*([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+        r"(?:^|,\s*)&?\s*"
+        r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
         r"\s*,\s*(?:[A-Z]\.\s*)+",
         author_block,
     )
+
     if author_matches:
         result["authors"] = author_matches
         result["first_author"] = author_matches[0]
+
     else:
         corporate = author_block.rstrip(" .,")
+
         if corporate:
             result["authors"] = [corporate]
             result["first_author"] = corporate
 
-    url_match = re.search(r"https?://\S+", reference, re.I)
-    if url_match:
-        url = url_match.group(0).rstrip(".,)")
-        if re.match(r"^https?://(?:dx\.)?doi\.org/10\.", url, re.I):
-            m = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", url)
-            if m:
-                result["doi"] = f"https://doi.org/{m.group(0).rstrip('.,;)')}"
-                result["url"] = result["doi"]
-        else:
-            result["url"] = url
+    # ------------------------------------------------------------
+    # DOI
+    #
+    # DOI is detected independently from the surrounding URL.
+    #
+    # Handles:
+    #   10.19109/muaddib.v7i1.24478
+    #   https://doi.org/10.19109/muaddib.v7i1.24478
+    #   https://doi.org/https://doi.org/10.19109/muaddib.v7i1.24478
+    #   doi:10.19109/muaddib.v7i1.24478
+    # ------------------------------------------------------------
+    doi_match = re.search(
+        r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+",
+        reference,
+        re.I,
+    )
+
+    if doi_match:
+        doi_value = doi_match.group(0).rstrip(".,;)")
+        normalized_doi = f"https://doi.org/{doi_value}"
+
+        result["doi"] = normalized_doi
+        result["url"] = normalized_doi
+
     else:
-        dm = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", reference, re.I)
-        if dm:
-            result["doi"] = f"https://doi.org/{dm.group(0).rstrip('.,;)')}"
-            result["url"] = result["doi"]
+        # --------------------------------------------------------
+        # ORDINARY URL
+        # Only used when no DOI exists in the reference.
+        # --------------------------------------------------------
+        url_match = re.search(
+            r"https?://\S+",
+            reference,
+            re.I,
+        )
+
+        if url_match:
+            result["url"] = url_match.group(0).rstrip(".,)")
 
     return result
 
@@ -848,9 +897,32 @@ RULES:
    - DOI: preserve from the ORIGINAL reference as https://doi.org/...
 
 2. If "openalex" is absent, null, or has no title:
-   - Correct the ORIGINAL reference ONLY. Do not invent facts.
-   - If the article/book title in the original is in ALL CAPS, convert
-     it to sentence case.
+
+   BOOK RULE:
+   - If the reference is a Book, format the ORIGINAL reference
+     according to APA 7th edition.
+   - Use ONLY bibliographic information already contained in the
+     ORIGINAL reference.
+   - Correct author formatting, punctuation, spacing, title
+     capitalization, edition placement, publisher formatting,
+     DOI/URL formatting, and APA italics.
+   - Book titles use sentence case.
+   - The complete book title is italicized.
+   - Edition information such as (2nd ed.) or (3rd ed.) is placed
+     immediately after the book title and is NOT italicized.
+   - Publisher names are NOT italicized.
+   - Do NOT invent authors, editors, year, edition, publisher,
+     DOI, URL, ISBN, or any other bibliographic information.
+   - Do NOT search for or infer missing bibliographic information.
+   - If the information supplied in the original reference is
+     sufficient for APA formatting, return "OK" or "REVISED".
+   - Return "MANUAL_CHECK" only when essential information is
+     missing or genuinely ambiguous.
+
+   OTHER SOURCE TYPES:
+   - Correct the ORIGINAL reference only when instructed by the
+     supplied input.
+   - Do not invent missing facts.
 
 3. Non-English titles:
    - You MUST add an English translation in parentheses for any title
@@ -1449,123 +1521,158 @@ def build_apa_report_docx(result):
     else:
         for row in reference_rows:
             not_cited = row["No."] not in cited_ref_nos
+            status = str(row.get("Status", "")).strip().upper()
 
+            # ========================================================
+            # REFERENCE NUMBER
+            # ========================================================
             head = doc.add_paragraph()
-            head.paragraph_format.space_before = Pt(4)
+            head.paragraph_format.space_before = Pt(6)
             head.paragraph_format.space_after = Pt(2)
+
             hrun = head.add_run(f"{row.get('No.', '')}.")
             _set_run_font(hrun, size_pt=11, bold=True)
 
             if not_cited:
                 _add_red_italic_run(head, "  [NOT CITED IN TEXT]")
 
+            # ========================================================
+            # SOURCE TYPE
+            # ========================================================
+            p_type = doc.add_paragraph()
+            p_type.paragraph_format.left_indent = Inches(0.25)
+            p_type.paragraph_format.space_after = Pt(2)
+
+            _add_run(
+                p_type,
+                "Source Type: ",
+                bold=True,
+                size_pt=11
+            )
+
+            _add_run(
+                p_type,
+                row.get("Source Type", "Other"),
+                size_pt=11
+            )
+
+            # ========================================================
+            # ORIGINAL
+            # ========================================================
             p_orig = doc.add_paragraph()
-            p_orig.paragraph_format.space_after = Pt(2)
             p_orig.paragraph_format.left_indent = Inches(0.25)
+            p_orig.paragraph_format.space_after = Pt(2)
             p_orig.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            _add_run(p_orig, "Original:  ", bold=True, size_pt=11)
+
+            _add_run(
+                p_orig,
+                "Original: ",
+                bold=True,
+                size_pt=11
+            )
 
             original = row.get("Original Reference", "")
-            if row.get("DOI Suspicious") != "—" or not_cited:
-                _add_run(p_orig, original, size_pt=11, red=True)
-            else:
-                _add_run(p_orig, original, size_pt=11)
 
-            if row.get("Status") == "WITHHELD":
-                withheld = doc.add_paragraph()
-                withheld.paragraph_format.left_indent = Inches(0.25)
-                withheld.paragraph_format.space_after = Pt(6)
-                _add_run(
-                    withheld,
-                    row.get("Explanation") or "Automated correction withheld.",
-                    size_pt=10, italic=True, bold=True, red=True,
-                )
-            elif row.get("DOI Suspicious") != "—":
-                withheld = doc.add_paragraph()
-                withheld.paragraph_format.left_indent = Inches(0.25)
-                withheld.paragraph_format.space_after = Pt(6)
-                withheld.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                _add_run(
-                    withheld,
-                    "Corrected version withheld — the DOI in this reference "
-                    "does not match the claimed title/authors. Manual "
-                    "verification required.",
-                    size_pt=10, italic=True, bold=True, red=True,
-                )
-            else:
-                p_corr = doc.add_paragraph()
-                p_corr.paragraph_format.space_after = Pt(2)
-                p_corr.paragraph_format.left_indent = Inches(0.25)
-                p_corr.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
+            _add_run(
+                p_orig,
+                original,
+                size_pt=11,
+                red=(status == "WITHHELD")
+            )
 
-                corrected = row.get("Corrected Version", "")
-                italic_elements = row.get("Italicized in APA", "")
-                tokens = [
-                    t.strip()
-                    for t in (italic_elements or "").split(",")
-                    if t.strip()
-                ]
-                _emit_with_italic_tokens(
-                    p_corr, corrected, tokens, size_pt=11
-                )
+            # ========================================================
+            # CORRECTED
+            # Completely SKIP when status is WITHHELD
+            # ========================================================
+            if status != "WITHHELD":
 
-                if row.get("Source") == "OpenAlex":
-                    src_p = doc.add_paragraph()
-                    src_p.paragraph_format.left_indent = Inches(0.25)
+                corrected = row.get("Corrected Version", "").strip()
+
+                if corrected:
+                    p_corr = doc.add_paragraph()
+                    p_corr.paragraph_format.left_indent = Inches(0.25)
+                    p_corr.paragraph_format.space_after = Pt(2)
+                    p_corr.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
                     _add_run(
-                        src_p,
-                        "Reconstructed from OpenAlex DOI metadata.",
-                        size_pt=10, italic=True,
+                        p_corr,
+                        "Corrected: ",
+                        bold=True,
+                        size_pt=11
                     )
 
-            if row.get("DOI Suspicious") != "—":
-                warn = doc.add_paragraph()
-                warn.paragraph_format.left_indent = Inches(0.25)
-                warn.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                _add_run(
-                    warn,
-                    f"⚠ Possible fabricated reference: "
-                    f"{row.get('DOI Issues', '')}",
-                    size_pt=10, italic=True, bold=True, red=True,
-                )
-                oa_title = row.get("OpenAlex Title", "")
-                if oa_title:
-                    _add_run(
-                        warn,
-                        f'\n   OpenAlex says: "{oa_title}"',
-                        size_pt=10, italic=True,
+                    italic_elements = row.get("Italicized in APA", "")
+
+                    tokens = [
+                        t.strip()
+                        for t in (italic_elements or "").split(",")
+                        if t.strip()
+                    ]
+
+                    _emit_with_italic_tokens(
+                        p_corr,
+                        corrected,
+                        tokens,
+                        size_pt=11
                     )
 
-            # Source-type-specific APA requirements
-            req_p = doc.add_paragraph()
-            req_p.paragraph_format.left_indent = Inches(0.25)
-            _add_run(req_p, f"Source Type: {row.get('Source Type', 'Other')}", size_pt=10, bold=True)
+            # ========================================================
+            # COMMENT
+            # ========================================================
+            p_comment = doc.add_paragraph()
+            p_comment.paragraph_format.left_indent = Inches(0.25)
+            p_comment.paragraph_format.space_after = Pt(2)
 
-            req2 = doc.add_paragraph()
-            req2.paragraph_format.left_indent = Inches(0.25)
-            _add_run(req2, "Mandatory Elements: ", size_pt=10, bold=True)
-            _add_run(req2, "; ".join(row.get("Required Elements", [])), size_pt=10)
+            _add_run(
+                p_comment,
+                "Comment: ",
+                bold=True,
+                size_pt=11
+            )
 
-            missing = row.get("Missing Required Elements", [])
-            miss_p = doc.add_paragraph()
-            miss_p.paragraph_format.left_indent = Inches(0.25)
-            if missing:
-                _add_run(miss_p, "Missing Mandatory Elements: ", size_pt=10, bold=True, red=True)
-                _add_run(miss_p, "; ".join(missing), size_pt=10, red=True)
-            else:
-                _add_run(miss_p, "Missing Mandatory Elements: None detected", size_pt=10)
+            comment = str(row.get("Explanation", "")).strip()
 
-            if row.get("Status") == "WITHHELD" and row.get("Explanation"):
-                note_p = doc.add_paragraph()
-                note_p.paragraph_format.left_indent = Inches(0.25)
-                _add_run(note_p, row.get("Explanation"), size_pt=10, italic=True, red=True)
+            if not comment:
+                if status == "OK":
+                    comment = "Reference is consistent with APA 7."
+                elif status == "REVISED":
+                    comment = "Reference was revised according to APA 7."
+                elif status == "WITHHELD":
+                    comment = "Automated correction was withheld."
+                elif status == "MANUAL_CHECK":
+                    comment = "Manual verification is recommended."
+                else:
+                    comment = "No additional comment."
 
-            status = row.get("Status", "")
-            if status and status != "OK":
-                sp = doc.add_paragraph()
-                sp.paragraph_format.left_indent = Inches(0.25)
-                _add_run(sp, f"Status: {status}", size_pt=10, italic=True)
+            _add_run(
+                p_comment,
+                comment,
+                size_pt=10,
+                italic=True,
+                red=(status == "WITHHELD")
+            )
+
+            # ========================================================
+            # STATUS
+            # ========================================================
+            p_status = doc.add_paragraph()
+            p_status.paragraph_format.left_indent = Inches(0.25)
+            p_status.paragraph_format.space_after = Pt(4)
+
+            _add_run(
+                p_status,
+                "Status: ",
+                bold=True,
+                size_pt=11
+            )
+
+            _add_run(
+                p_status,
+                status or "MANUAL_CHECK",
+                size_pt=11,
+                bold=True,
+                red=(status in {"WITHHELD", "MANUAL_CHECK"})
+            )
 
             _add_divider(doc)
 
@@ -1620,6 +1727,15 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
     for i, (ref, parsed, source_type, v) in enumerate(
         zip(reference_list, parsed_refs, local_source_types, verification_rows), start=1
     ):
+
+        if source_type == "Book":
+            review_payload.append({
+                "number": i,
+                "reference": ref,
+                "openalex": None,
+            })
+            continue
+
         if source_type == "Journal Article":
             if not parsed.get("doi"):
                 preclassified_results[i] = {
