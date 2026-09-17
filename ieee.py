@@ -279,7 +279,6 @@ def _heading_matches_reference_vocab(line):
     stripped = line.strip()
     if not stripped:
         return False
-    # Reject table rows: multiple wide gaps or tabs
     if "\t" in stripped or re.search(r"\s{3,}\S+\s{3,}\S+\s{3,}", stripped):
         return False
     if len(stripped) > 60:
@@ -308,11 +307,6 @@ def is_post_reference_heading(line):
 
 
 def find_reference_section(text):
-    """
-    Bottom-up detection: find the LAST [n] marker, then walk UP until
-    a reference-vocabulary heading is found. This avoids table headers
-    like 'Reference' inside body sections.
-    """
     lines = text.splitlines()
 
     marker_re = re.compile(r"^\s*\[?\s*(\d{1,3})\s*\]")
@@ -390,7 +384,6 @@ def _find_reference_section_topdown(text):
 # IEEE REFERENCE SPLITTING — bottom-up anchor
 # =========================================================
 
-# Matches [12], 12], [12, or ]12] at a token boundary
 _MARKER_TOKEN_RE = re.compile(
     r"(?:(?<=\s)|^)"
     r"\[?\s*(\d{1,3})\s*\]"
@@ -423,14 +416,6 @@ def _looks_like_reference_start(text_after_marker):
 
 
 def split_references(reference_text):
-    """
-    Bottom-up IEEE reference splitter:
-      1. Flatten (remove page breaks, normalize whitespace).
-      2. Find every [n] / n] token.
-      3. Keep the longest strictly-increasing run.
-      4. Cut references between consecutive markers.
-      5. Discard prefix before the first marker.
-    """
     if not reference_text:
         return []
 
@@ -441,7 +426,6 @@ def split_references(reference_text):
     text = text.replace("\u00ad", "")
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Repair common PDF extraction artifacts where the '[' was lost
     text = re.sub(r"([a-z])(\d{1,3})\]\s", r"\1 [\2] ", text)
 
     all_hits = _find_all_markers(text)
@@ -1362,7 +1346,6 @@ def build_local_ieee_reference_correction(reference):
         missing_no = not original_parsed["issue"]
         missing_pp = not original_parsed["pages"]
 
-        # Strip old placeholder artifacts so we don't stack them
         ref = re.sub(r",?\s*vol\.\s*\?{3}", "", ref)
         ref = re.sub(r",?\s*no\.\s*\?{3}", "", ref)
         ref = re.sub(r",?\s*pp\.\s*\?{3}-\?{3}", "", ref)
@@ -1373,7 +1356,6 @@ def build_local_ieee_reference_correction(reference):
 
         parsed_now = parse_ieee_reference(ref)
 
-        # Find the trailing year (with optional month) to anchor the tail
         year_tail_match = re.search(
             r"(,\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s*)?((?:19|20)\d{2})",
             ref,
@@ -1383,7 +1365,6 @@ def build_local_ieee_reference_correction(reference):
             head = ref[:tail_start].rstrip(", ")
             tail = ref[tail_start:]
 
-            # Strip existing vol/no/pp from head — we rebuild in order
             head = re.sub(r",?\s*vol\.\s*[\w\-?]+", "", head)
             head = re.sub(r",?\s*no\.\s*[\w\-?]+", "", head)
             head = re.sub(r",?\s*pp?\.\s*[\w\-–—?]+(?:\s*[-–—]\s*[\w\-–—?]+)?", "", head)
@@ -1424,7 +1405,6 @@ def build_local_ieee_reference_correction(reference):
 
             ref = head + (", " + ", ".join(pieces) if pieces else "") + tail
         else:
-            # No year found — fall back to appending placeholders at the end
             if missing_vol and "vol." not in ref.lower():
                 ref = ref.rstrip(".").rstrip(", ") + ", vol. ???"
                 placeholder_flags["missing_vol"] = True
@@ -1455,7 +1435,6 @@ def build_local_ieee_reference_correction(reference):
     ref = re.sub(r"\s+\.", ".", ref)
     ref = re.sub(r"\.\.+$", ".", ref)
 
-    # Ensure placeholder tokens are followed by a comma when more text follows
     ref = re.sub(
         r"(\b(?:vol|no)\.\s*\?{3})(?!\s*[,.])(\s+)(?!\d)",
         r"\1, \2",
@@ -1714,7 +1693,6 @@ def _fallback_ieee_italic_elements(source_type, parsed):
 # =========================================================
 
 def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
-    # ---- Stage A: local extraction ----
     uploaded_file.seek(0)
     full_text, pages, removed_running_text = extract_pdf_text(uploaded_file)
     uploaded_file.seek(0)
@@ -1733,18 +1711,15 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
     for c in citations:
         c["page"] = _page_for_offset(full_text, c.get("offset"))
 
-    # ---- Stage B: DOI verification via OpenAlex ----
     verification_rows = []
     for ref, parsed in zip(references, parsed_refs):
         v = verify_reference_against_openalex(ref, parsed)
         verification_rows.append(v)
 
-    # ---- Stage C: pre-classification ----
     review_payload, preclassified = preclassify_ieee_references(
         references, verification_rows, local_source_types
     )
 
-    # ---- Stage D: AI review of eligible references only ----
     ref_ai = review_ieee_references_with_ai(
         [x["reference"] for x in review_payload]
     ) if review_payload else []
@@ -1755,7 +1730,6 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
     }
     by_no.update(preclassified)
 
-    # ---- Stage E: build reference rows ----
     rows = []
     for i, original in enumerate(references, start=1):
         ai = by_no.get(i, {})
@@ -1821,7 +1795,6 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
             "Placeholders": local.get("Placeholders", {}),
         })
 
-    # ---- Stage F: AI citation cluster review ----
     cit_ai = review_ieee_citations_with_ai(clusters, rows) if clusters else []
     cit_by_no = {
         int(x.get("number", -1)): x for x in (cit_ai or [])
@@ -1843,7 +1816,6 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
             "Reason": " | ".join(reasons) or ai.get("explanation", ""),
         })
 
-    # ---- Stage G: attach everything to batch ----
     citation_stats = calculate_citation_statistics(citations, clusters)
     matching = match_citations_to_references(citations, parsed_refs)
     orphan = find_orphan_citations(citations, parsed_refs)
@@ -1899,15 +1871,25 @@ def _add_run(paragraph, text, size_pt=11, bold=False, italic=False, red=False):
 
 
 def _docx_set_default_font(document, font_name="Times New Roman", size_pt=11):
+    """Set the Normal style with zero default paragraph spacing so our
+    explicit Pt() values are the ONLY source of vertical rhythm."""
     style = document.styles["Normal"]
     style.font.name = font_name
     style.font.size = Pt(size_pt)
+    pf = style.paragraph_format
+    pf.space_after = Pt(0)
+    pf.space_before = Pt(0)
+    pf.line_spacing = 1.15
 
 
 def _add_divider(doc):
+    """Thin grey horizontal rule with controlled spacing. Used between
+    citation/reference entries to visually separate them without adding
+    excessive whitespace."""
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(2)
     p.paragraph_format.space_after = Pt(6)
+    p.paragraph_format.line_spacing = 1.0
     pPr = p._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
     bottom = OxmlElement("w:bottom")
@@ -1956,9 +1938,66 @@ def _emit_with_placeholders(paragraph, text, italic=False, size_pt=11):
         _add_run(paragraph, text[pos:], size_pt=size_pt, italic=italic)
 
 
-def _add_ieee_reference_with_italics(paragraph, text, italic_elements, size_pt=11):
+def _highlight_missing_tokens_in_corrected(paragraph, text, missing_tokens, size_pt=11):
+    """
+    Render `text` such that:
+      - Placeholder tokens (vol. ???, no. ???, pp. ???-???, doi: ???, pp. N-???)
+        are red bold italic.
+      - Tokens from `missing_tokens` (e.g. "pp.", "vol.", "no.", "doi") are also
+        red bold italic wherever they appear as isolated IEEE markers.
+      - Everything else is normal weight.
+    """
+    parts = []
+    parts.append(
+        r"(?P<ph>"
+        r"author \?{3}"
+        r"|author \d+(?:, author \d+)+"
+        r"|vol\. \?{3}"
+        r"|no\. \?{3}"
+        r"|pp\. \d+-\?{3}"
+        r"|pp\. \?{3}-\?{3}"
+        r"|doi: \?{3}"
+        r")"
+    )
+    if missing_tokens:
+        escaped = sorted({re.escape(t) for t in missing_tokens if t}, key=len, reverse=True)
+        if escaped:
+            parts.append(r"(?P<miss>\b(?:" + "|".join(escaped) + r")\b)")
+
+    if not parts:
+        _add_run(paragraph, text, size_pt=size_pt)
+        return
+
+    pattern = re.compile("|".join(parts), re.I)
+    pos = 0
+    for m in pattern.finditer(text):
+        if m.start() > pos:
+            _add_run(paragraph, text[pos:m.start()], size_pt=size_pt)
+
+        matched = m.group(0)
+        if m.lastgroup == "ph":
+            page_partial = _PAGE_PARTIAL_RE.match(matched)
+            if page_partial:
+                known = page_partial.group(1)
+                prefix = matched[: matched.index(known)]
+                _add_run(paragraph, prefix, size_pt=size_pt, italic=True, bold=True, red=True)
+                _add_run(paragraph, f"{known}-???", size_pt=size_pt,
+                         italic=True, bold=True, red=True)
+            else:
+                _add_run(paragraph, matched, size_pt=size_pt,
+                         italic=True, bold=True, red=True)
+        else:
+            _add_run(paragraph, matched, size_pt=size_pt,
+                     italic=True, bold=True, red=True)
+
+        pos = m.end()
+    if pos < len(text):
+        _add_run(paragraph, text[pos:], size_pt=size_pt)
+
+
+def _add_ieee_reference_with_italics(paragraph, text, italic_elements, missing_tokens=None, size_pt=11):
     """Emit corrected reference; italicize venue/title tokens; skip DOI spans;
-    highlight placeholders in red bold italic."""
+    highlight placeholders AND missing marker tokens in red bold italic."""
     doi_spans = []
     for m in re.finditer(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text):
         doi_spans.append((m.start(), m.end()))
@@ -1966,16 +2005,19 @@ def _add_ieee_reference_with_italics(paragraph, text, italic_elements, size_pt=1
     def _in_doi(pos):
         return any(s <= pos < e for s, e in doi_spans)
 
+    if missing_tokens is None:
+        missing_tokens = []
+
     tokens = [t.strip() for t in (italic_elements or "").split(",") if t.strip()]
     if not tokens:
-        _emit_with_placeholders(paragraph, text, italic=False, size_pt=size_pt)
+        _highlight_missing_tokens_in_corrected(paragraph, text, missing_tokens, size_pt=size_pt)
         return
 
     flat = [_esc(t) for t in tokens]
     pattern_str = "|".join(sorted(flat, key=len, reverse=True))
     pattern = _safe_compile(pattern_str, re.I)
     if pattern is None:
-        _emit_with_placeholders(paragraph, text, italic=False, size_pt=size_pt)
+        _highlight_missing_tokens_in_corrected(paragraph, text, missing_tokens, size_pt=size_pt)
         return
 
     pos = 0
@@ -1983,15 +2025,20 @@ def _add_ieee_reference_with_italics(paragraph, text, italic_elements, size_pt=1
         if _in_doi(m.start()):
             continue
         if m.start() > pos:
-            _emit_with_placeholders(paragraph, text[pos:m.start()],
-                                    italic=False, size_pt=size_pt)
-        _emit_with_placeholders(paragraph, m.group(0),
-                                italic=True, size_pt=size_pt)
+            _highlight_missing_tokens_in_corrected(
+                paragraph, text[pos:m.start()], missing_tokens, size_pt=size_pt
+            )
+        # Italic span — render with italic on the whole span, but still
+        # highlight missing tokens inside it.
+        _highlight_missing_tokens_in_corrected(
+            paragraph, m.group(0), missing_tokens, size_pt=size_pt
+        )
         pos = m.end()
 
     if pos < len(text):
-        _emit_with_placeholders(paragraph, text[pos:],
-                                italic=False, size_pt=size_pt)
+        _highlight_missing_tokens_in_corrected(
+            paragraph, text[pos:], missing_tokens, size_pt=size_pt
+        )
 
 
 def _ref_is_withheld(row):
@@ -2176,16 +2223,10 @@ def build_ieee_docx(result):
             has_orphan = any(n not in ref_numbers for n in numbers)
             is_revised = row.get("Status") == "REVISED"
 
-            # Blank spacer paragraph before each citation block
-            if i > 1:
-                spacer = doc.add_paragraph()
-                spacer.paragraph_format.space_before = Pt(0)
-                spacer.paragraph_format.space_after = Pt(0)
-                _set_run_font(spacer.add_run(""), size_pt=6)
-
+            # Compact header — no extra spacers; the divider below does the separating.
             head = doc.add_paragraph()
-            head.paragraph_format.space_before = Pt(6)
-            head.paragraph_format.space_after = Pt(2)
+            head.paragraph_format.space_before = Pt(4)
+            head.paragraph_format.space_after = Pt(1)
 
             hrun = head.add_run(f"{i}. ")
             _set_run_font(hrun, size_pt=11, bold=True)
@@ -2203,7 +2244,7 @@ def build_ieee_docx(result):
 
             p_orig = doc.add_paragraph()
             p_orig.paragraph_format.left_indent = Inches(0.25)
-            p_orig.paragraph_format.space_after = Pt(2)
+            p_orig.paragraph_format.space_after = Pt(1)
             _add_run(p_orig, "Original:  ", bold=True, size_pt=11)
             if is_revised or has_orphan:
                 _add_run(p_orig, row.get("Original Form", ""),
@@ -2213,7 +2254,7 @@ def build_ieee_docx(result):
 
             p_corr = doc.add_paragraph()
             p_corr.paragraph_format.left_indent = Inches(0.25)
-            p_corr.paragraph_format.space_after = Pt(2)
+            p_corr.paragraph_format.space_after = Pt(1)
             _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
             _add_run(p_corr, row.get("Corrected Form", ""), size_pt=11)
 
@@ -2229,19 +2270,12 @@ def build_ieee_docx(result):
 
             np = doc.add_paragraph()
             np.paragraph_format.left_indent = Inches(0.25)
-            np.paragraph_format.space_after = Pt(4)
+            np.paragraph_format.space_after = Pt(2)
+            np.paragraph_format.line_spacing = 1.0
             _add_run(np, f"Note: {note_text}", size_pt=10, italic=True,
                      red=(is_revised or has_orphan))
 
-            # Extra vertical breathing room before the divider
-            spacer2 = doc.add_paragraph()
-            spacer2.paragraph_format.space_before = Pt(0)
-            spacer2.paragraph_format.space_after = Pt(0)
-            _set_run_font(spacer2.add_run(""), size_pt=4)
-
             _add_divider(doc)
-
-    doc.add_page_break()
 
     # ========================================================
     # 3. REFERENCE LIST (IEEE STYLE)
@@ -2271,7 +2305,7 @@ def build_ieee_docx(result):
             has_placeholder = _ref_has_placeholder(row)
 
             head = doc.add_paragraph()
-            head.paragraph_format.space_before = Pt(8)
+            head.paragraph_format.space_before = Pt(6)
             head.paragraph_format.space_after = Pt(2)
 
             hrun = head.add_run(f"{ref_no}.")
@@ -2314,9 +2348,27 @@ def build_ieee_docx(result):
                     p_corr.paragraph_format.space_after = Pt(2)
                     p_corr.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
                     _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
+
                     italic_elements = row.get("Italicized in IEEE", "")
+
+                    missing = row.get("Missing Required Elements", "")
+                    missing_tokens = [m.strip() for m in missing.split(",") if m.strip()]
+                    norm_missing = set()
+                    for tok in missing_tokens:
+                        t = tok.lower().strip().rstrip(".")
+                        if t in {"vol", "volume"}:
+                            norm_missing.add("vol.")
+                        elif t in {"no", "issue", "number"}:
+                            norm_missing.add("no.")
+                        elif t in {"pp", "pages", "page"}:
+                            norm_missing.add("pp.")
+                        elif t in {"doi", "url", "doi / url"}:
+                            norm_missing.add("doi")
+                            norm_missing.add("url")
+
                     _add_ieee_reference_with_italics(
-                        p_corr, corrected, italic_elements, size_pt=11
+                        p_corr, corrected, italic_elements,
+                        missing_tokens=sorted(norm_missing), size_pt=11
                     )
 
             p_comment = doc.add_paragraph()
@@ -2372,7 +2424,7 @@ def build_ieee_docx(result):
 
             p_status = doc.add_paragraph()
             p_status.paragraph_format.left_indent = Inches(0.25)
-            p_status.paragraph_format.space_after = Pt(6)
+            p_status.paragraph_format.space_after = Pt(4)
             _add_run(p_status, "Status: ", bold=True, size_pt=11)
 
             status = str(row.get("Status", "MANUAL CHECK")).upper().strip()
@@ -2383,40 +2435,6 @@ def build_ieee_docx(result):
             _add_run(p_status, status, size_pt=11, bold=True, red=status_red)
 
             _add_divider(doc)
-
-    # ========================================================
-    # 4. CROSS-LINK DISCREPANCIES
-    # ========================================================
-    doc.add_page_break()
-    h4 = doc.add_heading(level=1)
-    hr4 = h4.add_run("4. Cross-link Discrepancies")
-    _set_run_font(hr4, size_pt=14, bold=True)
-
-    if orphan:
-        sub = doc.add_heading(level=2)
-        sr2 = sub.add_run("Citations Missing from References")
-        _set_run_font(sr2, size_pt=12, bold=True)
-        for o in orphan:
-            p = doc.add_paragraph()
-            p.paragraph_format.left_indent = Inches(0.25)
-            _add_run(p, f"{o.get('Citation','')}  ", size_pt=11, red=True)
-            _add_run(p, f"— {o.get('Problem','')}", size_pt=10, italic=True, red=True)
-
-    if uncited:
-        sub = doc.add_heading(level=2)
-        sr3 = sub.add_run("References Missing from Citations")
-        _set_run_font(sr3, size_pt=12, bold=True)
-        for u in uncited:
-            p = doc.add_paragraph()
-            p.paragraph_format.left_indent = Inches(0.25)
-            _add_run(p, f"[{u.get('Reference #')}] {u.get('Reference','')}  ",
-                     size_pt=11, red=True)
-            _add_run(p, f"— {u.get('Problem','')}", size_pt=10, italic=True, red=True)
-
-    if not orphan and not uncited:
-        p = doc.add_paragraph()
-        _set_run_font(p.add_run("No cross-link discrepancies detected."),
-                      italic=True)
 
     # ---- Save ----
     bio = io.BytesIO()
@@ -2543,12 +2561,11 @@ def render():
     total_refs_now = len(batch.get("references", []))
 
     # ========================================================
-    # BUTTON STYLING — matches APA
+    # BUTTON STYLING — green download, red reset
     # ========================================================
     st.markdown(
         """
         <style>
-        /* Green download button */
         div[class*="st-key-ieee_download_btn"] button {
             background-color: #16a34a !important;
             color: #ffffff !important;
@@ -2564,8 +2581,6 @@ def render():
         div[class*="st-key-ieee_download_btn"] button:focus {
             box-shadow: 0 0 0 0.2rem rgba(22, 163, 74, 0.4) !important;
         }
-
-        /* Red reset button */
         div[class*="st-key-ieee_reset_btn"] button {
             background-color: #dc2626 !important;
             color: #ffffff !important;
@@ -2580,23 +2595,6 @@ def render():
         }
         div[class*="st-key-ieee_reset_btn"] button:focus {
             box-shadow: 0 0 0 0.2rem rgba(220, 38, 38, 0.4) !important;
-        }
-
-        /* Blue secondary button ("Need Extra Review") */
-        div[class*="st-key-ieee_extra_review"] button {
-            background-color: #2563eb !important;
-            color: #ffffff !important;
-            border: 1px solid #1d4ed8 !important;
-            font-weight: 600 !important;
-            transition: background-color 0.15s ease;
-        }
-        div[class*="st-key-ieee_extra_review"] button:hover {
-            background-color: #1d4ed8 !important;
-            color: #ffffff !important;
-            border-color: #1e40af !important;
-        }
-        div[class*="st-key-ieee_extra_review"] button:focus {
-            box-shadow: 0 0 0 0.2rem rgba(37, 99, 235, 0.4) !important;
         }
         </style>
         """,
@@ -2667,44 +2665,6 @@ def render():
         st.dataframe(metric_df, use_container_width=True, hide_index=True)
     with right_col:
         st.dataframe(source_df, use_container_width=True, hide_index=True)
-
-    # ========================================================
-    # EXTRA REVIEW (blue) — only if withheld/suspicious exist
-    # ========================================================
-    problematic_count = withheld_count + doi_suspicious
-    if problematic_count > 0:
-        with st.container(key="ieee_extra_review"):
-            if st.button(
-                f"🔍 Need Extra Review ({problematic_count} problematic references)",
-                use_container_width=True,
-                key="ieee_extra_review_btn",
-            ):
-                st.session_state["ieee_show_extra"] = not st.session_state.get("ieee_show_extra", False)
-
-        if st.session_state.get("ieee_show_extra", False):
-            flagged_rows = [
-                {
-                    "No.": r.get("No."),
-                    "Source Type": r.get("Source Type"),
-                    "Status": r.get("Status"),
-                    "Original Reference": r.get("Original Reference", ""),
-                    "Comment": (
-                        r.get("DOI Verification Reasons")
-                        or r.get("AI Explanation")
-                        or r.get("Correction Note")
-                        or ""
-                    ),
-                }
-                for r in reference_rows
-                if _ref_is_withheld(r) or _ref_is_suspicious(r) or _ref_is_manual(r)
-            ]
-            if flagged_rows:
-                st.dataframe(
-                    pd.DataFrame(flagged_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                    height=min(320, 38 * (len(flagged_rows) + 1)),
-                )
 
     # ========================================================
     # DOWNLOAD (green)
