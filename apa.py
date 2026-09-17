@@ -1144,59 +1144,153 @@ def _citation_note_after_enforcement(original, revised, citation_type, ai_note="
 
 def _reference_name_candidates(reference, year):
     """
-    Return ALL plausible citation surnames from the author block of a
-    reference, in order. Handles:
-      * APA form: "Surname1, X., & Surname2, Y."
-      * Indonesian join: "Surname1, X. dan Surname2, Y."
-      * English join:   "Surname1, X. and Surname2, Y."
-      * Bare commas:    "Surname1, X., Surname2, Y."
-      * Missing separator: "Surname1, X. Surname2, Y."
-      * Malformed full names: "Ana Ittihada" -> "Ittihada"
+    Extract ALL citation surnames from the reference author block.
+
+    Examples:
+      Fathoni, I., & Asfiah, N.        -> ["Fathoni", "Asfiah"]
+      Anggraeni, I., & Oktaviani, S.   -> ["Anggraeni", "Oktaviani"]
+      Aji Sofanudin dan Wahab          -> ["Sofanudin", "Wahab"]
+      Ana Ittihada                     -> ["Ittihada"]
+      Darius Ru'ung                    -> ["Ru'ung"]
     """
+
     if not year:
         return []
-    m = re.search(rf"\({re.escape(str(year))}[a-z]?\)", reference, re.I)
-    block = reference[:m.start()].strip(" .") if m else ""
+
+    # --------------------------------------------------------
+    # Get author block before publication year
+    # --------------------------------------------------------
+    m = re.search(
+        rf"\({re.escape(str(year))}[a-z]?\)",
+        reference,
+        re.I
+    )
+
+    if not m:
+        return []
+
+    block = reference[:m.start()].strip()
+
     if not block:
         return []
 
-    # Normalize Indonesian "dan" to "&" before extraction.
-    normalized = re.sub(r"\s+dan\s+", " & ", block, flags=re.I)
+    # Indonesian conjunction -> common internal separator
+    normalized = re.sub(
+        r"\s+(?:dan|and)\s+",
+        " & ",
+        block,
+        flags=re.I
+    )
 
-    # 1) Strict APA form: Surname, Initials (joined by & or ,)
+    # --------------------------------------------------------
+    # APA-style authors:
+    # Fathoni, I., & Asfiah, N.
+    # Miles, M. B., Huberman, A. M., & Saldaña, J.
+    # --------------------------------------------------------
     apa_names = re.findall(
-        r"(?:^|[,&]\s*)([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z]\.\s*)+",
+        r"(?:^|,\s*|&\s*)"
+        r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+        r"\s*,\s*"
+        r"(?:[A-Z]\.(?:\s*[A-Z]\.)*)",
         normalized,
     )
-    if apa_names:
-        return apa_names
 
-    # 2) Comma-anywhere: match every "Surname, Initials" chunk
-    #    regardless of what separates them.
-    comma_names = re.findall(
-        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z]\.\s*)+",
-        normalized,
-    )
-    if comma_names:
+    # Remove duplicates while preserving order
+    apa_unique = []
+    seen = set()
+
+    for name in apa_names:
+        key = name.casefold()
+
+        if key not in seen:
+            seen.add(key)
+            apa_unique.append(name)
+
+    # If APA extraction clearly recovered multiple authors,
+    # trust it.
+    if len(apa_unique) >= 2:
+        return apa_unique
+
+    # --------------------------------------------------------
+    # Explicit conjunction fallback
+    #
+    # Handles:
+    # Aji Sofanudin dan Wahab
+    # Fathoni, I., & Asfiah, N.
+    # --------------------------------------------------------
+    if re.search(r"\s*&\s*", normalized):
+
+        people = re.split(r"\s*&\s*", normalized)
+
+        conjunction_names = []
+
+        for person in people:
+            part = person.strip(" ,.")
+
+            if not part:
+                continue
+
+            # APA inverted personal name:
+            # Fathoni, I.
+            comma_match = re.match(
+                r"^([A-ZÀ-ÖØ-Ý]"
+                r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,",
+                part,
+            )
+
+            if comma_match:
+                conjunction_names.append(
+                    comma_match.group(1)
+                )
+                continue
+
+            # Non-inverted personal name:
+            # Aji Sofanudin -> Sofanudin
+            tokens = re.findall(
+                r"[A-ZÀ-ÖØ-Ý]"
+                r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+",
+                part,
+            )
+
+            if tokens:
+                conjunction_names.append(tokens[-1])
+
+        # Deduplicate
+        result = []
         seen = set()
-        unique = []
-        for n in comma_names:
-            if n not in seen:
-                seen.add(n)
-                unique.append(n)
-        return unique
 
-    # 3) Last resort: split on conjunctions and take the leading token
-    people = re.split(r"\s+(?:dan|and|&)\s+", normalized, flags=re.I)
-    out = []
-    for person in people:
-        part = person.strip(" ,")
-        if not part:
-            continue
-        m2 = re.match(r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)", part)
-        if m2:
-            out.append(m2.group(1))
-    return out
+        for name in conjunction_names:
+            key = name.casefold()
+
+            if key not in seen:
+                seen.add(key)
+                result.append(name)
+
+        if result:
+            return result
+
+    # --------------------------------------------------------
+    # One APA-style author
+    # --------------------------------------------------------
+    if apa_unique:
+        return apa_unique
+
+    # --------------------------------------------------------
+    # Single non-inverted personal name
+    #
+    # Ana Ittihada -> Ittihada
+    # Darius Ru'ung -> Ru'ung
+    # --------------------------------------------------------
+    tokens = re.findall(
+        r"[A-ZÀ-ÖØ-Ý]"
+        r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+",
+        normalized,
+    )
+
+    if tokens:
+        return [tokens[-1]]
+
+    return []
 
 
 def _deterministic_citation_from_reference(citation, reference_rows):
@@ -2364,7 +2458,6 @@ def render():
 
         overall.progress(100, text="All manuscripts processed.")
         overall.empty()
-        st.success(f"Processed {n} manuscript{'s' if n != 1 else ''}.")
 
     any_done = any(
         b.get("ai_done") for b in st.session_state["pdf_batches"].values()
