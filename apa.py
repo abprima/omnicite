@@ -479,18 +479,38 @@ def extract_reference_year(reference):
 
 
 def detect_apa_source_type(reference):
+    """Conservative local source-type detection used BEFORE any AI call."""
     low = reference.lower()
-    if re.search(
-        r"\.\s*[^.]+?,\s*\d+\s*(?:\([^)]+\))?\s*,\s*\d+(?:\s*[–-]\s*\d+)?",
-        reference,
-    ):
-        return "Journal Article"
-    if re.search(r"\(eds?\.\)", reference, re.I):
+
+    # Explicit chapter/editor signals first.
+    if re.search(r"\b(in\s+.+?\(eds?\.\)|book chapter|chapter)\b", low):
         return "Book Chapter"
     if re.search(r"\b(proceedings|conference|symposium)\b", low):
         return "Conference Proceeding"
-    if re.search(r"\b(report|working paper)\b", low):
+    if re.search(r"\b(report|working paper|technical report)\b", low):
         return "Report"
+
+    # Journal names are common in Indonesian manuscripts and many malformed
+    # journal references do not satisfy a strict volume/pages regex.
+    journal_word = bool(re.search(
+        r"\b(journal|jurnal|review|quarterly|bulletin|transactions|letters|"
+        r"perspectives in education|education journal)\b", low
+    ))
+    journal_biblio = bool(re.search(
+        r"\.\s*[^.]{2,120}?,\s*\d+\s*(?:\([^)]+\))?"
+        r"(?:\s*,\s*\d+(?:\s*[–-]\s*\d+)?)?", reference
+    ))
+    if journal_word or journal_biblio:
+        return "Journal Article"
+
+    # Books: edition/publisher cues. URL alone must not turn a book into webpage.
+    if re.search(r"\(\d+(?:st|nd|rd|th)\s+ed\.\)", reference, re.I):
+        return "Book"
+    if re.search(r"\b(SAGE Publications|Penguin Books|Yale University Press|"
+                 r"Routledge|Springer|Wiley|Elsevier|Oxford University Press|"
+                 r"Cambridge University Press|LKiS)\b", reference, re.I):
+        return "Book"
+
     if re.search(r"https?://", reference) and "doi.org" not in low:
         return "Webpage / Online Document"
     return "Other"
@@ -905,13 +925,81 @@ INPUT:
 # ============================================================
 
 def enforce_apa_citation_rules(original, revised, citation_type):
-    """Deterministically enforce APA 7 conjunction rules after AI review."""
+    """Final hard guard: AI output can never override APA conjunction rules."""
     text = (revised or original or "").strip()
     if citation_type == "parenthetical":
         text = re.sub(r"\s+(?:and|dan)\s+", " & ", text, flags=re.I)
     elif citation_type == "narrative":
         text = re.sub(r"\s+(?:&|dan)\s+", " and ", text, flags=re.I)
     return text
+
+
+def _citation_note_after_enforcement(original, revised, citation_type, ai_note=""):
+    """Do not let an AI explanation contradict the deterministic APA output."""
+    if citation_type == "parenthetical" and re.search(r"\s(?:dan|and)\s", original, re.I):
+        return "APA 7 uses '&' between two authors in a parenthetical citation."
+    if citation_type == "narrative" and re.search(r"(?:&|\bdan\b)", original, re.I):
+        return "APA 7 uses 'and' between two authors in a narrative citation."
+    if revised != original and ai_note:
+        return ai_note
+    return ai_note or ("Citation is correct as is." if revised == original else "Citation revised to APA 7 format.")
+
+
+def _reference_name_candidates(reference, year):
+    """Return plausible citation surnames from the author block of a reference."""
+    if not year:
+        return []
+    m = re.search(rf"\({re.escape(str(year))}[a-z]?\)", reference, re.I)
+    block = reference[:m.start()].strip(" .") if m else ""
+    if not block:
+        return []
+    # Proper APA form: Surname, Initials
+    apa_names = re.findall(r"(?:^|[,&]\s*)([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z]\.\s*)+", block)
+    if apa_names:
+        return apa_names
+    # Malformed full personal names such as 'Ana Ittihada' or 'Darius Ru’ung'.
+    # For citation repair, use the final token as the surname candidate.
+    people = re.split(r"\s+(?:dan|and|&)\s+", block, flags=re.I)
+    out=[]
+    for person in people:
+        toks=re.findall(r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", person)
+        if toks:
+            out.append(toks[-1])
+    return out
+
+
+def _deterministic_citation_from_reference(citation, reference_rows):
+    """Repair author names using same-year bibliography entries when uniquely matchable."""
+    raw=citation.get("raw", "")
+    year=str(citation.get("year") or "")
+    ctype=citation.get("type")
+    raw_norm=re.sub(r"[^a-z0-9]+", " ", raw.lower())
+    matches=[]
+    for row in reference_rows:
+        ref=row.get("Original Reference", "")
+        if str(parse_reference(ref).get("year") or "") != year:
+            continue
+        names=_reference_name_candidates(ref, year)
+        if not names:
+            continue
+        # Match if surname occurs, OR a token from malformed full author block occurs.
+        score=sum(1 for n in names if n.lower() in raw_norm)
+        first_block=ref.split(f"({year}",1)[0].lower()
+        raw_tokens=set(raw_norm.split())
+        score += sum(1 for t in raw_tokens if len(t)>2 and t in first_block)
+        if score:
+            matches.append((score,names))
+    if not matches:
+        return None
+    matches.sort(key=lambda x:x[0], reverse=True)
+    if len(matches)>1 and matches[0][0] == matches[1][0]:
+        return None
+    names=matches[0][1]
+    if len(names)==1:
+        return f"({names[0]}, {year})" if ctype=="parenthetical" else f"{names[0]} ({year})"
+    if len(names)==2:
+        return f"({names[0]} & {names[1]}, {year})" if ctype=="parenthetical" else f"{names[0]} and {names[1]} ({year})"
+    return f"({names[0]} et al., {year})" if ctype=="parenthetical" else f"{names[0]} et al. ({year})"
 
 
 def review_apa_citations_with_ai(citations, reference_rows, client):
@@ -1121,7 +1209,7 @@ def build_apa_report_docx(result):
 
     meta = doc.add_paragraph()
     mr = meta.add_run(
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: APA-P1-P4-v2"
     )
     _set_run_font(mr, size_pt=9, italic=True)
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1652,14 +1740,20 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
     for i, c in enumerate(batch["citations"], start=1):
         ai = cit_by_no.get(i, {})
         revised = (ai.get("revised_citation") or "").strip() or c["raw"]
+        deterministic = _deterministic_citation_from_reference(c, ref_rows)
+        if deterministic:
+            revised = deterministic
         revised = enforce_apa_citation_rules(c["raw"], revised, c["type"])
+        note = _citation_note_after_enforcement(
+            c["raw"], revised, c["type"], ai.get("explanation", "")
+        )
         cit_rows.append({
             "No.": i,
             "Type": c["type"].title(),
             "Original Citation": c["raw"],
             "Revised Citation": revised,
-            "Status": (ai.get("status") or "MATCH").upper(),
-            "Notes": ai.get("explanation", ""),
+            "Status": ("REVISED" if revised != c["raw"] else (ai.get("status") or "MATCH")).upper(),
+            "Notes": note,
         })
 
     # ---- Stage G: attach to batch ----
