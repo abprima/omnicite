@@ -2502,12 +2502,15 @@ def render():
         if k not in active_keys:
             del st.session_state["ieee_batches"][k]
 
-    if st.button(
-        "Extract & Review",
-        type="primary",
-        use_container_width=True,
-        key="ieee_btn_run_all_pdfs",
-    ):
+    with st.container(key="ieee_extract_btn"):
+        extract_clicked = st.button(
+            "Extract & Review",
+            type="primary",
+            use_container_width=True,
+            key="ieee_btn_run_all_pdfs",
+        )
+
+    if extract_clicked:
         overall = st.progress(0, text="Starting...")
         n = len(file_keys)
         step = 100 / max(n, 1)
@@ -2595,6 +2598,21 @@ def render():
         }
         div[class*="st-key-ieee_reset_btn"] button:focus {
             box-shadow: 0 0 0 0.2rem rgba(220, 38, 38, 0.4) !important;
+        }
+        div[class*="st-key-ieee_extract_btn"] button {
+            background-color: #2563eb !important;
+            color: #ffffff !important;
+            border: 1px solid #1d4ed8 !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-ieee_extract_btn"] button:hover {
+            background-color: #1d4ed8 !important;
+            color: #ffffff !important;
+            border-color: #1e40af !important;
+        }
+        div[class*="st-key-ieee_extract_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(37, 99, 235, 0.4) !important;
         }
         </style>
         """,
