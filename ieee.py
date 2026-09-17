@@ -16,12 +16,12 @@ import io
 import json
 import difflib
 import traceback
+from markitdown import MarkItDown
 from datetime import datetime
 from collections import Counter
 
 import streamlit as st
 import pandas as pd
-import fitz  # PyMuPDF
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -97,83 +97,99 @@ def normalize_running_text(text):
 
 
 def extract_pdf_text(uploaded_file):
-    pdf_bytes = uploaded_file.read()
-    document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_blocks = []
+    uploaded_file.seek(0)
+    pdf_bytes = uploaded_file.getvalue()
+    stream = io.BytesIO(pdf_bytes)
 
-    for page_number, page in enumerate(document):
-        page_height = page.rect.height
-        page_width = page.rect.width
-        blocks = []
-        for block in page.get_text("blocks"):
-            x0, y0, x1, y1, text, *_ = block
-            text = text.strip()
-            if not text:
-                continue
-            blocks.append({
-                "text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-                "page_height": page_height, "page_width": page_width,
-            })
-        blocks.sort(key=lambda b: (round(b["y0"], 1), round(b["x0"], 1)))
-        page_blocks.append({"page": page_number + 1, "blocks": blocks})
+    md = MarkItDown(enable_plugins=False)
+    result = md.convert_stream(stream, file_extension=".pdf")
+    raw_text = result.text_content or ""
 
-    candidate_counter = Counter()
-    for page_data in page_blocks:
-        seen_on_page = set()
-        for block in page_data["blocks"]:
-            ph = block["page_height"]
-            is_top = block["y0"] <= ph * 0.12
-            is_bottom = block["y1"] >= ph * 0.90
-            if not (is_top or is_bottom):
-                continue
-            normalized = normalize_running_text(block["text"])
-            if not normalized:
-                continue
-            if normalized not in seen_on_page:
-                candidate_counter[normalized] += 1
-                seen_on_page.add(normalized)
+    # ---- Detect approximate page count from form-feed / page separators ----
+    # MarkItDown usually preserves PDF page breaks as "\f" (form feed) or
+    # "\n\n---\n\n" in some versions.
+    form_feed_count = raw_text.count("\f")
+    approx_pages = max(1, form_feed_count + 1)
 
-    total_pages = len(page_blocks)
-    minimum_pages = max(2, int(total_pages * 0.30))
-    running_text_patterns = {
-        text for text, count in candidate_counter.items()
-        if count >= minimum_pages
-    }
+    lines = raw_text.splitlines()
 
-    pages = []
+    # ---- Count normalized line occurrences ----
+    counter = Counter()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or len(stripped) > 120:
+            continue
+        norm = re.sub(r"\s+", " ", stripped).lower()
+        norm = re.sub(r"\b\d+\b", "<num>", norm)
+        counter[norm] += 1
+
+    # ---- Threshold: line must appear on >= 50% of pages ----
+    # This is the correct rule for "running headers/footers" because
+    # those appear once per page. 50% gives safety margin.
+    min_repeats = max(2, int(approx_pages * 0.5))
+    repeated = {n for n, c in counter.items() if c >= min_repeats}
+
+    # ---- Boilerplate regex (mirror APA's BOILERPLATE_PATTERNS) ----
+    BOILERPLATE_PATTERNS = [
+        r"^is licensed under a .*$",
+        r"^creative commons.*$",
+        r"^cc[- ]by.*$",
+        r"^doi:\s*10\.\S+$",
+        r"^https?://creativecommons\.org.*$",
+        r"^~?\s*\d+\s*~\s*\d+\(\d+\),\s*\d+[-–]\d+\s*$",
+        r"^\d+\s*~\s*\d+\(\d+\),\s*\d+[-–]\d+\s*$",
+        r"^p?e?ISSN\s*\d+[-–]\d+.*$",
+        r"^terakreditasi.*$",
+        r"^\*?email koresponden.*$",
+        r"^copyright ©.*$",
+        r"^received:.*accepted:.*$",
+        r"^submitted:.*published:.*$",
+        r"^diterima:.*disetujui:.*$",
+        r"^preprint\.?\s+under review.*$",
+        r"^under review.*$",
+    ]
+    BOILERPLATE_RE = re.compile("|".join(BOILERPLATE_PATTERNS), re.I)
+
+    cleaned_lines = []
     removed_running_text = []
-    for page_data in page_blocks:
-        clean_blocks = []
-        for block in page_data["blocks"]:
-            text = block["text"]
-            normalized = normalize_running_text(text)
-            ph = block["page_height"]
-            is_top = block["y0"] <= ph * 0.12
-            is_bottom = block["y1"] >= ph * 0.90
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append(line)
+            continue
 
-            if (is_top or is_bottom) and normalized in running_text_patterns:
-                removed_running_text.append({
-                    "Page": page_data["page"], "Text": text,
-                    "Reason": "Repeated header/footer",
-                })
-                continue
+        # Boilerplate pattern match
+        if BOILERPLATE_RE.match(stripped):
+            removed_running_text.append({
+                "Page": 1, "Text": stripped,
+                "Reason": "Boilerplate pattern",
+            })
+            continue
 
-            if _safe_fullmatch(r"\s*(?:page\s*)?\d+\s*", text, flags=re.IGNORECASE):
-                if is_top or is_bottom:
-                    removed_running_text.append({
-                        "Page": page_data["page"], "Text": text,
-                        "Reason": "Page number",
-                    })
-                    continue
-            clean_blocks.append(text)
+        # Repeated-line match
+        norm = re.sub(r"\s+", " ", stripped).lower()
+        norm = re.sub(r"\b\d+\b", "<num>", norm)
+        if norm in repeated:
+            removed_running_text.append({
+                "Page": 1, "Text": stripped,
+                "Reason": "Repeated header/footer line",
+            })
+            continue
 
-        page_text = "\n".join(clean_blocks)
-        pages.append({"page": page_data["page"], "text": page_text})
+        # Lone page number
+        if re.fullmatch(r"\s*\d{1,4}\s*", stripped):
+            removed_running_text.append({
+                "Page": 1, "Text": stripped,
+                "Reason": "Page number",
+            })
+            continue
 
-    document.close()
-    full_text = "\n".join(
-        f"<<<PAGE_BREAK:{p['page']}>>>\n{p['text']}" for p in pages
-    )
+        cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines)
+    full_text = f"<<<PAGE_BREAK:1>>>\n{cleaned}"
+    pages = [{"page": 1, "text": cleaned}]
+
     return full_text, pages, removed_running_text
 
 
@@ -182,30 +198,13 @@ def extract_pdf_text(uploaded_file):
 # =========================================================
 
 def extract_pdf_style_spans(uploaded_file):
+    """
+    MarkItDown does not expose per-span font flags, so italic detection is
+    not available. Return an empty list — the DOCX builder will fall back
+    to the AI-supplied italic_elements.
+    """
     uploaded_file.seek(0)
-    pdf_bytes = uploaded_file.read()
-    document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    spans = []
-    for page_number, page in enumerate(document, start=1):
-        page_dict = page.get_text("dict")
-        for block in page_dict.get("blocks", []):
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    text = span.get("text", "")
-                    if not text.strip():
-                        continue
-                    font = span.get("font", "")
-                    flags = span.get("flags", 0)
-                    italic = bool(flags & 2) or bool(
-                        re.search(r"italic|oblique", font, re.I)
-                    )
-                    spans.append({
-                        "page": page_number, "text": text, "font": font,
-                        "flags": flags, "italic": italic, "bbox": span.get("bbox"),
-                    })
-    document.close()
-    uploaded_file.seek(0)
-    return spans
+    return []
 
 
 def normalize_style_text(text):
