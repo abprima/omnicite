@@ -2114,7 +2114,7 @@ def render():
     # Refresh the batch's manuscript_year with whatever is in the widget now
     batch["manuscript_year"] = int(st.session_state.get("apa_manuscript_year", current_year))
 
-    with st.expander("View reference section (sent to AI)", expanded=False):
+    with st.expander("View reference section", expanded=False):
         st.text_area(
             "Reference slice",
             batch["reference_text"],
