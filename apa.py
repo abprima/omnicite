@@ -1143,32 +1143,71 @@ def _citation_note_after_enforcement(original, revised, citation_type, ai_note="
 
 
 def _reference_name_candidates(reference, year):
-    """Return plausible citation surnames from the author block of a reference."""
+    """
+    Return ALL plausible citation surnames from the author block of a
+    reference, in the order they appear.
+
+    Rules:
+      * Proper APA form 'Surname1, X., & Surname2, Y.': return both.
+      * Multi-author with commas: return each.
+      * Malformed full names 'Ana Ittihada' or 'Darius Ru'ung': use the
+        FINAL token of each person as the surname candidate.
+      * Two authors joined by '&'/'and'/'dan': return both surnames.
+    """
     if not year:
         return []
     m = re.search(rf"\({re.escape(str(year))}[a-z]?\)", reference, re.I)
     block = reference[:m.start()].strip(" .") if m else ""
     if not block:
         return []
-    apa_names = re.findall(r"(?:^|[,&]\s*)([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z]\.\s*)+", block)
+
+    # 1) Proper APA form: Surname, Initials (with optional &)
+    apa_names = re.findall(
+        r"(?:^|[,&]\s*)([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z]\.\s*)+",
+        block,
+    )
     if apa_names:
         return apa_names
+
+    # 2) Malformed but structured as "FirstA ... & FirstB ..." — split
+    # on the author conjunction and take the FINAL token of each part
+    # only if there is no space inside the part; otherwise take the
+    # FINAL two tokens as a best-effort surname.
     people = re.split(r"\s+(?:dan|and|&)\s+", block, flags=re.I)
     out = []
     for person in people:
         toks = re.findall(r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", person)
-        if toks:
-            out.append(toks[-1])
+        if not toks:
+            continue
+        # Heuristic: if the person block contains at least one comma, the
+        # surname is the token before the first comma. Otherwise the
+        # surname is the final token.
+        before_comma = person.split(",", 1)[0].strip()
+        surname = None
+        if before_comma:
+            first_tok = re.match(r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", before_comma)
+            if first_tok:
+                surname = first_tok.group(0)
+        if not surname:
+            surname = toks[-1]
+        out.append(surname)
     return out
 
 
 def _deterministic_citation_from_reference(citation, reference_rows):
-    """Repair author names using same-year bibliography entries when uniquely matchable."""
+    """
+    Repair author names using same-year bibliography entries.
+    The result is authoritative when the reference has ≥2 authors,
+    because the AI has a tendency to truncate multi-author parenthetical
+    citations to a single author.
+    """
     raw = citation.get("raw", "")
     year = str(citation.get("year") or "")
     ctype = citation.get("type")
     raw_norm = re.sub(r"[^a-z0-9]+", " ", raw.lower())
-    matches = []
+    raw_tokens = set(raw_norm.split())
+
+    matches = []   # list of (score, names, ref_lower)
     for row in reference_rows:
         ref = row.get("Original Reference", "")
         if str(parse_reference(ref).get("year") or "") != year:
@@ -1176,23 +1215,57 @@ def _deterministic_citation_from_reference(citation, reference_rows):
         names = _reference_name_candidates(ref, year)
         if not names:
             continue
+
+        # Score 1: surname hits in the citation string
         score = sum(1 for n in names if n.lower() in raw_norm)
+
+        # Score 2: token overlap between citation and the reference's
+        # author block (before the year)
         first_block = ref.split(f"({year}", 1)[0].lower()
-        raw_tokens = set(raw_norm.split())
         score += sum(1 for t in raw_tokens if len(t) > 2 and t in first_block)
+
         if score:
-            matches.append((score, names))
+            matches.append((score, names, first_block))
+
     if not matches:
         return None
-    matches.sort(key=lambda x: x[0], reverse=True)
+
+    matches.sort(key=lambda x: (-x[0], -len(x[1])))
+
+    # Prefer multi-author entries even on a tie, because the citation
+    # being repaired is more likely to have come from a multi-author
+    # reference. If the top two entries have DIFFERENT author lists AND
+    # the same score, disambiguate by raw-token overlap with the block.
     if len(matches) > 1 and matches[0][0] == matches[1][0]:
-        return None
+        top_score = matches[0][0]
+        tied = [m for m in matches if m[0] == top_score]
+        # Prefer the tied entry with the longest author list
+        tied.sort(key=lambda x: (-len(x[1]), -x[0]))
+        best = tied[0]
+        # If there is still a genuine tie between different surnames,
+        # keep the longest-author one anyway — truncation is worse than
+        # a wrong single-author pick.
+        matches = [best] + [m for m in matches if m is not best]
+
     names = matches[0][1]
+
     if len(names) == 1:
-        return f"({names[0]}, {year})" if ctype == "parenthetical" else f"{names[0]} ({year})"
+        return (
+            f"({names[0]}, {year})"
+            if ctype == "parenthetical"
+            else f"{names[0]} ({year})"
+        )
     if len(names) == 2:
-        return f"({names[0]} & {names[1]}, {year})" if ctype == "parenthetical" else f"{names[0]} and {names[1]} ({year})"
-    return f"({names[0]} et al., {year})" if ctype == "parenthetical" else f"{names[0]} et al. ({year})"
+        return (
+            f"({names[0]} & {names[1]}, {year})"
+            if ctype == "parenthetical"
+            else f"{names[0]} and {names[1]} ({year})"
+        )
+    return (
+        f"({names[0]} et al., {year})"
+        if ctype == "parenthetical"
+        else f"{names[0]} et al. ({year})"
+    )
 
 
 def review_apa_citations_with_ai(citations, reference_rows, client):
@@ -1230,6 +1303,17 @@ APA 7 AUTHOR RULES:
 - 2 authors: parenthetical MUST use "&"; narrative MUST use "and".
 - 3+ authors: FirstSurname et al.
 - Do not guess surnames merely from word position when the reference list provides the surname.
+
+CRITICAL ANTI-TRUNCATION RULE:
+- If the ORIGINAL citation contains TWO surnames (joined by "&", "and",
+  or "dan"), and the matching reference also has TWO authors, the
+  corrected citation MUST contain BOTH surnames. Never drop the second
+  surname.
+- If the ORIGINAL citation contains a single surname but the matching
+  reference has TWO authors, DO NOT invent the second surname; leave
+  the citation with a single surname and let the deterministic repair
+  step handle it. Never truncate a two-surname citation to one.
+- NEVER shorten "(A & B, 2020)" to "(A, 2020)".
 
 IMPORTANT — WRONG-AUTHOR RECOVERY:
 - If the citation's author name does NOT match any reference with the
