@@ -1825,6 +1825,7 @@ def process_single_ieee_pdf(uploaded_file, batch, client, manuscript_year):
 
     batch.update({
         "filename": uploaded_file.name,
+        "reference_text": reference_text,
         "heading": heading,
         "references": references,
         "parsed_references": parsed_refs,
@@ -2615,6 +2616,15 @@ def render():
         return
 
     batch["manuscript_year"] = int(st.session_state.get("ieee_manuscript_year", current_year))
+
+    # ---- Debug: show the reference section extracted from the PDF ----
+    with st.expander("View reference section", expanded=False):
+        st.text_area(
+            "Reference slice",
+            batch.get("reference_text", ""),
+            height=300,
+            key=f"dbg_ref_{selected_key}",
+        )
 
     reference_rows = batch.get("reference_comparison", [])
     total_refs_now = len(batch.get("references", []))
