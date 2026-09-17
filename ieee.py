@@ -2449,7 +2449,6 @@ def build_ieee_docx(result):
 
 def render():
     st.title("OmniCite Auditor - IEEE Style")
-    st.caption("Numbered bracketed in-text citations ↔ IEEE reference list")
 
     # ---- ALL button styling injected BEFORE any widget renders ----
     st.markdown(
@@ -2575,7 +2574,7 @@ def render():
         for i, (key, uf) in enumerate(file_keys, start=1):
             base_pct = int((i - 1) * step)
             overall.progress(base_pct + int(step * 0.10),
-                             text=f"[{i}/{n}] Extracting {uf.name}...")
+                             text=f"[{i}/{n}] Extracting references & verifying DOIs...")
 
             batch = {"filename": uf.name, "manuscript_year": int(manuscript_year),
                      "ai_done": False}
