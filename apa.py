@@ -197,9 +197,13 @@ LEADING_STOPWORDS = {
     "menurut", "berdasarkan", "dalam", "pada", "oleh", "lihat",
 }
 
+# NOTE: "and", "dan", "&" are deliberately EXCLUDED. They join AUTHOR
+# names, not parts of a single organizational name. Including them caused
+# Pattern 3 to swallow two-author citations like
+# "Arrochmah and Nasionalita (2020)" as a single corporate author.
 CONNECTOR_WORDS = {
-    "of", "and", "dan", "for", "the", "de", "del", "van", "von",
-    "bin", "binti", "di", "ke", "&",
+    "of", "for", "the", "de", "del", "van", "von",
+    "bin", "binti", "di", "ke",
 }
 
 _UPPER_TOKEN = r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*"
@@ -235,13 +239,11 @@ def extract_parenthetical_citations(text):
                 r"\bet\s+al\.", "", author_part, flags=re.I
             ).strip()
 
-            # Detect "Surname1, Surname2" (multiple authors) vs "One Org Name"
             has_comma_between_names = bool(
                 re.search(r"[A-Za-z],\s+[A-Z]", author_part_clean)
             )
 
             if not has_comma_between_names and not et_al and author_part_clean:
-                # Treat the whole thing as ONE corporate / multi-word author
                 authors = [author_part_clean]
             else:
                 authors = re.findall(
@@ -319,10 +321,38 @@ def extract_narrative_citations(text):
         occupied.append((m.start(), m.end()))
 
     # ------------------------------------------------------------------
+    # Pattern 2b: two authors joined by and/&/dan + (year)
+    #   Arrochmah and Nasionalita (2020)
+    #   Sofanudin & Wahab (2020)
+    #   Smith dan Jones (2019)
+    #
+    # MUST run BEFORE Pattern 3, otherwise the multi-word organizational
+    # author matcher would claim the whole "Arrochmah and Nasionalita"
+    # span and truncate it to a single corporate name.
+    # ------------------------------------------------------------------
+    for m in re.finditer(
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+        r"\s+(?:and|&|dan)\s+"
+        r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*"
+        r"\(((?:19|20)\d{2})[a-z]?\)",
+        text,
+    ):
+        if _overlaps(m.start(), m.end()):
+            continue
+        citations.append({
+            "author": m.group(1),
+            "authors": [m.group(1), m.group(2)],
+            "year": m.group(3),
+            "type": "narrative",
+            "et_al": False,
+            "raw": m.group(0),
+        })
+        occupied.append((m.start(), m.end()))
+
+    # ------------------------------------------------------------------
     # Pattern 3: MULTI-WORD organizational author + (year)
     #   SMERU Research Institute (2022)
     #   Badan Pusat Statistik (2023)
-    #   Kementerian Pendidikan dan Kebudayaan (2020)
     #
     # MUST run before the single-word pattern (#4) so it claims the full
     # span first; #4 will then see the overlap and skip.
@@ -344,6 +374,13 @@ def extract_narrative_citations(text):
         # After trimming we need at least 2 tokens to call it a
         # multi-word author; otherwise let pattern #4 handle it.
         if len(tokens) < 2:
+            continue
+
+        # Belt-and-braces guard: even if CONNECTOR_WORDS no longer
+        # contains "and"/"dan"/"&", refuse any candidate that still
+        # contains an author-joining conjunction. Those belong to
+        # two-author citations, not a single organizational name.
+        if any(t.lower() in {"and", "dan", "&"} for t in tokens):
             continue
 
         # Reject if the final token is a dangling lowercase connector
@@ -547,9 +584,6 @@ def parse_reference(reference):
         "url": None,
     }
 
-    # ------------------------------------------------------------
-    # YEAR
-    # ------------------------------------------------------------
     year_match = re.search(
         r"\(((?:19|20)\d{2})[a-z]?\)",
         reference
@@ -564,9 +598,6 @@ def parse_reference(reference):
     if year_match:
         result["year"] = year_match.group(1)
 
-    # ------------------------------------------------------------
-    # AUTHORS
-    # ------------------------------------------------------------
     author_block = (
         reference[:year_match.start()].strip()
         if year_match
@@ -591,17 +622,6 @@ def parse_reference(reference):
             result["authors"] = [corporate]
             result["first_author"] = corporate
 
-    # ------------------------------------------------------------
-    # DOI
-    #
-    # DOI is detected independently from the surrounding URL.
-    #
-    # Handles:
-    #   10.19109/muaddib.v7i1.24478
-    #   https://doi.org/10.19109/muaddib.v7i1.24478
-    #   https://doi.org/https://doi.org/10.19109/muaddib.v7i1.24478
-    #   doi:10.19109/muaddib.v7i1.24478
-    # ------------------------------------------------------------
     doi_match = re.search(
         r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+",
         reference,
@@ -616,10 +636,6 @@ def parse_reference(reference):
         result["url"] = normalized_doi
 
     else:
-        # --------------------------------------------------------
-        # ORDINARY URL
-        # Only used when no DOI exists in the reference.
-        # --------------------------------------------------------
         url_match = re.search(
             r"https?://\S+",
             reference,
@@ -641,7 +657,6 @@ def detect_apa_source_type(reference):
     """Conservative local source-type detection used BEFORE any AI call."""
     low = reference.lower()
 
-    # Explicit chapter/editor signals first.
     if re.search(r"\b(in\s+.+?\(eds?\.\)|book chapter|chapter)\b", low):
         return "Book Chapter"
     if re.search(r"\b(proceedings|conference|symposium)\b", low):
@@ -649,8 +664,6 @@ def detect_apa_source_type(reference):
     if re.search(r"\b(report|working paper|technical report)\b", low):
         return "Report"
 
-    # Journal names are common in Indonesian manuscripts and many malformed
-    # journal references do not satisfy a strict volume/pages regex.
     journal_word = bool(re.search(
         r"\b(journal|jurnal|review|quarterly|bulletin|transactions|letters|"
         r"perspectives in education|education journal)\b", low
@@ -662,7 +675,6 @@ def detect_apa_source_type(reference):
     if journal_word or journal_biblio:
         return "Journal Article"
 
-    # Books: edition/publisher cues. URL alone must not turn a book into webpage.
     if re.search(r"\(\d+(?:st|nd|rd|th)\s+ed\.\)", reference, re.I):
         return "Book"
     if re.search(r"\b(SAGE Publications|Penguin Books|Yale University Press|"
@@ -785,7 +797,7 @@ def verify_reference_against_openalex(reference, parsed, api_key):
     if meta.get("_not_found"):
         result["checked"] = True
         result["suspicious"] = True
-        result["reasons"].append("DOI does not resolve in OpenAlex.")
+        result["reasons"].append("DOI does not resolve.")
         return result
 
     result["checked"] = True
@@ -802,7 +814,10 @@ def verify_reference_against_openalex(reference, parsed, api_key):
     if ref_title and oa_title:
         sim = _title_similarity(ref_title, oa_title)
         result["title_similarity"] = sim
-        if sim < 0.60:
+        # 0.55 (was 0.60): subtle subtitle/punctuation differences in
+        # OpenAlex metadata often land in the 0.57–0.59 range and were
+        # being flagged as false-positive DOI mismatches.
+        if sim < 0.55:
             result["suspicious"] = True
             result["reasons"].append(
                 f"DOI resolves to a different title (similarity {sim:.0%})."
@@ -1135,12 +1150,9 @@ def _reference_name_candidates(reference, year):
     block = reference[:m.start()].strip(" .") if m else ""
     if not block:
         return []
-    # Proper APA form: Surname, Initials
     apa_names = re.findall(r"(?:^|[,&]\s*)([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z]\.\s*)+", block)
     if apa_names:
         return apa_names
-    # Malformed full personal names such as 'Ana Ittihada' or 'Darius Ru’ung'.
-    # For citation repair, use the final token as the surname candidate.
     people = re.split(r"\s+(?:dan|and|&)\s+", block, flags=re.I)
     out = []
     for person in people:
@@ -1164,7 +1176,6 @@ def _deterministic_citation_from_reference(citation, reference_rows):
         names = _reference_name_candidates(ref, year)
         if not names:
             continue
-        # Match if surname occurs, OR a token from malformed full author block occurs.
         score = sum(1 for n in names if n.lower() in raw_norm)
         first_block = ref.split(f"({year}", 1)[0].lower()
         raw_tokens = set(raw_norm.split())
@@ -1301,7 +1312,6 @@ def _surname_from_citation_string(s):
     if not s:
         return ""
     t = s.strip().strip("()").strip()
-    # Take everything before the first comma / '(' / ' et al' / ' &' / ' and '
     parts = re.split(r"\s*(?:,|\(| et al\b|&|\band\b)\s*", t, maxsplit=1)
     first = parts[0].strip() if parts else ""
     return first
@@ -1326,13 +1336,9 @@ def citation_matches_reference(citation, ref_keys, revised_author=None):
         if not year_key:
             return False
 
-        # Exact pair
         if (author_key, year_key) in ref_keys:
             return True
 
-        # Surname-of-block fallback: reference author may be stored as
-        # "Surname, Initials" or as a multi-word string; take the first
-        # token and compare with the citation name.
         for ref_author, ref_year in ref_keys:
             if ref_year != year_key:
                 continue
@@ -1342,12 +1348,9 @@ def citation_matches_reference(citation, ref_keys, revised_author=None):
 
         return False
 
-    # 1) The citation as written
     if _matches(citation.get("author")):
         return True
 
-    # 2) The AI-repaired surname — the citation is still anchored even
-    #    if the original author name was wrong.
     if revised_author and _matches(revised_author):
         return True
 
@@ -1492,7 +1495,7 @@ def build_apa_report_docx(result):
 
     meta = doc.add_paragraph()
     mr = meta.add_run(
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: APA-P1-P4-v4"
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: APA-P1-P4-v5"
     )
     _set_run_font(mr, size_pt=9, italic=True)
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1508,10 +1511,8 @@ def build_apa_report_docx(result):
     total_refs = len(reference_rows)
     total_cits = stats.get("total", 0)
 
-    # ---- Single source of truth for citation <-> reference matching ----
     ref_keys = build_reference_key_set(reference_rows)
 
-    # Which references are cited in text?
     cit_author_years = {
         (c.get("author", "").lower(), str(c.get("year") or ""))
         for c in result.get("citations", [])
@@ -1548,7 +1549,6 @@ def build_apa_report_docx(result):
         1 for r in reference_rows if r.get("Source") == "OpenAlex"
     )
 
-    # ---- Last-10-year window anchored to manuscript_year, inclusive ----
     window_start = manuscript_year - 9
     window_end = manuscript_year
     recent = sum(
@@ -1657,7 +1657,6 @@ def build_apa_report_docx(result):
         )
     else:
         for i, row in enumerate(citation_rows):
-            # The stored flag is authoritative — do NOT recompute here.
             missing_from_refs = bool(row.get("Missing From References"))
             status_upper = str(row.get("Status", "")).strip().upper()
 
@@ -1739,9 +1738,6 @@ def build_apa_report_docx(result):
             not_cited = row["No."] not in cited_ref_nos
             status = str(row.get("Status", "")).strip().upper()
 
-            # ========================================================
-            # REFERENCE NUMBER
-            # ========================================================
             head = doc.add_paragraph()
             head.paragraph_format.space_before = Pt(6)
             head.paragraph_format.space_after = Pt(2)
@@ -1752,9 +1748,6 @@ def build_apa_report_docx(result):
             if not_cited:
                 _add_red_italic_run(head, "  [NOT CITED IN TEXT]")
 
-            # ========================================================
-            # SOURCE TYPE
-            # ========================================================
             p_type = doc.add_paragraph()
             p_type.paragraph_format.left_indent = Inches(0.25)
             p_type.paragraph_format.space_after = Pt(2)
@@ -1772,9 +1765,6 @@ def build_apa_report_docx(result):
                 size_pt=11
             )
 
-            # ========================================================
-            # ORIGINAL
-            # ========================================================
             p_orig = doc.add_paragraph()
             p_orig.paragraph_format.left_indent = Inches(0.25)
             p_orig.paragraph_format.space_after = Pt(2)
@@ -1796,10 +1786,6 @@ def build_apa_report_docx(result):
                 red=(status == "WITHHELD")
             )
 
-            # ========================================================
-            # CORRECTED
-            # Completely SKIP when status is WITHHELD
-            # ========================================================
             if status != "WITHHELD":
 
                 corrected = row.get("Corrected Version", "").strip()
@@ -1832,9 +1818,6 @@ def build_apa_report_docx(result):
                         size_pt=11
                     )
 
-            # ========================================================
-            # COMMENT
-            # ========================================================
             p_comment = doc.add_paragraph()
             p_comment.paragraph_format.left_indent = Inches(0.25)
             p_comment.paragraph_format.space_after = Pt(2)
@@ -1868,9 +1851,6 @@ def build_apa_report_docx(result):
                 red=(status == "WITHHELD")
             )
 
-            # ========================================================
-            # STATUS
-            # ========================================================
             p_status = doc.add_paragraph()
             p_status.paragraph_format.left_indent = Inches(0.25)
             p_status.paragraph_format.space_after = Pt(4)
@@ -1932,11 +1912,6 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
         verification_rows.append(v)
 
     # ---- Stage C: decide which references are eligible for AI review ----
-    # Cost-control policy:
-    #   * Journal + no DOI: withhold; do NOT send to OpenAI.
-    #   * Journal + suspicious/unresolved DOI: manual check; do NOT send to OpenAI.
-    #   * Journal + verified DOI: eligible for AI reconstruction/correction.
-    #   * Non-journal sources: manual check for now; do NOT send to OpenAI.
     review_payload = []
     preclassified_results = {}
 
@@ -2068,7 +2043,6 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
         if str(x.get("number", "")).isdigit()
     }
 
-    # Single source of truth for citation <-> reference matching.
     ref_keys = build_reference_key_set(ref_rows)
 
     cit_rows = []
@@ -2078,15 +2052,11 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
         ai_revised = (ai.get("revised_citation") or "").strip()
         revised_author = _surname_from_citation_string(ai_revised) if ai_revised else ""
 
-        # Determine whether the citation is anchored to a reference:
-        #   * either its own author matches, OR
-        #   * the AI-repaired surname matches.
         attached = citation_matches_reference(
             c, ref_keys, revised_author=revised_author
         )
 
         if not attached:
-            # Truly unattached — no corrected version can be produced safely.
             cit_rows.append({
                 "No.": i,
                 "Type": c["type"].title(),
@@ -2102,7 +2072,6 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
             })
             continue
 
-        # ---- Normal path: citation is anchored. Produce corrected form. ----
         revised = ai_revised or c["raw"]
         deterministic = _deterministic_citation_from_reference(c, ref_rows)
         if deterministic:
@@ -2176,11 +2145,9 @@ def _get_openai_api_key():
 
 
 def _get_openalex_api_key():
-    # 1) Preferred: key captured by app.py login
     key = st.session_state.get("openalex_api_key", "").strip()
     if key:
         return key
-    # 2) Fallback: secrets.toml / env
     try:
         if "OPENALEX_API_KEY" in st.secrets:
             return st.secrets["OPENALEX_API_KEY"]
@@ -2196,7 +2163,6 @@ def _get_openalex_api_key():
 def render():
     st.title("OmniCite Auditor — APA Style")
 
-    # ---- API keys ----
     openai_key = _get_openai_api_key()
     if not openai_key:
         st.error(
@@ -2213,7 +2179,6 @@ def render():
 
     client = OpenAI(api_key=openai_key)
 
-    # ---- Uploader ----
     if "apa_uploader_version" not in st.session_state:
         st.session_state["apa_uploader_version"] = 0
 
@@ -2230,7 +2195,6 @@ def render():
     if not uploaded_files:
         return
 
-    # ---- Manual manuscript publication year (drives the 10-year window) ----
     current_year = datetime.now().year
     default_year = st.session_state.get("apa_manuscript_year", current_year)
     manuscript_year = st.number_input(
@@ -2252,13 +2216,11 @@ def render():
         key = f"{idx}::{uf.name}"
         file_keys.append((key, uf))
 
-    # Drop batches no longer uploaded
     active_keys = {k for k, _ in file_keys}
     for k in list(st.session_state["pdf_batches"].keys()):
         if k not in active_keys:
             del st.session_state["pdf_batches"][k]
 
-    # ---- Run pipeline ----
     if st.button(
         "Extract & Review",
         type="primary",
@@ -2328,10 +2290,6 @@ def render():
         overall.empty()
         st.success(f"Processed {n} manuscript{'s' if n != 1 else ''}.")
 
-    # ========================================================
-    # RESULTS
-    # ========================================================
-
     any_done = any(
         b.get("ai_done") for b in st.session_state["pdf_batches"].values()
     )
@@ -2360,7 +2318,6 @@ def render():
         )
         return
 
-    # Refresh the batch's manuscript_year with whatever is in the widget now
     batch["manuscript_year"] = int(st.session_state.get("apa_manuscript_year", current_year))
 
     with st.expander("View reference section", expanded=False):
@@ -2371,7 +2328,6 @@ def render():
             key=f"dbg_ref_{selected_key}",
         )
 
-    # ---- Metrics ----
     reference_rows = batch["reference_rows"]
     citation_rows = batch["citation_rows"]
     stats = batch["citation_stats"]
@@ -2386,7 +2342,6 @@ def render():
         1 for x in reference_rows if x.get("Source") == "OpenAlex"
     )
 
-    # Read the flag the pipeline already computed (AI-repair aware).
     missing_cits = sum(
         1 for row in citation_rows if row.get("Missing From References")
     )
@@ -2402,7 +2357,6 @@ def render():
             if (p["first_author"].lower(), str(p["year"])) not in cit_keys:
                 missing_refs += 1
 
-    # ---- Last-10-year window anchored to manuscript_year, inclusive ----
     window_start = manuscript_year - 9
     window_end = manuscript_year
     recent = sum(
@@ -2449,7 +2403,6 @@ def render():
     with right:
         st.dataframe(src_df, use_container_width=True, hide_index=True)
 
-    # ---- Download ----
     try:
         docx_bytes = build_apa_report_docx(batch)
         safe_name = re.sub(r"[^\w\-]+", "_", batch.get("filename", "manuscript"))
@@ -2467,7 +2420,6 @@ def render():
     except Exception as exc:
         st.error(f"Could not build DOCX report: {exc}")
 
-    # ---- Start Fresh button (red, below download) ----
     st.markdown(
         """
         <style>
@@ -2496,7 +2448,6 @@ def render():
         use_container_width=True,
         key="reset_btn_start_fresh",
     ):
-        # 1. Wipe every APA-related session-state entry.
         for k in list(st.session_state.keys()):
             if k == "pdf_batches" or k.startswith("pdf_batches"):
                 del st.session_state[k]
@@ -2505,16 +2456,12 @@ def render():
             if k == "selected_pdf_key":
                 del st.session_state[k]
 
-        # 2. Recreate the batch dict empty.
         st.session_state["pdf_batches"] = {}
 
-        # 3. Bump the uploader version → new key → empty uploader.
         st.session_state["apa_uploader_version"] = (
             st.session_state.get("apa_uploader_version", 0) + 1
         )
 
-        # 4. Optional: reset the manuscript year back to current year.
         st.session_state["apa_manuscript_year"] = datetime.now().year
 
-        # 5. Rerun so everything re-renders clean.
         st.rerun()
