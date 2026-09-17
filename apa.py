@@ -1145,14 +1145,13 @@ def _citation_note_after_enforcement(original, revised, citation_type, ai_note="
 def _reference_name_candidates(reference, year):
     """
     Return ALL plausible citation surnames from the author block of a
-    reference, in the order they appear.
-
-    Rules:
-      * Proper APA form 'Surname1, X., & Surname2, Y.': return both.
-      * Multi-author with commas: return each.
-      * Malformed full names 'Ana Ittihada' or 'Darius Ru'ung': use the
-        FINAL token of each person as the surname candidate.
-      * Two authors joined by '&'/'and'/'dan': return both surnames.
+    reference, in order. Handles:
+      * APA form: "Surname1, X., & Surname2, Y."
+      * Indonesian join: "Surname1, X. dan Surname2, Y."
+      * English join:   "Surname1, X. and Surname2, Y."
+      * Bare commas:    "Surname1, X., Surname2, Y."
+      * Missing separator: "Surname1, X. Surname2, Y."
+      * Malformed full names: "Ana Ittihada" -> "Ittihada"
     """
     if not year:
         return []
@@ -1161,36 +1160,42 @@ def _reference_name_candidates(reference, year):
     if not block:
         return []
 
-    # 1) Proper APA form: Surname, Initials (with optional &)
+    # Normalize Indonesian "dan" to "&" before extraction.
+    normalized = re.sub(r"\s+dan\s+", " & ", block, flags=re.I)
+
+    # 1) Strict APA form: Surname, Initials (joined by & or ,)
     apa_names = re.findall(
         r"(?:^|[,&]\s*)([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z]\.\s*)+",
-        block,
+        normalized,
     )
     if apa_names:
         return apa_names
 
-    # 2) Malformed but structured as "FirstA ... & FirstB ..." — split
-    # on the author conjunction and take the FINAL token of each part
-    # only if there is no space inside the part; otherwise take the
-    # FINAL two tokens as a best-effort surname.
-    people = re.split(r"\s+(?:dan|and|&)\s+", block, flags=re.I)
+    # 2) Comma-anywhere: match every "Surname, Initials" chunk
+    #    regardless of what separates them.
+    comma_names = re.findall(
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*,\s*(?:[A-Z]\.\s*)+",
+        normalized,
+    )
+    if comma_names:
+        seen = set()
+        unique = []
+        for n in comma_names:
+            if n not in seen:
+                seen.add(n)
+                unique.append(n)
+        return unique
+
+    # 3) Last resort: split on conjunctions and take the leading token
+    people = re.split(r"\s+(?:dan|and|&)\s+", normalized, flags=re.I)
     out = []
     for person in people:
-        toks = re.findall(r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", person)
-        if not toks:
+        part = person.strip(" ,")
+        if not part:
             continue
-        # Heuristic: if the person block contains at least one comma, the
-        # surname is the token before the first comma. Otherwise the
-        # surname is the final token.
-        before_comma = person.split(",", 1)[0].strip()
-        surname = None
-        if before_comma:
-            first_tok = re.match(r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", before_comma)
-            if first_tok:
-                surname = first_tok.group(0)
-        if not surname:
-            surname = toks[-1]
-        out.append(surname)
+        m2 = re.match(r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)", part)
+        if m2:
+            out.append(m2.group(1))
     return out
 
 
@@ -1207,7 +1212,7 @@ def _deterministic_citation_from_reference(citation, reference_rows):
     raw_norm = re.sub(r"[^a-z0-9]+", " ", raw.lower())
     raw_tokens = set(raw_norm.split())
 
-    matches = []   # list of (score, names, ref_lower)
+    matches = []   # list of (score, names)
     for row in reference_rows:
         ref = row.get("Original Reference", "")
         if str(parse_reference(ref).get("year") or "") != year:
@@ -1219,33 +1224,20 @@ def _deterministic_citation_from_reference(citation, reference_rows):
         # Score 1: surname hits in the citation string
         score = sum(1 for n in names if n.lower() in raw_norm)
 
-        # Score 2: token overlap between citation and the reference's
+        # Score 2: token overlap between the citation and the reference's
         # author block (before the year)
         first_block = ref.split(f"({year}", 1)[0].lower()
         score += sum(1 for t in raw_tokens if len(t) > 2 and t in first_block)
 
         if score:
-            matches.append((score, names, first_block))
+            matches.append((score, names))
 
     if not matches:
         return None
 
+    # Sort by score desc, then by author-list length desc (prefer
+    # multi-author entries so a tie never causes truncation).
     matches.sort(key=lambda x: (-x[0], -len(x[1])))
-
-    # Prefer multi-author entries even on a tie, because the citation
-    # being repaired is more likely to have come from a multi-author
-    # reference. If the top two entries have DIFFERENT author lists AND
-    # the same score, disambiguate by raw-token overlap with the block.
-    if len(matches) > 1 and matches[0][0] == matches[1][0]:
-        top_score = matches[0][0]
-        tied = [m for m in matches if m[0] == top_score]
-        # Prefer the tied entry with the longest author list
-        tied.sort(key=lambda x: (-len(x[1]), -x[0]))
-        best = tied[0]
-        # If there is still a genuine tie between different surnames,
-        # keep the longest-author one anyway — truncation is worse than
-        # a wrong single-author pick.
-        matches = [best] + [m for m in matches if m is not best]
 
     names = matches[0][1]
 
