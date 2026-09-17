@@ -206,6 +206,7 @@ _UPPER_TOKEN = r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*"
 _NAME_WORD = rf"(?:{_UPPER_TOKEN}|(?:{'|'.join(CONNECTOR_WORDS)}))"
 _MULTI_AUTHOR = rf"(?:{_UPPER_TOKEN})(?:\s+{_NAME_WORD}){{1,8}}"
 
+
 def _inside_parentheses(text, pos):
     depth = 0
     for i in range(pos):
@@ -1141,9 +1142,9 @@ def _reference_name_candidates(reference, year):
     # Malformed full personal names such as 'Ana Ittihada' or 'Darius Ru’ung'.
     # For citation repair, use the final token as the surname candidate.
     people = re.split(r"\s+(?:dan|and|&)\s+", block, flags=re.I)
-    out=[]
+    out = []
     for person in people:
-        toks=re.findall(r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", person)
+        toks = re.findall(r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", person)
         if toks:
             out.append(toks[-1])
     return out
@@ -1151,36 +1152,36 @@ def _reference_name_candidates(reference, year):
 
 def _deterministic_citation_from_reference(citation, reference_rows):
     """Repair author names using same-year bibliography entries when uniquely matchable."""
-    raw=citation.get("raw", "")
-    year=str(citation.get("year") or "")
-    ctype=citation.get("type")
-    raw_norm=re.sub(r"[^a-z0-9]+", " ", raw.lower())
-    matches=[]
+    raw = citation.get("raw", "")
+    year = str(citation.get("year") or "")
+    ctype = citation.get("type")
+    raw_norm = re.sub(r"[^a-z0-9]+", " ", raw.lower())
+    matches = []
     for row in reference_rows:
-        ref=row.get("Original Reference", "")
+        ref = row.get("Original Reference", "")
         if str(parse_reference(ref).get("year") or "") != year:
             continue
-        names=_reference_name_candidates(ref, year)
+        names = _reference_name_candidates(ref, year)
         if not names:
             continue
         # Match if surname occurs, OR a token from malformed full author block occurs.
-        score=sum(1 for n in names if n.lower() in raw_norm)
-        first_block=ref.split(f"({year}",1)[0].lower()
-        raw_tokens=set(raw_norm.split())
-        score += sum(1 for t in raw_tokens if len(t)>2 and t in first_block)
+        score = sum(1 for n in names if n.lower() in raw_norm)
+        first_block = ref.split(f"({year}", 1)[0].lower()
+        raw_tokens = set(raw_norm.split())
+        score += sum(1 for t in raw_tokens if len(t) > 2 and t in first_block)
         if score:
-            matches.append((score,names))
+            matches.append((score, names))
     if not matches:
         return None
-    matches.sort(key=lambda x:x[0], reverse=True)
-    if len(matches)>1 and matches[0][0] == matches[1][0]:
+    matches.sort(key=lambda x: x[0], reverse=True)
+    if len(matches) > 1 and matches[0][0] == matches[1][0]:
         return None
-    names=matches[0][1]
-    if len(names)==1:
-        return f"({names[0]}, {year})" if ctype=="parenthetical" else f"{names[0]} ({year})"
-    if len(names)==2:
-        return f"({names[0]} & {names[1]}, {year})" if ctype=="parenthetical" else f"{names[0]} and {names[1]} ({year})"
-    return f"({names[0]} et al., {year})" if ctype=="parenthetical" else f"{names[0]} et al. ({year})"
+    names = matches[0][1]
+    if len(names) == 1:
+        return f"({names[0]}, {year})" if ctype == "parenthetical" else f"{names[0]} ({year})"
+    if len(names) == 2:
+        return f"({names[0]} & {names[1]}, {year})" if ctype == "parenthetical" else f"{names[0]} and {names[1]} ({year})"
+    return f"({names[0]} et al., {year})" if ctype == "parenthetical" else f"{names[0]} et al. ({year})"
 
 
 def review_apa_citations_with_ai(citations, reference_rows, client):
@@ -1219,10 +1220,21 @@ APA 7 AUTHOR RULES:
 - 3+ authors: FirstSurname et al.
 - Do not guess surnames merely from word position when the reference list provides the surname.
 
+IMPORTANT — WRONG-AUTHOR RECOVERY:
+- If the citation's author name does NOT match any reference with the
+  same year, BUT a reference with that year exists in the reference
+  list, prefer rewriting the citation to use that reference's first
+  author surname — this is the correct repair when the author wrote
+  the wrong surname.
+- Never invent a surname that is absent from the reference list.
+- Only mark a citation as unattached when NO reference with the same
+  year exists that could plausibly correspond to it.
+
 Examples:
 (Ana Ittihada, 2026) + reference "Ittihada, A. (2026)" -> (Ittihada, 2026)
 (Darius Ru'ung, 2021) + reference "Ru'ung, D. (2021)" -> (Ru'ung, 2021)
 (Aji Sofanudin dan Wahab, 2020) -> (Sofanudin & Wahab, 2020)
+Putri et al. (2025) + reference "Nur, A. et al. (2025)" -> Nur et al. (2025)
 
 Return JSON only:
 {{"results": [
@@ -1250,6 +1262,96 @@ INPUT CITATIONS:
     except Exception as exc:
         return [{"number": 0, "status": "MANUAL_CHECK", "revised_citation": "",
                  "explanation": f"OpenAI API error: {exc}"}]
+
+
+# ============================================================
+# CITATION ↔ REFERENCE MATCHING (single source of truth)
+# ============================================================
+
+def build_reference_key_set(reference_rows):
+    """
+    Build a set of (author_lower, year_str) tuples from reference rows.
+
+    Each reference contributes:
+      * one entry per parsed author surname, AND
+      * one entry for the full author block as-is (covers corporate authors).
+    """
+    keys = set()
+    for row in reference_rows:
+        ref_text = row.get("Original Reference", "")
+        p = parse_reference(ref_text)
+        year = p.get("year")
+        if not year:
+            continue
+        year_str = str(year)
+        for a in (p.get("authors") or []):
+            if a:
+                keys.add((a.strip().lower(), year_str))
+        if p.get("first_author"):
+            keys.add((p["first_author"].strip().lower(), year_str))
+    return keys
+
+
+def _surname_from_citation_string(s):
+    """
+    Extract the leading surname from a citation string such as
+    'Nur et al. (2025)', '(Nur & Smith, 2025)', or 'Nur (2025)'.
+    Returns '' if nothing sensible can be extracted.
+    """
+    if not s:
+        return ""
+    t = s.strip().strip("()").strip()
+    # Take everything before the first comma / '(' / ' et al' / ' &' / ' and '
+    parts = re.split(r"\s*(?:,|\(| et al\b|&|\band\b)\s*", t, maxsplit=1)
+    first = parts[0].strip() if parts else ""
+    return first
+
+
+def citation_matches_reference(citation, ref_keys, revised_author=None):
+    """
+    Strict lookup used by BOTH the pipeline and the DOCX builder.
+
+    Returns True if the citation is anchored to a reference entry, using
+    EITHER:
+      * the citation's own author surname (exact or surname-of-block), OR
+      * the surname present in the AI-repaired citation (when the
+        original author was wrong but a reference with the same year
+        exists under that surname).
+    """
+    def _matches(author_str):
+        author_key = (author_str or "").strip().lower()
+        if not author_key:
+            return False
+        year_key = str(citation.get("year") or "")
+        if not year_key:
+            return False
+
+        # Exact pair
+        if (author_key, year_key) in ref_keys:
+            return True
+
+        # Surname-of-block fallback: reference author may be stored as
+        # "Surname, Initials" or as a multi-word string; take the first
+        # token and compare with the citation name.
+        for ref_author, ref_year in ref_keys:
+            if ref_year != year_key:
+                continue
+            ref_surname = re.split(r"[,\s]+", ref_author, 1)[0]
+            if ref_surname == author_key:
+                return True
+
+        return False
+
+    # 1) The citation as written
+    if _matches(citation.get("author")):
+        return True
+
+    # 2) The AI-repaired surname — the citation is still anchored even
+    #    if the original author name was wrong.
+    if revised_author and _matches(revised_author):
+        return True
+
+    return False
 
 
 # ============================================================
@@ -1390,7 +1492,7 @@ def build_apa_report_docx(result):
 
     meta = doc.add_paragraph()
     mr = meta.add_run(
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: APA-P1-P4-v2"
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: APA-P1-P4-v4"
     )
     _set_run_font(mr, size_pt=9, italic=True)
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1406,28 +1508,24 @@ def build_apa_report_docx(result):
     total_refs = len(reference_rows)
     total_cits = stats.get("total", 0)
 
-    ref_keys = {}
-    for row in reference_rows:
-        p = parse_reference(row.get("Original Reference", ""))
-        if p["first_author"] and p["year"]:
-            ref_keys[(p["first_author"].lower(), p["year"])] = row["No."]
+    # ---- Single source of truth for citation <-> reference matching ----
+    ref_keys = build_reference_key_set(reference_rows)
 
-    cit_keys = set()
-    for c in result.get("citations", []):
-        cit_keys.add((c["author"].lower(), c["year"]))
+    # Which references are cited in text?
+    cit_author_years = {
+        (c.get("author", "").lower(), str(c.get("year") or ""))
+        for c in result.get("citations", [])
+    }
 
     cited_ref_nos = set()
     for row in reference_rows:
         p = parse_reference(row.get("Original Reference", ""))
-        key = (p["first_author"].lower() if p["first_author"] else "", p["year"])
-        if key in cit_keys:
+        key = (
+            (p["first_author"].lower() if p["first_author"] else ""),
+            str(p["year"] or ""),
+        )
+        if key in cit_author_years:
             cited_ref_nos.add(row["No."])
-
-    not_in_refs = []
-    for c in result.get("citations", []):
-        key = (c["author"].lower(), c["year"])
-        if key not in ref_keys:
-            not_in_refs.append(c)
 
     citation_page_map = _compute_citation_pages(
         full_text, result.get("citations", [])
@@ -1450,7 +1548,7 @@ def build_apa_report_docx(result):
         1 for r in reference_rows if r.get("Source") == "OpenAlex"
     )
 
-    # --- Revised: last-10-year window now anchored to manuscript_year ---
+    # ---- Last-10-year window anchored to manuscript_year, inclusive ----
     window_start = manuscript_year - 9
     window_end = manuscript_year
     recent = sum(
@@ -1461,7 +1559,9 @@ def build_apa_report_docx(result):
     recent_pct = (recent / total_refs * 100) if total_refs else 0
 
     refs_missing_from_cits = total_refs - len(cited_ref_nos)
-    cits_missing_from_refs = len(not_in_refs)
+    cits_missing_from_refs = sum(
+        1 for row in citation_rows if row.get("Missing From References")
+    )
 
     summary_rows = [
         ("Manuscript publication year", str(manuscript_year), False),
@@ -1557,13 +1657,9 @@ def build_apa_report_docx(result):
         )
     else:
         for i, row in enumerate(citation_rows):
-            c_dict = result.get("citations", [])[i] if i < len(
-                result.get("citations", [])
-            ) else None
-            missing_from_refs = False
-            if c_dict:
-                key = (c_dict["author"].lower(), c_dict["year"])
-                missing_from_refs = key not in ref_keys
+            # The stored flag is authoritative — do NOT recompute here.
+            missing_from_refs = bool(row.get("Missing From References"))
+            status_upper = str(row.get("Status", "")).strip().upper()
 
             page_no = citation_page_map[i] if i < len(citation_page_map) else None
 
@@ -1576,7 +1672,7 @@ def build_apa_report_docx(result):
             hrun = head.add_run(hp)
             _set_run_font(hrun, size_pt=11, bold=True)
 
-            if missing_from_refs:
+            if missing_from_refs or status_upper == "NOT IN REFERENCES":
                 _add_red_italic_run(head, "  [NOT IN REFERENCES]")
 
             p_orig = doc.add_paragraph()
@@ -1599,14 +1695,18 @@ def build_apa_report_docx(result):
             _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
 
             revised_val = row.get("Revised Citation", "").strip()
-            if revised_val:
-                _add_run(p_corr, revised_val, size_pt=11)
-            else:
+            if (
+                missing_from_refs
+                or status_upper == "NOT IN REFERENCES"
+                or not revised_val
+            ):
                 _add_run(
                     p_corr,
                     "— withheld (citation not found in reference list) —",
                     size_pt=11, italic=True, red=True,
                 )
+            else:
+                _add_run(p_corr, revised_val, size_pt=11)
 
             notes = row.get("Notes", "")
             if notes:
@@ -1968,47 +2068,32 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
         if str(x.get("number", "")).isdigit()
     }
 
-    # Build a set of (first_author_lower, year) keys present in the reference list
-    ref_keys = set()
-    for row in ref_rows:
-        p = parse_reference(row.get("Original Reference", ""))
-        if p["first_author"] and p["year"]:
-            ref_keys.add((p["first_author"].lower(), p["year"]))
-        # Also index corporate authors under both full string and first token
-        for a in (p.get("authors") or []):
-            if a:
-                ref_keys.add((a.lower(), p["year"]))
+    # Single source of truth for citation <-> reference matching.
+    ref_keys = build_reference_key_set(ref_rows)
 
     cit_rows = []
     for i, c in enumerate(batch["citations"], start=1):
         ai = cit_by_no.get(i, {})
 
-        # ---- NEW: match against reference list ----
-        author_key = (c["author"] or "").lower()
-        year_key = str(c.get("year") or "")
+        ai_revised = (ai.get("revised_citation") or "").strip()
+        revised_author = _surname_from_citation_string(ai_revised) if ai_revised else ""
 
-        in_references = author_key in {k[0] for k in ref_keys} or any(
-            author_key and author_key in k[0] for k in ref_keys
+        # Determine whether the citation is anchored to a reference:
+        #   * either its own author matches, OR
+        #   * the AI-repaired surname matches.
+        attached = citation_matches_reference(
+            c, ref_keys, revised_author=revised_author
         )
-        # Stricter check: exact (author, year) pair OR first-author-only match
-        exact_match = (author_key, year_key) in ref_keys
-        loose_match = any(
-            k[0] == author_key and k[1] == year_key for k in ref_keys
-        ) or any(
-            k[0].startswith(author_key + " ") or author_key.startswith(k[0] + " ")
-            for k in ref_keys
-            if k[1] == year_key
-        )
-        missing_from_refs = not (exact_match or loose_match)
 
-        if missing_from_refs:
-            # Do NOT produce a corrected version — we cannot verify the target.
+        if not attached:
+            # Truly unattached — no corrected version can be produced safely.
             cit_rows.append({
                 "No.": i,
                 "Type": c["type"].title(),
                 "Original Citation": c["raw"],
-                "Revised Citation": "",           # <-- intentionally empty
+                "Revised Citation": "",
                 "Status": "NOT IN REFERENCES",
+                "Missing From References": True,
                 "Notes": (
                     "Citation has no matching entry in the reference list. "
                     "Corrected version withheld — add the source to the "
@@ -2017,8 +2102,8 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
             })
             continue
 
-        # ---- Normal path: only run repair for citations that DO have a match ----
-        revised = (ai.get("revised_citation") or "").strip() or c["raw"]
+        # ---- Normal path: citation is anchored. Produce corrected form. ----
+        revised = ai_revised or c["raw"]
         deterministic = _deterministic_citation_from_reference(c, ref_rows)
         if deterministic:
             revised = deterministic
@@ -2032,6 +2117,7 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
             "Original Citation": c["raw"],
             "Revised Citation": revised,
             "Status": ("REVISED" if revised != c["raw"] else (ai.get("status") or "MATCH")).upper(),
+            "Missing From References": False,
             "Notes": note,
         })
 
@@ -2300,26 +2386,23 @@ def render():
         1 for x in reference_rows if x.get("Source") == "OpenAlex"
     )
 
-    ref_keys = set()
-    for ref in batch["reference_list"]:
-        p = parse_reference(ref)
-        if p["first_author"] and p["year"]:
-            ref_keys.add((p["first_author"].lower(), p["year"]))
+    # Read the flag the pipeline already computed (AI-repair aware).
+    missing_cits = sum(
+        1 for row in citation_rows if row.get("Missing From References")
+    )
 
-    missing_cits = 0
-    for c in citations:
-        if (c["author"].lower(), c["year"]) not in ref_keys:
-            missing_cits += 1
-
-    cit_keys = {(c["author"].lower(), c["year"]) for c in citations}
+    cit_keys = {
+        (c["author"].lower(), str(c["year"] or ""))
+        for c in citations
+    }
     missing_refs = 0
     for ref in batch["reference_list"]:
         p = parse_reference(ref)
         if p["first_author"] and p["year"]:
-            if (p["first_author"].lower(), p["year"]) not in cit_keys:
+            if (p["first_author"].lower(), str(p["year"])) not in cit_keys:
                 missing_refs += 1
 
-    # ---- Revised: window anchored to manuscript_year, inclusive ----
+    # ---- Last-10-year window anchored to manuscript_year, inclusive ----
     window_start = manuscript_year - 9
     window_end = manuscript_year
     recent = sum(
