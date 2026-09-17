@@ -2451,6 +2451,63 @@ def render():
     st.title("OmniCite Auditor - IEEE Style")
     st.caption("Numbered bracketed in-text citations ↔ IEEE reference list")
 
+    # ---- ALL button styling injected BEFORE any widget renders ----
+    st.markdown(
+        """
+        <style>
+        /* Blue Extract & Review */
+        div[class*="st-key-ieee_extract_btn"] button {
+            background-color: #2563eb !important;
+            color: #ffffff !important;
+            border: 1px solid #1d4ed8 !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-ieee_extract_btn"] button:hover {
+            background-color: #1d4ed8 !important;
+            color: #ffffff !important;
+            border-color: #1e40af !important;
+        }
+        div[class*="st-key-ieee_extract_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(37, 99, 235, 0.4) !important;
+        }
+        /* Green Download */
+        div[class*="st-key-ieee_download_btn"] button {
+            background-color: #16a34a !important;
+            color: #ffffff !important;
+            border: 1px solid #15803d !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-ieee_download_btn"] button:hover {
+            background-color: #15803d !important;
+            color: #ffffff !important;
+            border-color: #166534 !important;
+        }
+        div[class*="st-key-ieee_download_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(22, 163, 74, 0.4) !important;
+        }
+        /* Red Start Fresh */
+        div[class*="st-key-ieee_reset_btn"] button {
+            background-color: #dc2626 !important;
+            color: #ffffff !important;
+            border: 1px solid #b91c1c !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-ieee_reset_btn"] button:hover {
+            background-color: #b91c1c !important;
+            color: #ffffff !important;
+            border-color: #991b1b !important;
+        }
+        div[class*="st-key-ieee_reset_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(220, 38, 38, 0.4) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not openai_key:
         st.warning("OPENAI_API_KEY not set — AI correction will be skipped. Local checks still run.")
