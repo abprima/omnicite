@@ -306,54 +306,145 @@ def is_post_reference_heading(line):
 
 
 def find_reference_section(text):
+    """
+    Detect the bibliography without assuming every [n] marker survived PDF
+    extraction. If a References heading exists, use it. If the heading was
+    lost, anchor on the EARLIEST surviving reference marker near the end of
+    the manuscript and scan backwards across bibliography-looking lines.
+
+    The previous fallback started at the LAST surviving marker. That can
+    silently discard most of the bibliography when PDF extraction removes
+    the heading or early reference numbers.
+    """
     lines = text.splitlines()
-
     marker_re = re.compile(r"^\s*\[?\s*(\d{1,3})\s*\]")
-    last_marker_idx = None
-    for i in range(len(lines) - 1, -1, -1):
-        if marker_re.match(lines[i]):
-            last_marker_idx = i
-            break
 
-    if last_marker_idx is None:
+    marker_indices = []
+    for i, line in enumerate(lines):
+        m = marker_re.match(line)
+        if not m:
+            continue
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if 1 <= n <= 500 and not (1900 <= n <= 2099):
+            marker_indices.append((i, n))
+
+    # First preference: an explicit References/Bibliography heading.
+    if marker_indices:
+        last_marker_idx = marker_indices[-1][0]
+        heading_idx = None
+        for i in range(last_marker_idx, -1, -1):
+            if _heading_matches_reference_vocab(lines[i]):
+                heading_idx = i
+                break
+
+        if heading_idx is not None:
+            end_idx = None
+            saw_reference_content = False
+            for i in range(heading_idx + 1, len(lines)):
+                line = lines[i].strip()
+                if not line:
+                    continue
+                if re.fullmatch(r"<<<PAGE_BREAK:\d+>>>", line):
+                    continue
+                if marker_re.match(line) or re.search(
+                    r"\b(?:19|20)\d{2}\b|10\.\d{4,9}/|\bvol\.\s*\d+|\bpp\.\s*\d+",
+                    line,
+                    re.I,
+                ):
+                    saw_reference_content = True
+                if saw_reference_content and is_post_reference_heading(line):
+                    end_idx = i
+                    break
+
+            heading_found = lines[heading_idx].strip()
+            body_text = "\n".join(lines[:heading_idx])
+            if end_idx is not None:
+                reference_text = "\n".join(lines[heading_idx + 1:end_idx])
+            else:
+                reference_text = "\n".join(lines[heading_idx + 1:])
+            return reference_text, heading_found, body_text
+
+    # If no marker survived at all, fall back to the normal heading search.
+    if not marker_indices:
         return _find_reference_section_topdown(text)
 
-    heading_idx = None
-    for i in range(last_marker_idx, -1, -1):
-        if _heading_matches_reference_vocab(lines[i]):
-            heading_idx = i
+    # ---------------------------------------------------------
+    # Heading missing: DO NOT start from the last marker.
+    # ---------------------------------------------------------
+    # Use the earliest surviving marker. MarkItDown often drops [1]...[10]
+    # while leaving [11] and later markers, so we scan backwards to recover
+    # the unnumbered bibliography entries before that marker.
+    first_marker_idx = marker_indices[0][0]
+
+    def bibliography_signal(line):
+        line = (line or "").strip()
+        if not line:
+            return False
+        return bool(re.search(
+            r"(?:"
+            r"10\.\d{4,9}/"
+            r"|\b(?:19|20)\d{2}\b"
+            r"|\bvol\.\s*\d+"
+            r"|\bno\.\s*\d+"
+            r"|\bpp?\.\s*\d+"
+            r"|\bIEEE\b"
+            r"|\bProceedings\b"
+            r"|\bJournal\b"
+            r")",
+            line,
+            re.I,
+        ))
+
+    start_idx = first_marker_idx
+    signals_seen = 0
+    blank_run = 0
+
+    # Scan at most 180 extracted lines backwards. This is deliberately
+    # bounded so ordinary body text is not swallowed into References.
+    lower_bound = max(0, first_marker_idx - 180)
+    for i in range(first_marker_idx - 1, lower_bound - 1, -1):
+        stripped = lines[i].strip()
+
+        if re.fullmatch(r"<<<PAGE_BREAK:\d+>>>", stripped):
+            continue
+
+        if not stripped:
+            blank_run += 1
+            # Once we have already seen bibliography evidence, a large blank
+            # gap is a good boundary between body and bibliography.
+            if signals_seen >= 2 and blank_run >= 3:
+                break
+            continue
+
+        blank_run = 0
+
+        if _heading_matches_reference_vocab(stripped):
+            start_idx = i + 1
             break
 
-    if heading_idx is None:
-        reference_text = "\n".join(lines[last_marker_idx:])
-        body_text = "\n".join(lines[:last_marker_idx])
-        return reference_text, None, body_text
+        if bibliography_signal(stripped):
+            signals_seen += 1
 
-    end_idx = None
-    saw_marker = False
-    for i in range(heading_idx + 1, len(lines)):
-        line = lines[i].strip()
-        if not line:
-            continue
-        if re.fullmatch(r"<<<PAGE_BREAK:\d+>>>", line):
-            continue
-        if marker_re.match(line):
-            saw_marker = True
-            continue
-        if saw_marker and is_post_reference_heading(line):
+        # Keep continuation/author lines while scanning backwards.
+        start_idx = i
+
+    # Stop at a post-reference section if one exists after the markers.
+    end_idx = len(lines)
+    saw_ref = False
+    for i in range(start_idx, len(lines)):
+        stripped = lines[i].strip()
+        if marker_re.match(stripped) or bibliography_signal(stripped):
+            saw_ref = True
+        if saw_ref and is_post_reference_heading(stripped):
             end_idx = i
             break
 
-    heading_found = lines[heading_idx].strip()
-    body_text = "\n".join(lines[:heading_idx])
-
-    if end_idx is not None:
-        reference_text = "\n".join(lines[heading_idx + 1:end_idx])
-    else:
-        reference_text = "\n".join(lines[heading_idx + 1:])
-
-    return reference_text, heading_found, body_text
-
+    reference_text = "\n".join(lines[start_idx:end_idx])
+    body_text = "\n".join(lines[:start_idx])
+    return reference_text, None, body_text
 
 def _find_reference_section_topdown(text):
     lines = text.splitlines()
