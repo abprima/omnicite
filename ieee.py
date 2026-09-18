@@ -1686,6 +1686,116 @@ def _fallback_ieee_italic_elements(source_type, parsed):
         return parsed["title"]
     return ""
 
+def compute_ieee_italic_tokens(source_type, corrected_reference, parsed=None):
+    """
+    Deterministically derive the list of substrings that must be italic
+    in an IEEE corrected reference, based on source type.
+
+    Returns a list of exact substrings (as they appear in
+    corrected_reference) that should be italicized.
+    """
+    if not corrected_reference:
+        return []
+
+    if parsed is None:
+        parsed = parse_ieee_reference(corrected_reference)
+
+    tokens = []
+    ref = corrected_reference
+
+    def _add(token):
+        token = (token or "").strip()
+        if not token:
+            return
+        # Only add if the token literally appears in the reference
+        if token in ref and token not in tokens:
+            tokens.append(token)
+
+    # ---------------- JOURNAL ARTICLE ----------------
+    # Italic: journal name (venue). Volume/issue/pages are NOT italic.
+    if source_type == "Journal Article":
+        venue = parsed.get("venue")
+        if venue:
+            _add(venue)
+            return tokens
+
+        # Fallback: try to infer the journal name from the reference shape.
+        # Journal name = the comma-delimited phrase right after the closing
+        # quote and before "vol." / a volume number.
+        m = re.search(
+            r'"\s*,\s*([^,]+?)\s*,\s*(?:vol\.|no\.|\d+\s*,)',
+            ref,
+        )
+        if m:
+            _add(m.group(1).strip())
+        return tokens
+
+    # ---------------- CONFERENCE PAPER ----------------
+    # Italic: conference or proceedings name.
+    if source_type == "Conference Paper":
+        venue = parsed.get("venue")
+        if venue:
+            _add(venue)
+            return tokens
+
+        # Fallback: "in Proc. ..." or "in Proceedings ..."
+        m = re.search(
+            r'\bin\s+((?:Proc\.|Proceedings|Conference|Symposium|Workshop)[^,]*)',
+            ref,
+            re.I,
+        )
+        if m:
+            _add(m.group(1).strip())
+        return tokens
+
+    # ---------------- BOOK ----------------
+    # Italic: the book title. In IEEE, book titles are usually NOT in
+    # quotes, so the title is the phrase after the author block and
+    # before a publisher or edition marker.
+    if source_type == "Book":
+        title = parsed.get("title")
+        if title:
+            _add(title)
+            return tokens
+
+        m = re.search(r"\.\s*([^.]+?)\s*,\s*[A-Z][a-zA-Z]+", ref)
+        if m:
+            _add(m.group(1).strip())
+        return tokens
+
+    # ---------------- BOOK CHAPTER ----------------
+    # Italic: the containing book title, not the chapter title.
+    if source_type == "Book Chapter":
+        # IEEE convention: chapter title in quotes, book title italic
+        m = re.search(
+            r'"[^"]+"\s*,\s*in\s+([^,]+?)\s*,',
+            ref,
+        )
+        if m:
+            _add(m.group(1).strip())
+            return tokens
+        return tokens
+
+    # ---------------- TECHNICAL REPORT ----------------
+    # Italic: report title.
+    if source_type == "Technical Report":
+        title = parsed.get("title")
+        if title:
+            _add(title)
+            return tokens
+        return tokens
+
+    # ---------------- WEB PAGE ----------------
+    # Italic: page/document title.
+    if source_type == "Web Page":
+        title = parsed.get("title")
+        if title:
+            _add(title)
+            return tokens
+        return tokens
+
+    # ---------------- OTHER / UNKNOWN ----------------
+    return tokens
 
 # =========================================================
 # STAGED PIPELINE
@@ -1786,9 +1896,27 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
         if source_type == "Other" and not ai.get("source_type"):
             source_type = parsed["source_type"]
 
-        italic_elements = (ai.get("italic_elements") or "").strip()
-        if not italic_elements:
-            italic_elements = _fallback_ieee_italic_elements(source_type, parsed)
+        # ---- Deterministic italics based on source type ----
+        # Priority order:
+        #   1. Deterministic tokens computed from source_type + parsed ref
+        #   2. AI-supplied italic_elements (when the deterministic layer
+        #      can't infer them, e.g. unusual source types)
+        deterministic_tokens = compute_ieee_italic_tokens(
+            source_type, corrected, parsed
+        )
+        ai_tokens = [
+            t.strip()
+            for t in (ai.get("italic_elements") or "").split(",")
+            if t.strip()
+        ]
+
+        # Merge, preserving order, de-duplicating
+        merged_tokens = []
+        for tok in deterministic_tokens + ai_tokens:
+            if tok and tok not in merged_tokens:
+                merged_tokens.append(tok)
+
+        italic_elements = ", ".join(merged_tokens)
 
         year = ai.get("year")
         if not isinstance(year, int):
@@ -2024,10 +2152,54 @@ def _highlight_missing_tokens_in_corrected(paragraph, text, missing_tokens, size
     if pos < len(text):
         _add_run(paragraph, text[pos:], size_pt=size_pt)
 
+def _highlight_missing_tokens_in_corrected_italic(paragraph, text, missing_tokens, size_pt=11):
+    """Same as _highlight_missing_tokens_in_corrected, but the default
+    weight is italic."""
+    parts = []
+    parts.append(
+        r"(?P<ph>"
+        r"author \?{3}"
+        r"|author \d+(?:, author \d+)+"
+        r"|vol\. \?{3}"
+        r"|no\. \?{3}"
+        r"|pp\. \d+-\?{3}"
+        r"|pp\. \?{3}-\?{3}"
+        r"|doi: \?{3}"
+        r")"
+    )
+    if missing_tokens:
+        escaped = sorted({re.escape(t) for t in missing_tokens if t}, key=len, reverse=True)
+        if escaped:
+            parts.append(r"(?P<miss>\b(?:" + "|".join(escaped) + r")\b)")
+
+    pattern = re.compile("|".join(parts), re.I)
+    pos = 0
+    for m in pattern.finditer(text):
+        if m.start() > pos:
+            _add_run(paragraph, text[pos:m.start()], size_pt=size_pt, italic=True)
+        matched = m.group(0)
+        if m.lastgroup == "ph":
+            page_partial = _PAGE_PARTIAL_RE.match(matched)
+            if page_partial:
+                known = page_partial.group(1)
+                prefix = matched[: matched.index(known)]
+                _add_run(paragraph, prefix, size_pt=size_pt, italic=True, bold=True, red=True)
+                _add_run(paragraph, f"{known}-???", size_pt=size_pt,
+                         italic=True, bold=True, red=True)
+            else:
+                _add_run(paragraph, matched, size_pt=size_pt,
+                         italic=True, bold=True, red=True)
+        else:
+            _add_run(paragraph, matched, size_pt=size_pt,
+                     italic=True, bold=True, red=True)
+        pos = m.end()
+    if pos < len(text):
+        _add_run(paragraph, text[pos:], size_pt=size_pt, italic=True)
 
 def _add_ieee_reference_with_italics(paragraph, text, italic_elements, missing_tokens=None, size_pt=11):
     """Emit corrected reference; italicize venue/title tokens; skip DOI spans;
-    highlight placeholders AND missing marker tokens in red bold italic."""
+    highlight placeholders AND missing marker tokens in red bold italic.
+    Italicizes only the FIRST occurrence of each token."""
     doi_spans = []
     for m in re.finditer(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text):
         doi_spans.append((m.start(), m.end()))
@@ -2043,33 +2215,55 @@ def _add_ieee_reference_with_italics(paragraph, text, italic_elements, missing_t
         _highlight_missing_tokens_in_corrected(paragraph, text, missing_tokens, size_pt=size_pt)
         return
 
-    flat = [_esc(t) for t in tokens]
-    pattern_str = "|".join(sorted(flat, key=len, reverse=True))
-    pattern = _safe_compile(pattern_str, re.I)
-    if pattern is None:
-        _highlight_missing_tokens_in_corrected(paragraph, text, missing_tokens, size_pt=size_pt)
-        return
+    # Build a list of (start, end) spans, one per token, first occurrence only
+    spans = []
+    for tok in tokens:
+        if not tok:
+            continue
+        pat = re.compile(re.escape(tok), re.I)
+        m = pat.search(text)
+        if m:
+            spans.append((m.start(), m.end()))
+
+    # Sort and drop overlapping spans (keep earliest start)
+    spans.sort()
+    merged = []
+    for s, e in spans:
+        if merged and s < merged[-1][1]:
+            # Overlap — merge into the existing span
+            merged[-1] = (merged[-1][0], max(e, merged[-1][1]))
+        else:
+            merged.append((s, e))
 
     pos = 0
-    for m in pattern.finditer(text):
-        if _in_doi(m.start()):
-            continue
-        if m.start() > pos:
+    for s, e in merged:
+        if _in_doi(s):
+            # Span overlaps a DOI — emit as normal (non-italic), then advance
+            if s > pos:
+                _highlight_missing_tokens_in_corrected(
+                    paragraph, text[pos:s], missing_tokens, size_pt=size_pt
+                )
             _highlight_missing_tokens_in_corrected(
-                paragraph, text[pos:m.start()], missing_tokens, size_pt=size_pt
+                paragraph, text[s:e], missing_tokens, size_pt=size_pt
             )
-        # Italic span — render with italic on the whole span, but still
-        # highlight missing tokens inside it.
-        _highlight_missing_tokens_in_corrected(
-            paragraph, m.group(0), missing_tokens, size_pt=size_pt
+            pos = e
+            continue
+
+        if s > pos:
+            _highlight_missing_tokens_in_corrected(
+                paragraph, text[pos:s], missing_tokens, size_pt=size_pt
+            )
+        # Italic span — italicize the whole span, but still apply
+        # placeholder highlighting inside it if present.
+        _highlight_missing_tokens_in_corrected_italic(
+            paragraph, text[s:e], missing_tokens, size_pt=size_pt
         )
-        pos = m.end()
+        pos = e
 
     if pos < len(text):
         _highlight_missing_tokens_in_corrected(
             paragraph, text[pos:], missing_tokens, size_pt=size_pt
         )
-
 
 def _ref_is_withheld(row):
     cv = (row.get("Corrected Version") or "").strip()
