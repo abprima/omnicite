@@ -1156,10 +1156,28 @@ def build_ieee_reference_from_openalex(original_reference, meta):
     first_page = meta.get("first_page")
     last_page = meta.get("last_page")
     pages = None
-    if first_page and last_page:
-        pages = str(first_page) if str(first_page) == str(last_page) else f"{first_page}-{last_page}"
-    elif first_page:
-        pages = str(first_page)
+    # OpenAlex biblio occasionally returns malformed page fields.  Accept only
+    # page-like values and never concatenate a publication year onto pages.
+    def _page_value(v):
+        if v is None:
+            return None
+        x = str(v).strip()
+        return x if re.fullmatch(r"[A-Za-z]?\d+(?:[-–][A-Za-z]?\d+)?", x) else None
+
+    fp = _page_value(first_page)
+    lp = _page_value(last_page)
+    if fp and lp:
+        # If first_page already contains a range, do not append last_page.
+        if re.search(r"[-–]", fp):
+            pages = fp
+        elif fp == lp:
+            pages = fp
+        elif str(lp) == str(year):
+            pages = fp
+        else:
+            pages = f"{fp}-{lp}"
+    elif fp:
+        pages = fp
     else:
         pages = op.get("pages")
     doi = meta.get("doi") or op.get("doi")
@@ -1169,7 +1187,7 @@ def build_ieee_reference_from_openalex(original_reference, meta):
         parts.append(authors)
 
     if source_type in {"Journal Article", "Conference Paper"} and title:
-        parts.append(f'"{title},"')
+        parts.append(f'"{title}"')
     elif title:
         parts.append(title)
 
@@ -2376,30 +2394,19 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
             italic_elements = ", ".join(deterministic_tokens)
             local = {"Corrected": corrected, "Note": "Constructed from verified OpenAlex DOI metadata."}
         else:
-            # No usable verified DOI metadata: retain the existing local + AI fallback.
-            ai_revised = strip_markdown_markers(clean_text(ai.get("revised_reference", "")))
-            corrected = ai_revised or original_clean
-            if corrected != original_clean and _reference_is_hallucinated(original_clean, corrected):
-                corrected = original_clean
-
-            local = build_local_ieee_reference_correction(corrected)
-            corrected = local["Corrected"]
-            corrected = re.sub(r',\s+"(?=\s*(?:in\b|,))', ',"', corrected)
+            # No verified OpenAlex metadata: NEVER reconstruct bibliographic facts
+            # from AI guesses. Preserve the extracted reference exactly (apart from
+            # whitespace cleanup) and flag it for manual review when necessary.
+            corrected = original_clean
             parsed = parse_ieee_reference(corrected)
+            local = {"Corrected": corrected, "Note": "Original preserved because no verified OpenAlex DOI metadata was available."}
 
             local_source_type = normalize_source_type(parsed.get("source_type"))
             ai_source_type = normalize_source_type(ai.get("source_type"))
             source_type = local_source_type if local_source_type != "Other" else ai_source_type
 
             deterministic_tokens = compute_ieee_italic_tokens(source_type, corrected, parsed)
-            ai_tokens = [
-                t.strip() for t in (ai.get("italic_elements") or "").split(",") if t.strip()
-            ]
-            merged_tokens = []
-            for tok in deterministic_tokens + ai_tokens:
-                if tok and tok not in merged_tokens:
-                    merged_tokens.append(tok)
-            italic_elements = ", ".join(merged_tokens)
+            italic_elements = ", ".join(deterministic_tokens)
 
         year = oa_built.get("Year") if oa_built else ai.get("year")
         if not isinstance(year, int):
@@ -2425,6 +2432,7 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
             "Original Reference": original_clean,
             "Corrected Version": corrected_display,
             "Italicized in IEEE": italic_elements,
+            "Italic Tokens": deterministic_tokens,
             "Status": status,
             "Missing Required Elements": ", ".join(str(x) for x in missing),
             "AI Explanation": ai.get("explanation", ""),
@@ -2694,7 +2702,12 @@ def _add_ieee_reference_with_italics(paragraph, text, italic_elements, missing_t
     if missing_tokens is None:
         missing_tokens = []
 
-    tokens = [t.strip() for t in (italic_elements or "").split(",") if t.strip()]
+    if isinstance(italic_elements, (list, tuple)):
+        tokens = [str(t).strip() for t in italic_elements if str(t).strip()]
+    else:
+        # Backward compatibility for older rows. New rows should pass Italic Tokens
+        # as a list so venue names containing commas are never split accidentally.
+        tokens = [str(italic_elements).strip()] if str(italic_elements or "").strip() else []
     if not tokens:
         _highlight_missing_tokens_in_corrected(paragraph, text, missing_tokens, size_pt=size_pt)
         return
@@ -2946,6 +2959,9 @@ def build_ieee_docx(result):
             hrun = head.add_run(f"{i}. ")
             _set_run_font(hrun, size_pt=11, bold=True)
 
+            type_run = head.add_run("IN-TEXT CITATIONS")
+            _set_run_font(type_run, size_pt=10, italic=True)
+
             if has_orphan:
                 _add_run(head, "  [NOT IN REFERENCES]",
                          size_pt=10, bold=True, italic=True, red=True)
@@ -3059,7 +3075,7 @@ def build_ieee_docx(result):
                     p_corr.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
                     _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
 
-                    italic_elements = row.get("Italicized in IEEE", "")
+                    italic_elements = row.get("Italic Tokens") or row.get("Italicized in IEEE", "")
 
                     missing = row.get("Missing Required Elements", "")
                     missing_tokens = [m.strip() for m in missing.split(",") if m.strip()]
