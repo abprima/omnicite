@@ -1804,6 +1804,7 @@ IEEE STYLE RULES:
 - All authors must be listed; "et al." is NOT allowed.
 - Article titles: double quotes, Title Case.
 - Journal / conference names: italic (list them in "italic_elements").
+- SOURCE TYPE CLASSIFICATION IS STRICT: if an entry contains "in" followed by a conference/proceedings/symposium/workshop name, classify it as "Conference Paper", NOT "Journal Article", even when it has an IEEE DOI. A DOI does not make a source a journal article.
 - Volume: "vol. X". Issue: "no. Y". Pages: "pp. Z-W".
 - DOI: "doi: 10.xxxx/xxxxx" — never https://doi.org/.
 - Must end with a period.
@@ -2040,14 +2041,19 @@ def compute_ieee_italic_tokens(source_type, corrected_reference, parsed=None):
             _add(venue)
             return tokens
 
-        # Fallback: "in Proc. ..." or "in Proceedings ..."
+        # Fallback: capture the proceedings/conference name after "in".
+        # This also handles forms such as:
+        #   in 2024 Asia Pacific Conference on Innovation in Technology APCIT 2024, 2024.
+        # where the venue does not begin with the word "Conference".
         m = re.search(
-            r'\bin\s+((?:Proc\.|Proceedings|Conference|Symposium|Workshop)[^,]*)',
+            r'\bin\s+(.+?)(?=,\s*(?:pp?\.|(?:19|20)\d{2}\b|doi\s*:))',
             ref,
             re.I,
         )
         if m:
-            _add(m.group(1).strip())
+            candidate = m.group(1).strip().rstrip(',.')
+            if re.search(r'\b(?:proc\.?|proceedings|conference|symposium|workshop)\b', candidate, re.I):
+                _add(candidate)
         return tokens
 
     # ---------------- BOOK ----------------
@@ -2212,13 +2218,23 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
 
         local = build_local_ieee_reference_correction(corrected)
         corrected = local["Corrected"]
+        # Normalize punctuation inside quoted article/conference titles.
+        # Prevent AI output such as:  title, " in ...
+        corrected = re.sub(r',\s+"(?=\s*(?:in\b|,))', ',"', corrected)
 
         parsed = parse_ieee_reference(corrected)
         v = verification_rows[i - 1]
 
-        source_type = normalize_source_type(ai.get("source_type"))
-        if source_type == "Other" and not ai.get("source_type"):
-            source_type = parsed["source_type"]
+        # Source type must be determined primarily from the reference itself.
+        # AI is only a fallback. This prevents conference proceedings from being
+        # mislabeled as Journal Article merely because they have a DOI.
+        local_source_type = normalize_source_type(parsed.get("source_type"))
+        ai_source_type = normalize_source_type(ai.get("source_type"))
+        source_type = (
+            local_source_type
+            if local_source_type != "Other"
+            else ai_source_type
+        )
 
         # ---- Deterministic italics based on source type ----
         # Priority order:
