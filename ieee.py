@@ -642,14 +642,22 @@ def _split_chunk_using_author_boundaries(chunk, aggressive=False):
     return _split_by_year_author_boundaries(chunk)
 
 
-def split_references(reference_text, expected_count=None):
-    """
-    Robust IEEE bibliography splitter.
+def _uninterpretable_reference_placeholder(number):
+    return f"[UNINTERPRETABLE_REFERENCE_{int(number)}]"
 
-    Unlike the previous implementation, this does NOT discard marker runs
-    merely because one intermediate [n] marker vanished in PDF extraction.
-    All surviving markers are retained, marker gaps trigger recovery splitting,
-    and text before the first surviving marker is also recovered.
+
+def _is_uninterpretable_reference(ref):
+    return bool(re.fullmatch(r"\[UNINTERPRETABLE_REFERENCE_\d+\]", (ref or "").strip()))
+
+
+def split_references(reference_text, expected_count=None):
+    """Split an IEEE bibliography while preserving its original numbering.
+
+    The key rule is positional integrity: when the manuscript indicates that
+    reference [n] exists, slot n must never disappear merely because its text is
+    malformed, authorless, or difficult to parse.  If a numbered entry cannot
+    be recovered, a deterministic placeholder is inserted for that number.
+    This keeps citation/reference numbering stable all the way to the DOCX.
     """
     if not reference_text:
         return []
@@ -660,89 +668,67 @@ def split_references(reference_text, expected_count=None):
 
     markers = sorted(set(_find_all_markers(text)), key=lambda x: x[0])
 
-    # If no markers survived, use bibliographic boundaries as fallback.
+    # Without surviving markers we cannot reliably assign original numbers.
+    # Fall back to boundary splitting, then pad to expected_count if known.
     if not markers:
-        refs = _split_by_year_author_boundaries_aggressive(text)
-        return [re.sub(r"\s+", " ", r).strip() for r in refs if r.strip()]
+        refs = [re.sub(r"\s+", " ", r).strip()
+                for r in _split_by_year_author_boundaries_aggressive(text)
+                if r.strip()]
+        if expected_count:
+            refs = refs[:expected_count]
+            while len(refs) < expected_count:
+                refs.append(_uninterpretable_reference_placeholder(len(refs) + 1))
+        return refs
 
-    chunks = []
+    highest_marker = max(n for _, n in markers)
+    target_count = int(expected_count or highest_marker)
+    target_count = max(target_count, highest_marker)
+    slots = {n: None for n in range(1, target_count + 1)}
 
-    # Recover bibliography text before the first surviving marker.
-    first_pos = markers[0][0]
+    # Text before the first surviving marker usually represents early entries
+    # whose [1], [2], ... markers were lost by PDF extraction.
+    first_pos, first_num = markers[0]
     prefix = text[:first_pos].strip()
-    if prefix:
-        prefix_refs = _split_by_year_author_boundaries_aggressive(prefix)
-        chunks.extend(r.strip() for r in prefix_refs if r.strip())
+    if prefix and first_num > 1:
+        pieces = _split_by_year_author_boundaries_aggressive(prefix)
+        pieces = [re.sub(r"\s+", " ", x).strip() for x in pieces if x.strip()]
+        # Align recovered prefix entries to the slots immediately preceding the
+        # first surviving marker. If fewer pieces are recovered, the remaining
+        # slots deliberately stay empty and become Cannot Interpret placeholders.
+        start_num = max(1, first_num - len(pieces))
+        for num, piece in zip(range(start_num, first_num), pieces[-(first_num-start_num):]):
+            slots[num] = piece
 
-    # Split using every surviving marker, not only the longest consecutive run.
+    # Every surviving marker owns its slot. If markers are missing between n
+    # and the next surviving marker, attempt to split the chunk into n..next-1.
     for i, (pos, marker_num) in enumerate(markers):
-        end = markers[i + 1][0] if i + 1 < len(markers) else len(text)
-        chunk = text[pos:end].strip()
-        chunk = re.sub(
-            r"^\s*(?:\[\s*\d{1,3}\s*\]|\d{1,3}\.)\s*",
-            "",
-            chunk,
-        ).strip()
+        next_pos = markers[i + 1][0] if i + 1 < len(markers) else len(text)
+        next_num = markers[i + 1][1] if i + 1 < len(markers) else target_count + 1
+        chunk = text[pos:next_pos].strip()
+        chunk = re.sub(r"^\s*(?:\[\s*\d{1,3}\s*\]|\d{1,3}\.)\s*", "", chunk).strip()
         if not chunk:
             continue
 
-        if i + 1 < len(markers):
-            next_num = markers[i + 1][1]
-            gap = next_num - marker_num
-        elif expected_count:
-            gap = expected_count - marker_num + 1
-        else:
-            gap = 1
-
-        # A numbering gap is evidence that one or more markers may have vanished.
+        gap = max(1, next_num - marker_num)
+        pieces = [chunk]
         if gap > 1:
             recovered = _split_chunk_using_author_boundaries(chunk, aggressive=False)
             if len(recovered) < min(gap, 2):
                 recovered = _split_chunk_using_author_boundaries(chunk, aggressive=True)
-            chunks.extend(recovered if len(recovered) > 1 else [chunk])
-        else:
-            chunks.append(chunk)
+            if len(recovered) > 1:
+                pieces = recovered
 
-    references = []
-    for ref in chunks:
-        ref = re.sub(
-            r"^\s*(?:\[\s*\d{1,3}\s*\]|\d{1,3}\.)\s*",
-            "",
-            ref,
-        )
-        ref = re.sub(r"\s+", " ", ref).strip()
-        if ref and len(ref) >= 20:
-            references.append(ref)
+        for offset, piece in enumerate(pieces[:gap]):
+            num = marker_num + offset
+            if 1 <= num <= target_count:
+                cleaned = re.sub(r"\s+", " ", piece).strip()
+                if cleaned:
+                    slots[num] = cleaned
 
-    # If still clearly short, inspect suspiciously long chunks again.
-    if expected_count and len(references) < expected_count * 0.90:
-        recovered = []
-        for ref in references:
-            if len(ref) >= 250:
-                pieces = _split_chunk_using_author_boundaries(ref, aggressive=True)
-                recovered.extend(pieces if len(pieces) > 1 else [ref])
-            else:
-                recovered.append(ref)
-        if len(recovered) > len(references):
-            references = recovered
-
-    # Whole-section fallback is accepted only when it improves the count.
-    if expected_count and len(references) < expected_count * 0.90:
-        fallback = _split_by_year_author_boundaries_aggressive(text)
-        cleaned_fallback = []
-        for ref in fallback:
-            ref = re.sub(
-                r"^\s*(?:\[\s*\d{1,3}\s*\]|\d{1,3}\.)\s*",
-                "",
-                ref,
-            )
-            ref = re.sub(r"\s+", " ", ref).strip()
-            if ref and len(ref) >= 20:
-                cleaned_fallback.append(ref)
-        if len(cleaned_fallback) > len(references):
-            references = cleaned_fallback
-
-    return references
+    # Never collapse numbering. Missing/unreadable slots remain represented.
+    return [slots[n] if slots[n] and len(slots[n]) >= 5
+            else _uninterpretable_reference_placeholder(n)
+            for n in range(1, target_count + 1)]
 
 
 def recover_glued_references(references, expected_count):
@@ -2116,6 +2102,15 @@ def preclassify_ieee_references(references, verification_rows, local_source_type
     ):
         parsed = parse_ieee_reference(ref)
 
+        if _is_uninterpretable_reference(ref):
+            preclassified[i] = {
+                "number": i, "status": "MANUAL_CHECK", "revised_reference": "",
+                "source_type": "Other", "italic_elements": "", "year": None,
+                "missing_required_elements": [],
+                "explanation": f"Cannot interpret reference [{i}] from the extracted PDF. The reference number has been preserved.",
+            }
+            continue
+
         if stype == "Journal Article":
             if not parsed.get("doi"):
                 preclassified[i] = {
@@ -2379,7 +2374,15 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
     # ---- DOI verification via OpenAlex ----
     verification_rows = []
     for ref, parsed in zip(references, parsed_refs):
-        v = verify_reference_against_openalex(ref, parsed)
+        if _is_uninterpretable_reference(ref):
+            v = {
+                "checked": False, "suspicious": False,
+                "reasons": ["Reference text could not be interpreted from PDF extraction."],
+                "openalex_metadata": None, "crossref_title": None,
+                "crossref_authors": [], "title_similarity": None, "author_overlap": None,
+            }
+        else:
+            v = verify_reference_against_openalex(ref, parsed)
         verification_rows.append(v)
 
     # ---- Pre-classification + AI reference review ----
@@ -2404,13 +2407,27 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
         structure_errors = ieee_structure_errors(original_clean)
 
         v = verification_rows[i - 1]
+        uninterpretable = _is_uninterpretable_reference(original_clean)
         oa_built = None
-        if v.get("checked") and not v.get("suspicious") and v.get("openalex_metadata"):
+        if (not uninterpretable) and v.get("checked") and not v.get("suspicious") and v.get("openalex_metadata"):
             oa_built = build_ieee_reference_from_openalex(
                 original_clean, v.get("openalex_metadata")
             )
 
-        if oa_built:
+        if uninterpretable:
+            corrected = ""
+            source_type = "Other"
+            source_type_origin = "Extraction-Placeholder"
+            parsed = parse_ieee_reference("")
+            deterministic_tokens = []
+            italic_elements = ""
+            local = {"Corrected": "", "Note": f"Cannot interpret reference [{i}] from the extracted PDF; numbering preserved."}
+            ai = {
+                "status": "MANUAL_CHECK",
+                "explanation": f"Cannot interpret reference [{i}] from the extracted PDF. Please check the original manuscript manually.",
+                "missing_required_elements": [],
+            }
+        elif oa_built:
             # DOI resolved and matched: OpenAlex bibliographic metadata is authoritative.
             corrected = oa_built["Corrected"]
             source_type = oa_built["Source Type"]
@@ -2472,7 +2489,10 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
             "Source Type": source_type,
             "Source Type Origin": source_type_origin,
             "Year": year,
-            "Original Reference": original_clean,
+            "Original Reference": (
+                f"Cannot interpret reference [{i}] from the extracted PDF."
+                if uninterpretable else original_clean
+            ),
             "Corrected Version": corrected_display,
             "Italicized in IEEE": italic_elements,
             "Italic Tokens": deterministic_tokens,
@@ -3413,12 +3433,26 @@ def render():
 
     # ---- Debug: show the reference section extracted from the PDF ----
     with st.expander("View reference section", expanded=False):
+        numbered_slice = "\n\n".join(
+            f"[{i}] " + (
+                "Cannot interpret reference from extracted PDF."
+                if _is_uninterpretable_reference(ref) else ref
+            )
+            for i, ref in enumerate(batch.get("references", []), start=1)
+        )
         st.text_area(
             "Reference slice",
-            batch.get("reference_text", ""),
+            numbered_slice,
             height=300,
             key=f"dbg_ref_{selected_key}",
         )
+        with st.expander("Raw extracted reference text", expanded=False):
+            st.text_area(
+                "Raw reference section",
+                batch.get("reference_text", ""),
+                height=220,
+                key=f"dbg_raw_ref_{selected_key}",
+            )
 
     # ---- Extraction quality warning ----
     quality = batch.get("reference_extraction_quality") or {}
