@@ -380,199 +380,154 @@ def _find_reference_section_topdown(text):
 
 
 # =========================================================
-# IEEE REFERENCE SPLITTING — bottom-up anchor
+# IEEE REFERENCE SPLITTING — robust marker + recovery logic
 # =========================================================
 
 _MARKER_TOKEN_RE = re.compile(
     r"(?:"
-    r"(?:(?<=\s)|^)\[\s*(\d{1,3})\s*\]"    # bracketed: [n]
+    r"(?:(?<=\s)|^)\[\s*(\d{1,3})\s*\]"          # [12]
     r"|"
-    r"(?:(?<=\s)|^)(\d{1,3})\.\s+(?=[A-Z])"  # numeric: "12. Author..."
+    r"(?:(?<=\s)|^)(\d{1,3})\.\s+(?=[A-Z])"     # 12. Author...
     r")"
     r"(?=\s|[A-Z]|$)"
 )
 
 
-def _find_all_markers(line):
+def _find_all_markers(text):
+    """Return every plausible IEEE reference marker as (position, number)."""
     hits = []
-    for m in _MARKER_TOKEN_RE.finditer(line):
+    for m in _MARKER_TOKEN_RE.finditer(text or ""):
         num_str = m.group(1) or m.group(2)
         if not num_str:
             continue
         try:
             num = int(num_str)
-        except ValueError:
+        except (TypeError, ValueError):
             continue
         if 1900 <= num <= 2099:
             continue
-        if num > 500:
+        if not (1 <= num <= 500):
             continue
         hits.append((m.start(), num))
     return hits
 
 
-def _looks_like_reference_start(text_after_marker):
-    tail = text_after_marker.lstrip()
-    if not tail:
-        return False
-    if tail[0].isupper() or tail[0] in '"\u201c':
-        return True
-    return False
-
-
-def split_references(reference_text):
-    if not reference_text:
-        return []
-
-    text = reference_text
-    text = re.sub(r"<<<PAGE_BREAK:\d+>>>", " ", text)
-    text = text.replace("\u2013", "-").replace("\u2014", "-")
-    text = text.replace("\u201c", '"').replace("\u201d", '"')
-    text = text.replace("\u00ad", "")
-    text = re.sub(r"\s+", " ", text).strip()
-
-    text = re.sub(r"([a-z])(\d{1,3})\]\s", r"\1 [\2] ", text)
-
-    all_hits = _find_all_markers(text)
-    if not all_hits:
-        return []
-
-    sequences = []
-    current = []
-    for pos, num in all_hits:
-        if not current:
-            current = [(pos, num)]
-            continue
-        prev_num = current[-1][1]
-        if num == prev_num + 1:
-            current.append((pos, num))
-        elif num > prev_num + 1:
-            sequences.append(current)
-            current = [(pos, num)]
-
-    if current:
-        sequences.append(current)
-
-    if not sequences:
-        return []
-    best = max(sequences, key=lambda s: (len(s), s[-1][0]))
-
-    markers = best
-    references = []
-    for i, (pos, num) in enumerate(markers):
-        start = pos
-        end = markers[i + 1][0] if i + 1 < len(markers) else len(text)
-        chunk = text[start:end].strip()
-        chunk = re.sub(r"^\[?\s*\d{1,3}\s*\]\s*", "", chunk).strip()
-        chunk = re.sub(r"\s+\d{1,3}\s*$", "", chunk).strip()
-        if chunk:
-            references.append(chunk)
-
-    numbered = sorted(zip([n for _, n in markers], references), key=lambda x: x[0])
-    return [ref for _, ref in numbered]
-
 def estimate_expected_reference_count(reference_text, full_text=None):
     """
-    IEEE reference lists are numbered. The highest [n] marker we can find
-    anywhere in the reference section (or body citations) is a reliable
-    upper bound for the number of references.
-
-    Returns None if no markers are found.
+    Estimate the expected IEEE bibliography size from the highest bracketed
+    reference number found in the reference section and full manuscript.
     """
     candidates = []
-
     for src in (reference_text or "", full_text or ""):
         for m in re.finditer(r"\[\s*(\d{1,3})\s*\]", src):
             try:
-                v = int(m.group(1))
-            except ValueError:
+                num = int(m.group(1))
+            except (TypeError, ValueError):
                 continue
-            if 1 <= v <= 500:
-                candidates.append(v)
+            if 1 <= num <= 500:
+                candidates.append(num)
+    return max(candidates) if candidates else None
 
-    if not candidates:
-        return None
-    return max(candidates)
+
+def _normalize_reference_text(text):
+    """Normalize PDF artifacts while preserving bibliography boundaries."""
+    if not text:
+        return ""
+    text = re.sub(r"<<<PAGE_BREAK:\d+>>>", " ", text)
+    text = (
+        text.replace("\u00ad", "")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u00a0", " ")
+    )
+    # Repair cases such as "author.[12]" or "2024.[13]".
+    text = re.sub(r"(?<=[A-Za-z0-9.,;)])\[(\d{1,3})\]", r" [\1]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def _split_by_year_author_boundaries(text):
     """
-    Fallback splitter when [n] markers are absent or too sparse.
-
-    A reference in IEEE almost always:
-      - ENDS with a 4-digit year, optionally followed by ", doi:",
-        ". doi:", ". URL", or a period.
-      - BEGINS (after the previous ref's terminator) with an
-        initials-surname author block: "N. Dwivedi", "F. Schwarz",
-        or a surname-comma-initials form "Smith, J."
+    Conservative recovery splitter for chunks where one or more [n] markers
+    disappeared during PDF extraction. A cut is accepted only when a likely
+    reference terminator is followed by a likely new author block.
     """
-    year_terminator = re.compile(
-        r"(?<=[a-zA-Z0-9\)\]\}])"
-        r"(?:,\s*|\s+)"
-        r"((?:19|20)\d{2})"
-        r"(?:\.\s*doi:\s*|\.\s*https?://|\.\s*$|\.\s+(?=[A-Z])|,\s*doi:)"
-    )
+    text = (text or "").strip()
+    if not text:
+        return []
 
-    author_start = re.compile(
+    author_start = (
         r"(?:"
-        r"[A-Z]\.(?:\s*[A-Z]\.)*\s+[A-Z][a-zA-Z'\-]+"    # "N. Dwivedi"
+        r"[A-Z](?:[-.]?[A-Z])?\."
+        r"(?:\s*[A-Z](?:[-.]?[A-Z])?\.)*"
+        r"\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
         r"|"
-        r"[A-Z][a-zA-Z'\-]+,\s+[A-Z]\."                   # "Smith, J."
+        r"[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+,\s*[A-Z]\."
         r")"
     )
 
-    cut_points = []
-    for m in year_terminator.finditer(text):
-        end = m.end()
-        tail = text[end:end + 80]
-        # Only cut here if a NEW author-start appears right after
-        if author_start.match(tail.lstrip()):
-            cut_points.append(end)
+    boundary_re = re.compile(
+        r"("
+        r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.?"
+        r"|"
+        r"(?:19|20)\d{2}\."
+        r")"
+        r"\s+(?=" + author_start + r")",
+        re.I,
+    )
 
-    if not cut_points:
-        return [text.strip()] if text.strip() else []
+    cuts = [m.end() for m in boundary_re.finditer(text)]
+    if not cuts:
+        return [text]
 
-    references = []
-    prev = 0
-    for cut in cut_points:
-        chunk = text[prev:cut].strip()
+    refs = []
+    start = 0
+    for cut in cuts:
+        chunk = text[start:cut].strip()
         if chunk:
-            references.append(chunk)
-        prev = cut
-    tail = text[prev:].strip()
+            refs.append(chunk)
+        start = cut
+    tail = text[start:].strip()
     if tail:
-        references.append(tail)
-
-    return references
+        refs.append(tail)
+    return refs
 
 
 def _split_by_year_author_boundaries_aggressive(text):
-    """
-    Looser variant: cut at every year-terminator followed by an author-start,
-    even without trailing period/DOI. Used only as a last resort.
-    """
-    boundary_re = re.compile(
+    """Looser last-resort splitter used only when extraction remains short."""
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    author_start = (
         r"(?:"
-        r"((?:19|20)\d{2})"
+        r"[A-Z](?:[-.]?[A-Z])?\."
+        r"(?:\s*[A-Z](?:[-.]?[A-Z])?\.)*"
+        r"\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
         r"|"
-        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)"
-        r"|"
-        r"(https?://\S+)"
-        r"|"
-        r"(pp?\.\s*\d+(?:\s*[-–]\s*\d+)?)"
-        r")"
-        r"\.\s*"
-        r"(?="
-        r"[A-Z]\.(?:\s*[A-Z]\.)*\s+[A-Z][a-zA-Z'\-]+"
-        r"|"
-        r"[A-Z][a-zA-Z'\-]+,\s+[A-Z]\."
+        r"[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+,\s*[A-Z]\."
         r")"
     )
 
+    boundary_re = re.compile(
+        r"("
+        r"(?:19|20)\d{2}\.?"
+        r"|10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.?"
+        r"|https?://\S+?\."
+        r"|pp?\.\s*\d+(?:\s*[-–]\s*\d+)?\."
+        r")\s+(?=" + author_start + r")",
+        re.I,
+    )
+
+    cuts = [m.end() for m in boundary_re.finditer(text)]
+    if not cuts:
+        return [text]
+
     parts = []
     last = 0
-    for m in boundary_re.finditer(text):
-        cut = m.end()
+    for cut in cuts:
         chunk = text[last:cut].strip()
         if chunk:
             parts.append(chunk)
@@ -581,48 +536,144 @@ def _split_by_year_author_boundaries_aggressive(text):
     if tail:
         parts.append(tail)
 
-    # Merge tiny fragments into previous
     merged = []
-    for p in parts:
-        if len(p) < 40 and merged:
-            merged[-1] = merged[-1] + " " + p
+    for part in parts:
+        if len(part) < 40 and merged:
+            merged[-1] = merged[-1] + " " + part
         else:
-            merged.append(p)
-
+            merged.append(part)
     return merged if len(merged) > 1 else [text]
 
 
+def _split_chunk_using_author_boundaries(chunk, aggressive=False):
+    if aggressive:
+        return _split_by_year_author_boundaries_aggressive(chunk)
+    return _split_by_year_author_boundaries(chunk)
+
+
+def split_references(reference_text, expected_count=None):
+    """
+    Robust IEEE bibliography splitter.
+
+    Unlike the previous implementation, this does NOT discard marker runs
+    merely because one intermediate [n] marker vanished in PDF extraction.
+    All surviving markers are retained, marker gaps trigger recovery splitting,
+    and text before the first surviving marker is also recovered.
+    """
+    if not reference_text:
+        return []
+
+    text = _normalize_reference_text(reference_text)
+    if not text:
+        return []
+
+    markers = sorted(set(_find_all_markers(text)), key=lambda x: x[0])
+
+    # If no markers survived, use bibliographic boundaries as fallback.
+    if not markers:
+        refs = _split_by_year_author_boundaries_aggressive(text)
+        return [re.sub(r"\s+", " ", r).strip() for r in refs if r.strip()]
+
+    chunks = []
+
+    # Recover bibliography text before the first surviving marker.
+    first_pos = markers[0][0]
+    prefix = text[:first_pos].strip()
+    if prefix:
+        prefix_refs = _split_by_year_author_boundaries_aggressive(prefix)
+        chunks.extend(r.strip() for r in prefix_refs if r.strip())
+
+    # Split using every surviving marker, not only the longest consecutive run.
+    for i, (pos, marker_num) in enumerate(markers):
+        end = markers[i + 1][0] if i + 1 < len(markers) else len(text)
+        chunk = text[pos:end].strip()
+        chunk = re.sub(
+            r"^\s*(?:\[\s*\d{1,3}\s*\]|\d{1,3}\.)\s*",
+            "",
+            chunk,
+        ).strip()
+        if not chunk:
+            continue
+
+        if i + 1 < len(markers):
+            next_num = markers[i + 1][1]
+            gap = next_num - marker_num
+        elif expected_count:
+            gap = expected_count - marker_num + 1
+        else:
+            gap = 1
+
+        # A numbering gap is evidence that one or more markers may have vanished.
+        if gap > 1:
+            recovered = _split_chunk_using_author_boundaries(chunk, aggressive=False)
+            if len(recovered) < min(gap, 2):
+                recovered = _split_chunk_using_author_boundaries(chunk, aggressive=True)
+            chunks.extend(recovered if len(recovered) > 1 else [chunk])
+        else:
+            chunks.append(chunk)
+
+    references = []
+    for ref in chunks:
+        ref = re.sub(
+            r"^\s*(?:\[\s*\d{1,3}\s*\]|\d{1,3}\.)\s*",
+            "",
+            ref,
+        )
+        ref = re.sub(r"\s+", " ", ref).strip()
+        if ref and len(ref) >= 20:
+            references.append(ref)
+
+    # If still clearly short, inspect suspiciously long chunks again.
+    if expected_count and len(references) < expected_count * 0.90:
+        recovered = []
+        for ref in references:
+            if len(ref) >= 250:
+                pieces = _split_chunk_using_author_boundaries(ref, aggressive=True)
+                recovered.extend(pieces if len(pieces) > 1 else [ref])
+            else:
+                recovered.append(ref)
+        if len(recovered) > len(references):
+            references = recovered
+
+    # Whole-section fallback is accepted only when it improves the count.
+    if expected_count and len(references) < expected_count * 0.90:
+        fallback = _split_by_year_author_boundaries_aggressive(text)
+        cleaned_fallback = []
+        for ref in fallback:
+            ref = re.sub(
+                r"^\s*(?:\[\s*\d{1,3}\s*\]|\d{1,3}\.)\s*",
+                "",
+                ref,
+            )
+            ref = re.sub(r"\s+", " ", ref).strip()
+            if ref and len(ref) >= 20:
+                cleaned_fallback.append(ref)
+        if len(cleaned_fallback) > len(references):
+            references = cleaned_fallback
+
+    return references
+
+
 def recover_glued_references(references, expected_count):
-    """
-    When splitting left refs glued together, split the longest chunks
-    using year + author-start boundaries. Two passes: primary, then
-    aggressive if still short.
-    """
+    """Additional safety pass for unusually long glued bibliography chunks."""
     if not references:
         return references
 
-    # Pass 1: split anything suspiciously long
     recovered = []
     for ref in references:
         if len(ref) <= 300:
             recovered.append(ref)
             continue
         parts = _split_by_year_author_boundaries(ref)
-        if len(parts) > 1:
-            recovered.extend(parts)
-        else:
-            recovered.append(ref)
+        recovered.extend(parts if len(parts) > 1 else [ref])
 
-    # Pass 2: aggressive if still short
-    if expected_count and len(recovered) < expected_count * 0.9:
+    if expected_count and len(recovered) < expected_count * 0.90:
         aggressive = []
         for ref in recovered:
             parts = _split_by_year_author_boundaries_aggressive(ref)
-            if len(parts) > 1:
-                aggressive.extend(parts)
-            else:
-                aggressive.append(ref)
-        recovered = aggressive
+            aggressive.extend(parts if len(parts) > 1 else [ref])
+        if len(aggressive) > len(recovered):
+            recovered = aggressive
 
     return recovered
 
@@ -1977,10 +2028,11 @@ def extract_ieee_pdf(uploaded_file, batch, manuscript_year):
     if reference_text is None:
         raise ValueError("I could not detect a References section.")
 
-    references = split_references(reference_text)
-
-    # ---- Estimate how many refs we SHOULD have gotten ----
+    # ---- Estimate expected bibliography size BEFORE splitting ----
     expected_count = estimate_expected_reference_count(reference_text, full_text)
+
+    # ---- Split with expected count available for marker-gap recovery ----
+    references = split_references(reference_text, expected_count=expected_count)
 
     # ---- Attempt recovery if we came up short ----
     if expected_count and len(references) < expected_count * 0.9:
