@@ -2508,6 +2508,8 @@ def build_ieee_docx(result):
 
             _add_divider(doc)
 
+    doc.add_page_break()
+
     # ========================================================
     # 3. REFERENCE LIST (IEEE STYLE)
     # ========================================================
