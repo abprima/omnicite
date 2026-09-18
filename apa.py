@@ -2582,12 +2582,30 @@ def render():
     if not any_done:
         return
 
-    selector_options = [k for k, _ in file_keys]
+    # Only show manuscripts that actually have a batch in session state.
+    # A PDF can fail before its batch is created (for example, no valid
+    # References section).  Keeping that key in the selectbox caused
+    # format_func to index pdf_batches[k] and raise KeyError.
+    selector_options = [
+        k for k, _ in file_keys
+        if k in st.session_state["pdf_batches"]
+    ]
+
+    if not selector_options:
+        st.info(
+            "No manuscript is available for review yet. "
+            "Please process a PDF successfully first."
+        )
+        return
 
     def _fmt(k):
-        b = st.session_state["pdf_batches"][k]
+        # Defensive lookup: format_func must never crash even if Streamlit
+        # briefly retains a stale widget option during a rerun.
+        b = st.session_state["pdf_batches"].get(k)
+        if not b:
+            return str(k).split("::", 1)[-1]
         suffix = "" if b.get("ai_done") else "  (not yet processed)"
-        return b["filename"] + suffix
+        return b.get("filename", str(k).split("::", 1)[-1]) + suffix
 
     selected_key = st.selectbox(
         "Select manuscript to review",
