@@ -341,7 +341,23 @@ def extract_parenthetical_citations(text):
                 re.search(r"[A-Za-z],\s+[A-Z]", author_part_clean)
             )
 
-            if not has_comma_between_names and not et_al and author_part_clean:
+            # Parenthetical citations with exactly two authors must keep the
+            # two surnames separate.  Previously, a crowded citation such as
+            # ``(Naeem & Ozuem, 2021; Rahayu et al., 2022)`` stored the first
+            # item as one author string ("Naeem & Ozuem").  Reference matching
+            # then looked for that whole string and incorrectly reported the
+            # Naeem reference as NOT CITED IN TEXT.
+            two_author_match = re.fullmatch(
+                r"\s*([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+                r"\s*(?:&|and|dan)\s*"
+                r"([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)\s*",
+                author_part_clean,
+                flags=re.I,
+            )
+
+            if two_author_match and not et_al:
+                authors = [two_author_match.group(1), two_author_match.group(2)]
+            elif not has_comma_between_names and not et_al and author_part_clean:
                 authors = [author_part_clean]
             else:
                 authors = re.findall(
@@ -350,7 +366,7 @@ def extract_parenthetical_citations(text):
                 )
                 authors = [
                     a for a in authors
-                    if a.lower() not in {"and", "according", "see", "cf"}
+                    if a.lower() not in {"and", "dan", "according", "see", "cf"}
                 ]
 
             if not authors:
@@ -607,6 +623,44 @@ def extract_narrative_citations(text):
         occupied.append((m.start(), m.end()))
 
     return citations
+
+
+def extract_crowded_parenthetical_groups(text):
+    """Return multi-source APA parenthetical groups whose order can be checked.
+
+    This is deliberately separate from ``extract_parenthetical_citations`` so
+    individual citation extraction, citation counts, and reference matching are
+    unchanged.  A crowded group is only a formatting-review object.
+    """
+    groups = []
+    for m in re.finditer(r"\(([^()]+)\)", text):
+        content = m.group(1).strip()
+        if ";" not in content:
+            continue
+
+        parts = [p.strip() for p in content.split(";") if p.strip()]
+        if len(parts) < 2 or not all(_YEAR_RE.search(p) for p in parts):
+            continue
+
+        def first_author_key(part):
+            ym = _YEAR_RE.search(part)
+            author_text = part[:ym.start()].strip(" ,") if ym else part
+            author_text = re.sub(r"\bet\s+al\.", "", author_text, flags=re.I).strip()
+            # The first author is the first surname/token before &, and, dan, or comma.
+            first = re.split(r"\s*(?:&|\band\b|\bdan\b|,)\s*", author_text, maxsplit=1, flags=re.I)[0]
+            first = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ'’\- ]+", "", first).strip()
+            return first.casefold()
+
+        ordered_parts = sorted(parts, key=first_author_key)
+        original = f"({content})"
+        revised = f"({'; '.join(ordered_parts)})"
+        groups.append({
+            "type": "parenthetical_multiple",
+            "raw": original,
+            "revised": revised,
+            "needs_reorder": parts != ordered_parts,
+        })
+    return groups
 
 
 def extract_all_citations(text):
@@ -2367,6 +2421,28 @@ def process_single_pdf(uf, batch, client, openalex_api_key, manuscript_year):
             "Status": ("REVISED" if revised != c["raw"] else (ai.get("status") or "MATCH")).upper(),
             "Missing From References": False,
             "Notes": note,
+        })
+
+    # ---- Stage F2: crowded/multiple-source parenthetical ordering ----
+    # Keep this separate from batch["citations"] so citation totals and
+    # citation-to-reference matching remain exactly as before.  We add a
+    # correction row only when a semicolon-separated parenthetical group is
+    # not alphabetized by first-author surname.
+    crowded_groups = extract_crowded_parenthetical_groups(batch.get("body_text", "") or batch.get("full_text", ""))
+    for group in crowded_groups:
+        if not group.get("needs_reorder"):
+            continue
+        cit_rows.append({
+            "No.": len(cit_rows) + 1,
+            "Type": "Parenthetical — Multiple Sources",
+            "Original Citation": group["raw"],
+            "Revised Citation": group["revised"],
+            "Status": "REVISED",
+            "Missing From References": False,
+            "Notes": (
+                "Multiple sources in the same parentheses must be ordered "
+                "alphabetically by first-author surname."
+            ),
         })
 
     # ---- Stage G: attach to batch ----
