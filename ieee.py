@@ -2327,7 +2327,7 @@ def build_ieee_docx(result):
 
     meta = doc.add_paragraph()
     mr = meta.add_run(
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: IEEE-P1-P4-v2"
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: OmniCite-IEEE-v1"
     )
     _set_run_font(mr, size_pt=9, italic=True)
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
