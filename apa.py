@@ -381,14 +381,25 @@ def extract_narrative_citations(text):
     #   Author1, Author2 et al. (2022)
     # ------------------------------------------------------------------
     for m in re.finditer(
-        r"\b("
-        r"[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
-        r"(?:\s*,\s*[A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)+"
-        r")"
-        r"\s*,?\s*et\s+al\.\s*"
+        r"\b([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)"
+        r"\s+et\s+al\.\s*,\s*"
         r"\(((?:19|20)\d{2})[a-z]?\)",
         text,
     ):
+        if _overlaps(m.start(), m.end()):
+            continue
+
+        citations.append({
+            "author": m.group(1),
+            "authors": [m.group(1)],
+            "year": m.group(2),
+            "type": "narrative",
+            "et_al": True,
+            "raw": m.group(0),
+            "malformed": True,
+        })
+        occupied.append((m.start(), m.end()))
+
         author_text = m.group(1)
         authors = [a.strip() for a in author_text.split(",") if a.strip()]
         if not authors:
