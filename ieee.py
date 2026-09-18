@@ -384,8 +384,11 @@ def _find_reference_section_topdown(text):
 # =========================================================
 
 _MARKER_TOKEN_RE = re.compile(
-    r"(?:(?<=\s)|^)"
-    r"\[?\s*(\d{1,3})\s*\]"
+    r"(?:"
+    r"(?:(?<=\s)|^)\[\s*(\d{1,3})\s*\]"    # bracketed: [n]
+    r"|"
+    r"(?:(?<=\s)|^)(\d{1,3})\.\s+(?=[A-Z])"  # numeric: "12. Author..."
+    r")"
     r"(?=\s|[A-Z]|$)"
 )
 
@@ -393,8 +396,11 @@ _MARKER_TOKEN_RE = re.compile(
 def _find_all_markers(line):
     hits = []
     for m in _MARKER_TOKEN_RE.finditer(line):
+        num_str = m.group(1) or m.group(2)
+        if not num_str:
+            continue
         try:
-            num = int(m.group(1))
+            num = int(num_str)
         except ValueError:
             continue
         if 1900 <= num <= 2099:
@@ -465,6 +471,160 @@ def split_references(reference_text):
     numbered = sorted(zip([n for _, n in markers], references), key=lambda x: x[0])
     return [ref for _, ref in numbered]
 
+def estimate_expected_reference_count(reference_text, full_text=None):
+    """
+    IEEE reference lists are numbered. The highest [n] marker we can find
+    anywhere in the reference section (or body citations) is a reliable
+    upper bound for the number of references.
+
+    Returns None if no markers are found.
+    """
+    candidates = []
+
+    for src in (reference_text or "", full_text or ""):
+        for m in re.finditer(r"\[\s*(\d{1,3})\s*\]", src):
+            try:
+                v = int(m.group(1))
+            except ValueError:
+                continue
+            if 1 <= v <= 500:
+                candidates.append(v)
+
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _split_by_year_author_boundaries(text):
+    """
+    Fallback splitter when [n] markers are absent or too sparse.
+
+    A reference in IEEE almost always:
+      - ENDS with a 4-digit year, optionally followed by ", doi:",
+        ". doi:", ". URL", or a period.
+      - BEGINS (after the previous ref's terminator) with an
+        initials-surname author block: "N. Dwivedi", "F. Schwarz",
+        or a surname-comma-initials form "Smith, J."
+    """
+    year_terminator = re.compile(
+        r"(?<=[a-zA-Z0-9\)\]\}])"
+        r"(?:,\s*|\s+)"
+        r"((?:19|20)\d{2})"
+        r"(?:\.\s*doi:\s*|\.\s*https?://|\.\s*$|\.\s+(?=[A-Z])|,\s*doi:)"
+    )
+
+    author_start = re.compile(
+        r"(?:"
+        r"[A-Z]\.(?:\s*[A-Z]\.)*\s+[A-Z][a-zA-Z'\-]+"    # "N. Dwivedi"
+        r"|"
+        r"[A-Z][a-zA-Z'\-]+,\s+[A-Z]\."                   # "Smith, J."
+        r")"
+    )
+
+    cut_points = []
+    for m in year_terminator.finditer(text):
+        end = m.end()
+        tail = text[end:end + 80]
+        # Only cut here if a NEW author-start appears right after
+        if author_start.match(tail.lstrip()):
+            cut_points.append(end)
+
+    if not cut_points:
+        return [text.strip()] if text.strip() else []
+
+    references = []
+    prev = 0
+    for cut in cut_points:
+        chunk = text[prev:cut].strip()
+        if chunk:
+            references.append(chunk)
+        prev = cut
+    tail = text[prev:].strip()
+    if tail:
+        references.append(tail)
+
+    return references
+
+
+def _split_by_year_author_boundaries_aggressive(text):
+    """
+    Looser variant: cut at every year-terminator followed by an author-start,
+    even without trailing period/DOI. Used only as a last resort.
+    """
+    boundary_re = re.compile(
+        r"(?:"
+        r"((?:19|20)\d{2})"
+        r"|"
+        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)"
+        r"|"
+        r"(https?://\S+)"
+        r"|"
+        r"(pp?\.\s*\d+(?:\s*[-–]\s*\d+)?)"
+        r")"
+        r"\.\s*"
+        r"(?="
+        r"[A-Z]\.(?:\s*[A-Z]\.)*\s+[A-Z][a-zA-Z'\-]+"
+        r"|"
+        r"[A-Z][a-zA-Z'\-]+,\s+[A-Z]\."
+        r")"
+    )
+
+    parts = []
+    last = 0
+    for m in boundary_re.finditer(text):
+        cut = m.end()
+        chunk = text[last:cut].strip()
+        if chunk:
+            parts.append(chunk)
+        last = cut
+    tail = text[last:].strip()
+    if tail:
+        parts.append(tail)
+
+    # Merge tiny fragments into previous
+    merged = []
+    for p in parts:
+        if len(p) < 40 and merged:
+            merged[-1] = merged[-1] + " " + p
+        else:
+            merged.append(p)
+
+    return merged if len(merged) > 1 else [text]
+
+
+def recover_glued_references(references, expected_count):
+    """
+    When splitting left refs glued together, split the longest chunks
+    using year + author-start boundaries. Two passes: primary, then
+    aggressive if still short.
+    """
+    if not references:
+        return references
+
+    # Pass 1: split anything suspiciously long
+    recovered = []
+    for ref in references:
+        if len(ref) <= 300:
+            recovered.append(ref)
+            continue
+        parts = _split_by_year_author_boundaries(ref)
+        if len(parts) > 1:
+            recovered.extend(parts)
+        else:
+            recovered.append(ref)
+
+    # Pass 2: aggressive if still short
+    if expected_count and len(recovered) < expected_count * 0.9:
+        aggressive = []
+        for ref in recovered:
+            parts = _split_by_year_author_boundaries_aggressive(ref)
+            if len(parts) > 1:
+                aggressive.extend(parts)
+            else:
+                aggressive.append(ref)
+        recovered = aggressive
+
+    return recovered
 
 # =========================================================
 # IEEE REFERENCE PARSER
@@ -1818,6 +1978,25 @@ def extract_ieee_pdf(uploaded_file, batch, manuscript_year):
         raise ValueError("I could not detect a References section.")
 
     references = split_references(reference_text)
+
+    # ---- Estimate how many refs we SHOULD have gotten ----
+    expected_count = estimate_expected_reference_count(reference_text, full_text)
+
+    # ---- Attempt recovery if we came up short ----
+    if expected_count and len(references) < expected_count * 0.9:
+        recovered = recover_glued_references(references, expected_count)
+        if len(recovered) > len(references):
+            references = recovered
+
+    extraction_quality = {
+        "expected_count": expected_count,
+        "actual_count": len(references),
+        "complete": (
+            expected_count is None
+            or len(references) >= int(expected_count * 0.9)
+        ),
+    }
+
     parsed_refs = [parse_ieee_reference(r) for r in references]
     local_source_types = [p.get("source_type", "Other") for p in parsed_refs]
 
@@ -1837,6 +2016,8 @@ def extract_ieee_pdf(uploaded_file, batch, manuscript_year):
         "removed_running_text": removed_running_text,
         "style_spans": style_spans,
         "manuscript_year": int(manuscript_year),
+        "expected_reference_count": expected_count,
+        "reference_extraction_quality": extraction_quality,
         "ai_done": False,
     })
     return batch
@@ -2882,6 +3063,19 @@ def render():
             batch.get("reference_text", ""),
             height=300,
             key=f"dbg_ref_{selected_key}",
+        )
+
+    # ---- Extraction quality warning ----
+    quality = batch.get("reference_extraction_quality") or {}
+    if not quality.get("complete", True):
+        expected = quality.get("expected_count")
+        actual = quality.get("actual_count")
+        st.warning(
+            f"⚠️ **Reference extraction may be incomplete.** "
+            f"The manuscript appears to contain **{expected}** references "
+            f"(based on the highest `[n]` marker found), but only "
+            f"**{actual}** were successfully extracted. "
+            f"Please verify the reference list manually."
         )
 
     reference_rows = batch.get("reference_comparison", [])
