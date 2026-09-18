@@ -996,22 +996,38 @@ def parse_ieee_reference(reference):
         result["first_author"] = authors[0]
 
     low = reference.lower()
-    if re.search(r"\b(proc\.|proceedings|conference|symposium|workshop)\b", low):
+
+    # Conference/proceedings evidence takes precedence over DOI.
+    conference_pattern = (
+        r"\b(?:proc\.?|proceedings|conference|symposium|workshop|"
+        r"congress|congres|colloquium|convention|seminar|procedia|meeting|"
+        r"international\s+conference)\b"
+    )
+    journal_pattern = (
+        r"\b(?:journal|jurnal|review|quarterly|bulletin|transactions|letters|magazine)\b"
+    )
+    book_pattern = r"\b(?:book|monograph|handbook|textbook)\b"
+    report_pattern = (
+        r"\b(?:tech\.?\s*rep\.?|technical\s+report|report|working\s+paper|"
+        r"white\s+paper|standard)\b"
+    )
+    chapter_pattern = r"\b(?:ed\.|eds\.|chapter)\b"
+
+    if re.search(conference_pattern, low):
         result["source_type"] = "Conference Paper"
-    elif re.search(r"\b(ieee|acm)\s+trans\.", low) or re.search(r"\bjournal\b", low):
-        result["source_type"] = "Journal Article"
-    elif re.search(r"\b(vol\.|no\.|pp\.)\b", low) and result["venue"]:
-        result["source_type"] = "Journal Article"
-    elif re.search(r"\b(book|monograph|handbook)\b", low):
-        result["source_type"] = "Book"
-    elif re.search(r"\b(tech\.?\s*rep\.?|technical report|report)\b", low):
-        result["source_type"] = "Technical Report"
-    elif re.search(r"\b(ed\.|eds\.|chapter)\b", low):
+    elif re.search(chapter_pattern, low):
         result["source_type"] = "Book Chapter"
+    elif re.search(book_pattern, low):
+        result["source_type"] = "Book"
+    elif re.search(report_pattern, low):
+        result["source_type"] = "Technical Report"
+    elif re.search(journal_pattern, low) or (result["volume"] and result["pages"] and result["venue"]):
+        result["source_type"] = "Journal Article"
     elif re.search(r"https?://", low) and not result["doi"]:
         result["source_type"] = "Web Page"
-    elif result["doi"]:
-        result["source_type"] = "Journal Article"
+    else:
+        # DOI alone does NOT establish a journal article.
+        result["source_type"] = "Other"
 
     return result
 
@@ -1086,14 +1102,19 @@ def _fetch_openalex_metadata(doi):
 
 
 def _openalex_ieee_source_type(meta, original_reference=""):
-    """Map OpenAlex metadata to the source types used by OmniCite."""
+    """Map OpenAlex metadata to OmniCite source types; conference evidence wins."""
     if not meta or meta.get("_not_found"):
         return "Other"
     wt = str(meta.get("work_type") or "").lower()
     ct = str(meta.get("crossref_type") or "").lower()
     st = str(meta.get("source_type") or "").lower()
-    hay = " ".join([wt, ct, st, meta.get("venue") or "", original_reference or ""]).lower()
-    if any(x in hay for x in ("proceedings", "conference", "symposium", "workshop")):
+    venue = str(meta.get("venue") or "")
+    hay = " ".join([wt, ct, st, venue, original_reference or ""]).lower()
+
+    if any(x in hay for x in (
+        "proceedings", "conference", "symposium", "workshop", "congress",
+        "colloquium", "convention", "seminar", "procedia", "meeting"
+    )):
         return "Conference Paper"
     if "book-chapter" in hay or "book chapter" in hay or "chapter" in wt:
         return "Book Chapter"
@@ -1971,7 +1992,11 @@ IEEE STYLE RULES:
 - All authors must be listed; "et al." is NOT allowed.
 - Article titles: double quotes, Title Case.
 - Journal / conference names: italic (list them in "italic_elements").
-- SOURCE TYPE CLASSIFICATION IS STRICT: if an entry contains "in" followed by a conference/proceedings/symposium/workshop name, classify it as "Conference Paper", NOT "Journal Article", even when it has an IEEE DOI. A DOI does not make a source a journal article.
+- SOURCE TYPE PRECEDENCE IS STRICT:
+  a) Conference Paper if the entry or venue contains Proc./Proceedings/Conference/Symposium/Workshop/Congress/Colloquium/Convention/Seminar/Procedia/Meeting.
+  b) Journal Article only with clear journal evidence such as Journal/Transactions/Letters/Review, or journal-like volume+pages metadata.
+  c) Otherwise classify Book, Book Chapter, Technical Report, Web Page, or Other as applicable.
+- NEVER classify an entry as Journal Article merely because a DOI is present. Conference and proceedings papers also have DOIs.
 - Volume: "vol. X". Issue: "no. Y". Pages: "pp. Z-W".
 - DOI: "doi: 10.xxxx/xxxxx" — never https://doi.org/.
 - Must end with a period.
@@ -2389,6 +2414,7 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
             # DOI resolved and matched: OpenAlex bibliographic metadata is authoritative.
             corrected = oa_built["Corrected"]
             source_type = oa_built["Source Type"]
+            source_type_origin = "OpenAlex"
             parsed = parse_ieee_reference(corrected)
             deterministic_tokens = oa_built.get("Italic Tokens", [])
             italic_elements = ", ".join(deterministic_tokens)
@@ -2403,7 +2429,23 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
 
             local_source_type = normalize_source_type(parsed.get("source_type"))
             ai_source_type = normalize_source_type(ai.get("source_type"))
-            source_type = local_source_type if local_source_type != "Other" else ai_source_type
+
+            # Strong conference/proceedings evidence in the actual reference wins
+            # over an AI journal guess. DOI presence is intentionally ignored here.
+            strong_conference_signal = bool(re.search(
+                r"\b(?:proc\.?|proceedings|conference|symposium|workshop|congress|"
+                r"congres|colloquium|convention|seminar|procedia|meeting)\b",
+                corrected.lower(),
+            ))
+            if strong_conference_signal and local_source_type != "Book":
+                source_type = "Conference Paper"
+                source_type_origin = "Local-Strong"
+            elif local_source_type != "Other":
+                source_type = local_source_type
+                source_type_origin = "Local"
+            else:
+                source_type = ai_source_type
+                source_type_origin = "AI"
 
             deterministic_tokens = compute_ieee_italic_tokens(source_type, corrected, parsed)
             italic_elements = ", ".join(deterministic_tokens)
@@ -2428,6 +2470,7 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
         rows.append({
             "No.": i,
             "Source Type": source_type,
+            "Source Type Origin": source_type_origin,
             "Year": year,
             "Original Reference": original_clean,
             "Corrected Version": corrected_display,
