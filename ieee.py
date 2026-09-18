@@ -2786,13 +2786,6 @@ def build_ieee_docx(result):
             hrun = head.add_run(f"{i}. ")
             _set_run_font(hrun, size_pt=11, bold=True)
 
-            type_run = head.add_run("[Bracketed]")
-            _set_run_font(type_run, size_pt=11, bold=True)
-
-            page_no = row.get("Page")
-            if page_no:
-                _add_run(head, f"  — Page {page_no}", size_pt=10, italic=True)
-
             if has_orphan:
                 _add_run(head, "  [NOT IN REFERENCES]",
                          size_pt=10, bold=True, italic=True, red=True)
