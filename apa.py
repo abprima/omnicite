@@ -2454,8 +2454,17 @@ def render():
         "Upload manuscript PDFs",
         type=["pdf"],
         accept_multiple_files=True,
+        help="Upload up to 15 PDF files at a time.",
         key=f"apa_uploader_{st.session_state['apa_uploader_version']}",
     )
+
+    if uploaded_files and len(uploaded_files) > 15:
+        st.error(
+            f"Maximum 15 PDF files can be uploaded at a time. "
+            f"You selected {len(uploaded_files)} files. Please remove "
+            f"{len(uploaded_files) - 15} file(s)."
+        )
+        return
 
     if "pdf_batches" not in st.session_state:
         st.session_state["pdf_batches"] = {}
