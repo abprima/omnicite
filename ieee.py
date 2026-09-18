@@ -1319,7 +1319,7 @@ def verify_reference_against_openalex(reference, parsed):
     if meta.get("_not_found"):
         result["checked"] = True
         result["suspicious"] = True
-        result["reasons"].append("DOI does not resolve in OpenAlex (possible fake DOI).")
+        result["reasons"].append("DOI does not resolve (possible fake DOI).")
         return result
 
     result["checked"] = True
@@ -3200,7 +3200,7 @@ def build_ieee_docx(result):
                 )
                 oa_title = row.get("OpenAlex Title")
                 if oa_title:
-                    comment_parts.append(f'OpenAlex title: "{oa_title}"')
+                    comment_parts.append(f'Source title: "{oa_title}"')
             elif withheld:
                 comment_parts.append(
                     "DOI not provided — automated verification/correction withheld."
