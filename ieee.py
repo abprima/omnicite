@@ -1032,6 +1032,7 @@ def _normalize_doi_for_lookup(doi):
 
 
 def _fetch_openalex_metadata(doi):
+    """Fetch rich OpenAlex metadata for a DOI. None means unavailable; _not_found means DOI did not resolve."""
     if not doi:
         return None
     try:
@@ -1039,27 +1040,22 @@ def _fetch_openalex_metadata(doi):
     except Exception:
         return None
 
-    api_key = _get_openalex_api_key()
-    if not api_key:
-        return None
-
     clean = _normalize_doi_for_lookup(doi)
     if not clean:
         return None
 
+    api_key = _get_openalex_api_key()
     url = f"https://api.openalex.org/works/doi:{clean}"
+    params = {"api_key": api_key} if api_key else {}
     try:
-        r = requests.get(url, params={"api_key": api_key}, timeout=10)
+        r = requests.get(url, params=params, timeout=10)
         if r.status_code == 404:
-            return {"_not_found": True}
+            return {"_not_found": True, "doi": clean}
         if r.status_code != 200:
             return None
         data = r.json()
     except Exception:
         return None
-
-    title = data.get("title") or ""
-    year = data.get("publication_year")
 
     authors = []
     for a in data.get("authorships", []) or []:
@@ -1067,8 +1063,159 @@ def _fetch_openalex_metadata(doi):
         if name:
             authors.append(name)
 
-    return {"title": title, "authors": authors, "year": year}
+    primary = data.get("primary_location") or {}
+    source = primary.get("source") or {}
+    biblio = data.get("biblio") or {}
 
+    return {
+        "doi": clean,
+        "title": data.get("title") or data.get("display_name") or "",
+        "authors": authors,
+        "year": data.get("publication_year"),
+        "work_type": data.get("type") or "",
+        "crossref_type": data.get("type_crossref") or "",
+        "venue": source.get("display_name") or "",
+        "source_type": source.get("type") or "",
+        "volume": biblio.get("volume"),
+        "issue": biblio.get("issue"),
+        "first_page": biblio.get("first_page"),
+        "last_page": biblio.get("last_page"),
+        "is_oa": (data.get("open_access") or {}).get("is_oa"),
+        "raw": data,
+    }
+
+
+def _openalex_ieee_source_type(meta, original_reference=""):
+    """Map OpenAlex metadata to the source types used by OmniCite."""
+    if not meta or meta.get("_not_found"):
+        return "Other"
+    wt = str(meta.get("work_type") or "").lower()
+    ct = str(meta.get("crossref_type") or "").lower()
+    st = str(meta.get("source_type") or "").lower()
+    hay = " ".join([wt, ct, st, meta.get("venue") or "", original_reference or ""]).lower()
+    if any(x in hay for x in ("proceedings", "conference", "symposium", "workshop")):
+        return "Conference Paper"
+    if "book-chapter" in hay or "book chapter" in hay or "chapter" in wt:
+        return "Book Chapter"
+    if any(x in hay for x in ("book", "monograph")) and "article" not in wt:
+        return "Book"
+    if any(x in hay for x in ("report", "report-series")):
+        return "Technical Report"
+    if any(x in hay for x in ("journal", "article")):
+        return "Journal Article"
+    return "Other"
+
+
+def _openalex_author_to_ieee(name):
+    """Convert an OpenAlex display name to IEEE initials-first form."""
+    if not name:
+        return ""
+    name = re.sub(r"\s+", " ", str(name)).strip()
+    if not name:
+        return ""
+    if "," in name:
+        surname, given = [x.strip() for x in name.split(",", 1)]
+        name = (given + " " + surname).strip()
+    return _to_ieee_initial_form(name)
+
+
+def _join_ieee_authors(names):
+    authors = [_openalex_author_to_ieee(n) for n in (names or [])]
+    authors = [a for a in authors if a]
+    if not authors:
+        return ""
+    if len(authors) == 1:
+        return authors[0]
+    if len(authors) == 2:
+        return f"{authors[0]} and {authors[1]}"
+    return ", ".join(authors[:-1]) + ", and " + authors[-1]
+
+
+def build_ieee_reference_from_openalex(original_reference, meta):
+    """Construct a corrected IEEE reference from verified OpenAlex DOI metadata.
+
+    OpenAlex supplies bibliographic facts; Python supplies IEEE punctuation and
+    formatting. Missing OpenAlex fields are filled only from the parsed original
+    reference when available. Nothing is invented.
+    """
+    if not meta or meta.get("_not_found"):
+        return None
+
+    original = strip_markdown_markers(clean_text(original_reference or ""))
+    op = parse_ieee_reference(original)
+    source_type = _openalex_ieee_source_type(meta, original)
+    if source_type == "Other":
+        source_type = normalize_source_type(op.get("source_type"))
+
+    authors = _join_ieee_authors(meta.get("authors"))
+    title = (meta.get("title") or op.get("title") or "").strip().rstrip(".")
+    venue = (meta.get("venue") or op.get("venue") or "").strip().rstrip(".,")
+    year = meta.get("year") or op.get("year")
+    volume = meta.get("volume") or op.get("volume")
+    issue = meta.get("issue") or op.get("issue")
+    first_page = meta.get("first_page")
+    last_page = meta.get("last_page")
+    pages = None
+    if first_page and last_page:
+        pages = str(first_page) if str(first_page) == str(last_page) else f"{first_page}-{last_page}"
+    elif first_page:
+        pages = str(first_page)
+    else:
+        pages = op.get("pages")
+    doi = meta.get("doi") or op.get("doi")
+
+    parts = []
+    if authors:
+        parts.append(authors)
+
+    if source_type in {"Journal Article", "Conference Paper"} and title:
+        parts.append(f'"{title},"')
+    elif title:
+        parts.append(title)
+
+    if source_type == "Conference Paper":
+        if venue:
+            parts.append(f"in {venue}")
+        if pages:
+            parts.append(f"pp. {pages}")
+        if year:
+            parts.append(str(year))
+    elif source_type == "Journal Article":
+        if venue:
+            parts.append(venue)
+        if volume:
+            parts.append(f"vol. {volume}")
+        if issue:
+            parts.append(f"no. {issue}")
+        if pages:
+            parts.append(f"pp. {pages}")
+        if year:
+            parts.append(str(year))
+    else:
+        if venue:
+            parts.append(venue)
+        if volume:
+            parts.append(f"vol. {volume}")
+        if pages:
+            parts.append(f"pp. {pages}")
+        if year:
+            parts.append(str(year))
+
+    corrected = ", ".join(p for p in parts if p)
+    if doi:
+        corrected += (", " if corrected else "") + f"doi: {doi}"
+    corrected = re.sub(r"\s+", " ", corrected).strip().rstrip(".") + "."
+    italic_tokens = compute_ieee_italic_tokens(source_type, corrected, parse_ieee_reference(corrected))
+    if venue and source_type in {"Journal Article", "Conference Paper"} and venue in corrected and venue not in italic_tokens:
+        italic_tokens.insert(0, venue)
+
+    return {
+        "Corrected": corrected,
+        "Source Type": source_type,
+        "Year": int(year) if str(year).isdigit() else None,
+        "Italic Tokens": italic_tokens,
+        "Metadata Source": "OpenAlex",
+    }
 
 def _normalize_for_compare(s):
     if not s:
@@ -1106,6 +1253,7 @@ def verify_reference_against_openalex(reference, parsed):
         "reasons": [],
         "crossref_title": None,
         "crossref_authors": [],
+        "openalex_metadata": None,
     }
 
     doi = parsed.get("doi")
@@ -1123,6 +1271,7 @@ def verify_reference_against_openalex(reference, parsed):
         return result
 
     result["checked"] = True
+    result["openalex_metadata"] = meta
     result["crossref_title"] = meta.get("title")
     result["crossref_authors"] = meta.get("authors", [])
 
@@ -2211,54 +2360,48 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
         original_clean = strip_markdown_markers(clean_text(original))
         structure_errors = ieee_structure_errors(original_clean)
 
-        ai_revised = strip_markdown_markers(clean_text(ai.get("revised_reference", "")))
-        corrected = ai_revised or original_clean
-        if corrected != original_clean and _reference_is_hallucinated(original_clean, corrected):
-            corrected = original_clean
-
-        local = build_local_ieee_reference_correction(corrected)
-        corrected = local["Corrected"]
-        # Normalize punctuation inside quoted article/conference titles.
-        # Prevent AI output such as:  title, " in ...
-        corrected = re.sub(r',\s+"(?=\s*(?:in\b|,))', ',"', corrected)
-
-        parsed = parse_ieee_reference(corrected)
         v = verification_rows[i - 1]
+        oa_built = None
+        if v.get("checked") and not v.get("suspicious") and v.get("openalex_metadata"):
+            oa_built = build_ieee_reference_from_openalex(
+                original_clean, v.get("openalex_metadata")
+            )
 
-        # Source type must be determined primarily from the reference itself.
-        # AI is only a fallback. This prevents conference proceedings from being
-        # mislabeled as Journal Article merely because they have a DOI.
-        local_source_type = normalize_source_type(parsed.get("source_type"))
-        ai_source_type = normalize_source_type(ai.get("source_type"))
-        source_type = (
-            local_source_type
-            if local_source_type != "Other"
-            else ai_source_type
-        )
+        if oa_built:
+            # DOI resolved and matched: OpenAlex bibliographic metadata is authoritative.
+            corrected = oa_built["Corrected"]
+            source_type = oa_built["Source Type"]
+            parsed = parse_ieee_reference(corrected)
+            deterministic_tokens = oa_built.get("Italic Tokens", [])
+            italic_elements = ", ".join(deterministic_tokens)
+            local = {"Corrected": corrected, "Note": "Constructed from verified OpenAlex DOI metadata."}
+        else:
+            # No usable verified DOI metadata: retain the existing local + AI fallback.
+            ai_revised = strip_markdown_markers(clean_text(ai.get("revised_reference", "")))
+            corrected = ai_revised or original_clean
+            if corrected != original_clean and _reference_is_hallucinated(original_clean, corrected):
+                corrected = original_clean
 
-        # ---- Deterministic italics based on source type ----
-        # Priority order:
-        #   1. Deterministic tokens computed from source_type + parsed ref
-        #   2. AI-supplied italic_elements (when the deterministic layer
-        #      can't infer them, e.g. unusual source types)
-        deterministic_tokens = compute_ieee_italic_tokens(
-            source_type, corrected, parsed
-        )
-        ai_tokens = [
-            t.strip()
-            for t in (ai.get("italic_elements") or "").split(",")
-            if t.strip()
-        ]
+            local = build_local_ieee_reference_correction(corrected)
+            corrected = local["Corrected"]
+            corrected = re.sub(r',\s+"(?=\s*(?:in\b|,))', ',"', corrected)
+            parsed = parse_ieee_reference(corrected)
 
-        # Merge, preserving order, de-duplicating
-        merged_tokens = []
-        for tok in deterministic_tokens + ai_tokens:
-            if tok and tok not in merged_tokens:
-                merged_tokens.append(tok)
+            local_source_type = normalize_source_type(parsed.get("source_type"))
+            ai_source_type = normalize_source_type(ai.get("source_type"))
+            source_type = local_source_type if local_source_type != "Other" else ai_source_type
 
-        italic_elements = ", ".join(merged_tokens)
+            deterministic_tokens = compute_ieee_italic_tokens(source_type, corrected, parsed)
+            ai_tokens = [
+                t.strip() for t in (ai.get("italic_elements") or "").split(",") if t.strip()
+            ]
+            merged_tokens = []
+            for tok in deterministic_tokens + ai_tokens:
+                if tok and tok not in merged_tokens:
+                    merged_tokens.append(tok)
+            italic_elements = ", ".join(merged_tokens)
 
-        year = ai.get("year")
+        year = oa_built.get("Year") if oa_built else ai.get("year")
         if not isinstance(year, int):
             year = int(parsed["year"]) if parsed["year"] else None
 
@@ -2288,6 +2431,7 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
             "Original Structure Errors": " | ".join(structure_errors),
             "Original Has Structure Error": bool(structure_errors),
             "Correction Note": local.get("Note", ""),
+            "Metadata Source": "OpenAlex" if oa_built else ("AI/Local" if ai else "Local"),
             "DOI Verified": v["checked"],
             "DOI Suspicious": v["suspicious"],
             "DOI Verification Reasons": " | ".join(v["reasons"]),
