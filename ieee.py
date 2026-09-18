@@ -1193,7 +1193,18 @@ def build_ieee_reference_from_openalex(original_reference, meta):
     if authors:
         parts.append(authors)
 
-    if source_type in {"Journal Article", "Conference Paper"} and title:
+    # Recover a conference/proceedings venue from the extracted original when
+    # OpenAlex resolves the DOI but does not expose a source display name.
+    # This is preferable to silently dropping the conference name.
+    if source_type == "Conference Paper" and not venue:
+        vm = re.search(r'\bin\s+(.+?)(?=\s*,?\s*(?:pp?\.|doi\s*:|10\.\d{4,9}/|$))', original, re.I)
+        if vm:
+            candidate = re.sub(r'\s+', ' ', vm.group(1)).strip(' ,.;')
+            if re.search(r'\b(?:conference|proceedings|proc\.?|symposium|workshop|congress|procedia|seminar|meeting)\b', candidate, re.I):
+                venue = candidate
+
+    # IEEE structural formatting is source-type specific.
+    if source_type in {"Journal Article", "Conference Paper", "Book Chapter"} and title:
         parts.append(f'"{title}"')
     elif title:
         parts.append(title)
@@ -1216,6 +1227,17 @@ def build_ieee_reference_from_openalex(original_reference, meta):
             parts.append(f"pp. {pages}")
         if year:
             parts.append(str(year))
+    elif source_type == "Book Chapter":
+        # Chapter title is quoted; containing book/series title follows `in`
+        # and is italicized by the DOCX renderer.
+        if venue:
+            parts.append(f"in {venue}")
+        if volume:
+            parts.append(f"vol. {volume}")
+        if pages:
+            parts.append(f"pp. {pages}")
+        if year:
+            parts.append(str(year))
     else:
         if venue:
             parts.append(venue)
@@ -1231,8 +1253,13 @@ def build_ieee_reference_from_openalex(original_reference, meta):
         corrected += (", " if corrected else "") + f"doi: {doi}"
     corrected = re.sub(r"\s+", " ", corrected).strip().rstrip(".") + "."
     italic_tokens = compute_ieee_italic_tokens(source_type, corrected, parse_ieee_reference(corrected))
-    if venue and source_type in {"Journal Article", "Conference Paper"} and venue in corrected and venue not in italic_tokens:
+    # The publication/container title is italic in IEEE for journal articles,
+    # conference papers, and book chapters. For standalone books, the book
+    # title itself is italic.
+    if venue and source_type in {"Journal Article", "Conference Paper", "Book Chapter"} and venue in corrected and venue not in italic_tokens:
         italic_tokens.insert(0, venue)
+    if source_type == "Book" and title and title in corrected and title not in italic_tokens:
+        italic_tokens.insert(0, title)
 
     return {
         "Corrected": corrected,
@@ -2435,7 +2462,7 @@ def process_ieee_references_and_citations(batch, client, manuscript_year):
             parsed = parse_ieee_reference(corrected)
             deterministic_tokens = oa_built.get("Italic Tokens", [])
             italic_elements = ", ".join(deterministic_tokens)
-            local = {"Corrected": corrected, "Note": "Constructed from verified OpenAlex DOI metadata."}
+            local = {"Corrected": corrected, "Note": "Reference reconstructed from verified DOI metadata and formatted to IEEE style."}
         else:
             # No verified OpenAlex metadata: NEVER reconstruct bibliographic facts
             # from AI guesses. Preserve the extracted reference exactly (apart from
