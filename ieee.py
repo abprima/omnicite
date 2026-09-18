@@ -3342,7 +3342,7 @@ def render():
         "Upload manuscript PDFs",
         type=["pdf"],
         accept_multiple_files=True,
-        help="Upload up to 5 manuscripts in one batch.",
+        help="Upload up to 15 manuscripts in one batch.",
         key=f"ieee_uploader_{st.session_state['ieee_uploader_version']}",
     )
 
@@ -3352,8 +3352,8 @@ def render():
     if not uploaded_files:
         return
 
-    if len(uploaded_files) > 5:
-        st.error(f"You uploaded {len(uploaded_files)} manuscripts. Maximum batch size is 5.")
+    if len(uploaded_files) > 15:
+        st.error(f"You uploaded {len(uploaded_files)} manuscripts. Maximum batch size is 15.")
         st.stop()
 
     current_year = datetime.now().year
