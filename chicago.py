@@ -1458,50 +1458,29 @@ def process_single_chicago_pdf(uf, batch, client, manuscript_year):
 # RENDER — APA-style flow
 # ============================================================
 
-def render():
-    st.markdown(
-        """
-        <style>
-        div[data-testid="stDataFrame"] th, div[data-testid="stDataFrame"] td {
-            text-align: center !important;
-        }
-        div[data-testid="stDataFrame"] th > div, div[data-testid="stDataFrame"] td > div {
-            justify-content: center !important;
-            text-align: center !important;
-        }
-        div[data-testid="stDownloadButton"] > button {
-            background-color: #16a34a !important;
-            color: white !important;
-            border: 1px solid #15803d !important;
-            font-weight: 600 !important;
-        }
-        div[data-testid="stDownloadButton"] > button:hover {
-            background-color: #15803d !important;
-        }
-        div[class*="st-key-blue_container"] .stButton button {
-            background-color: #2980B9 !important;
-            color: white !important;
-            border: none !important;
-        }
-        div[class*="st-key-blue_container"] .stButton button:hover {
-            background-color: #2471A3 !important;
-        }
-        div[class*="st-key-reset_btn"] button {
-            background-color: #dc2626 !important;
-            color: #ffffff !important;
-            border: 1px solid #b91c1c !important;
-            font-weight: 600 !important;
-        }
-        div[class*="st-key-reset_btn"] button:hover {
-            background-color: #b91c1c !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+# ============================================================
+# RENDER — mirrors apa.py's upload → year → button flow exactly
+# ============================================================
 
+def render():
     st.title("OmniCite Auditor — Chicago Style")
 
+    # ---- API key resolution (same as apa.py) ----
+    client = get_openai_client()
+    if client is None:
+        st.error(
+            "OPENAI_API_KEY was not found. "
+            "Add it to .streamlit/secrets.toml or your environment variables."
+        )
+        st.stop()
+
+    openalex_key = _get_openalex_api_key()
+    if not openalex_key:
+        st.warning(
+            "OA key was not found — DOI verification will be skipped."
+        )
+
+    # ---- Versioned uploader key (same pattern as apa.py) ----
     if "chicago_uploader_version" not in st.session_state:
         st.session_state["chicago_uploader_version"] = 0
 
@@ -1513,13 +1492,23 @@ def render():
         key=f"chicago_uploader_{st.session_state['chicago_uploader_version']}",
     )
 
+    # ---- HARD CAP (identical to apa.py) ----
     if uploaded_files and len(uploaded_files) > 10:
         st.error(
             f"Maximum 10 PDF files can be uploaded at a time. "
-            f"You selected {len(uploaded_files)} files."
+            f"You selected {len(uploaded_files)} files. Please remove "
+            f"{len(uploaded_files) - 10} file(s)."
         )
         return
 
+    if "chicago_batches" not in st.session_state:
+        st.session_state["chicago_batches"] = {}
+
+    # ---- Nothing renders past this point until a PDF is uploaded ----
+    if not uploaded_files:
+        return
+
+    # ---- Year input: appears ONLY after upload, BEFORE the button ----
     current_year = datetime.now().year
     default_year = st.session_state.get("chicago_manuscript_year", current_year)
     manuscript_year = st.number_input(
@@ -1528,128 +1517,117 @@ def render():
         max_value=current_year + 5,
         value=int(default_year),
         step=1,
-        help="Used to compute the % of references within the last 10 years.",
+        help=(
+            "Used to compute the % of references published within the last "
+            "10 years. The window is [year-9, year], inclusive."
+        ),
         key="chicago_manuscript_year_input",
     )
     st.session_state["chicago_manuscript_year"] = int(manuscript_year)
 
-    if "chicago_batches" not in st.session_state:
-        st.session_state["chicago_batches"] = {}
+    # ---- Build/prune file keys ----
+    file_keys = []
+    for idx, uf in enumerate(uploaded_files):
+        key = f"{idx}::{uf.name}"
+        file_keys.append((key, uf))
 
-    if not uploaded_files:
-        return
-
-    client = get_openai_client()
-    if client is None:
-        st.warning(
-            "OPENAI_API_KEY was not found. Local extraction still works, "
-            "but AI review will be skipped."
-        )
-
-    openalex_key = _get_openalex_api_key()
-    if not openalex_key:
-        st.warning("OPENALEX_API_KEY was not found — DOI verification will be skipped.")
-
-    file_keys = [(f"{i}::{uf.name}", uf) for i, uf in enumerate(uploaded_files)]
     active_keys = {k for k, _ in file_keys}
     for k in list(st.session_state["chicago_batches"].keys()):
         if k not in active_keys:
             del st.session_state["chicago_batches"][k]
 
-    with st.container(key="blue_container_chicago"):
-        if st.button(
-            "Extract & Review",
-            type="primary",
-            use_container_width=True,
-            key="chicago_extract_review_btn",
-        ):
-            overall = st.progress(0, text="Starting...")
-            n = len(file_keys)
-            step = 100 / max(n, 1)
+    # ---- Extract & Review button (blue, primary, full width) ----
+    if st.button(
+        "Extract & Review",
+        type="primary",
+        use_container_width=True,
+        key="blue_btn_run_all_chicago_pdfs",
+    ):
+        overall = st.progress(0, text="Starting...")
+        n = len(file_keys)
+        step = 100 / max(n, 1)
 
-            for i, (key, uf) in enumerate(file_keys, start=1):
-                base_pct = int((i - 1) * step)
+        for i, (key, uf) in enumerate(file_keys, start=1):
+            base_pct = int((i - 1) * step)
 
-                overall.progress(
-                    base_pct + int(step * 0.10),
-                    text=f"[{i}/{n}] Extracting {uf.name}...",
+            overall.progress(
+                base_pct + int(step * 0.10),
+                text=f"[{i}/{n}] Extracting {uf.name}...",
+            )
+            try:
+                (
+                    full_text,
+                    cleaned_text,
+                    body_text,
+                    reference_text,
+                    ref_found,
+                    post_found,
+                ) = extract_pdf_text(uf)
+            except Exception as exc:
+                st.error(f"{uf.name} extraction failed: {exc}")
+                continue
+
+            # ---- HARD STOP: no valid reference section detected ----
+            if not ref_found:
+                st.error(
+                    f"{uf.name}: No valid 'Bibliography' or 'References' "
+                    f"section could be identified. The heading may be "
+                    f"missing, or the section contains too few reference "
+                    f"entries. This manuscript cannot be audited."
                 )
-                try:
-                    full_text, cleaned, body_text, ref_text, ref_found, post_found = (
-                        extract_pdf_text(uf)
-                    )
-                except Exception as exc:
-                    st.error(f"{uf.name} extraction failed: {exc}")
-                    continue
+                continue
 
-                if not ref_found:
-                    st.error(
-                        f"{uf.name}: No valid Bibliography/References section "
-                        f"could be identified. This manuscript cannot be audited."
-                    )
-                    continue
+            batch = {
+                "filename": uf.name,
+                "full_text": full_text,
+                "cleaned_text": cleaned_text,
+                "body_text": body_text,
+                "reference_text": reference_text,
+                "ref_found": ref_found,
+                "post_found": post_found,
+                "manuscript_year": int(manuscript_year),
+                "ai_done": False,
+            }
+            st.session_state["chicago_batches"][key] = batch
 
-                batch = {
-                    "filename": uf.name,
-                    "full_text": full_text,
-                    "cleaned_text": cleaned,
-                    "body_text": body_text,
-                    "reference_text": ref_text,
-                    "ref_found": ref_found,
-                    "post_found": post_found,
-                    "manuscript_year": int(manuscript_year),
-                    "ai_done": False,
-                }
-                st.session_state["chicago_batches"][key] = batch
-
-                overall.progress(
-                    base_pct + int(step * 0.40),
-                    text=f"[{i}/{n}] Checking Chicago rules & DOIs...",
+            overall.progress(
+                base_pct + int(step * 0.35),
+                text=f"[{i}/{n}] Auditing Chicago footnotes & bibliography...",
+            )
+            try:
+                process_single_chicago_pdf(
+                    uf, batch, client, int(manuscript_year)
                 )
-                try:
-                    if client is not None:
-                        process_single_chicago_pdf(
-                            uf, batch, client, int(manuscript_year)
-                        )
-                    else:
-                        # Local-only fallback
-                        fn_res = extract_chicago_footnotes(batch["cleaned_text"])
-                        footnotes = attach_page_numbers_to_footnotes(fn_res["footnotes"])
-                        for nt in footnotes:
-                            nt["has_dan_warning"] = footnote_has_indonesian_author_conjunction(nt["text"])
-                        refs = split_references_from_lines(batch["reference_text"].splitlines())
-                        batch.update({
-                            "footnotes": footnotes, "references": refs,
-                            "match_rows": [], "missing_rows": [],
-                            "checked_notes": [], "detail_rows": [],
-                            "composition_rows": [], "recency_stats": {
-                                "total": len(refs), "cutoff": int(manuscript_year) - 9,
-                                "recent_count": 0, "recent_pct_all": 0.0,
-                                "recent_pct_detected": 0.0, "unknown_year_count": 0,
-                            },
-                            "corrected_rows": [], "report_docx": None,
-                            "manuscript_year": int(manuscript_year),
-                            "ai_done": True,
-                        })
-                except Exception as exc:
-                    st.error(f"{uf.name} Chicago check failed: {exc}")
-                    continue
+            except Exception as exc:
+                st.error(f"{uf.name} Chicago check failed: {exc}")
+                continue
 
-                overall.progress(
-                    base_pct + int(step * 1.00),
-                    text=f"[{i}/{n}] {uf.name} done.",
-                )
+            overall.progress(
+                base_pct + int(step * 1.00),
+                text=f"[{i}/{n}] {uf.name} done.",
+            )
 
-            overall.progress(100, text="All manuscripts processed.")
-            overall.empty()
+        overall.progress(100, text="All manuscripts processed.")
+        overall.empty()
 
-    any_done = any(b.get("ai_done") for b in st.session_state["chicago_batches"].values())
+    # ---- Gate: nothing shown until at least one batch has been processed ----
+    any_done = any(
+        b.get("ai_done") for b in st.session_state["chicago_batches"].values()
+    )
     if not any_done:
         return
 
-    selector_options = [k for k, _ in file_keys if k in st.session_state["chicago_batches"]]
+    # ---- Selector (defensive lookup, same as apa.py) ----
+    selector_options = [
+        k for k, _ in file_keys
+        if k in st.session_state["chicago_batches"]
+    ]
+
     if not selector_options:
-        st.info("No manuscript is available for review yet.")
+        st.info(
+            "No manuscript is available for review yet. "
+            "Please process a PDF successfully first."
+        )
         return
 
     def _fmt(k):
@@ -1668,10 +1646,18 @@ def render():
 
     batch = st.session_state["chicago_batches"].get(selected_key)
     if not batch or not batch.get("ai_done"):
-        st.info("This manuscript has not been processed yet. Click 'Extract & Review'.")
+        st.info(
+            "This manuscript has not been processed yet. "
+            "Click 'Extract & Review' above."
+        )
         return
 
-    with st.expander("View reference section", expanded=False):
+    batch["manuscript_year"] = int(
+        st.session_state.get("chicago_manuscript_year", current_year)
+    )
+
+    # ---- Debug expanders (same style as apa.py) ----
+    with st.expander("View bibliography section", expanded=False):
         st.text_area(
             "Bibliography slice",
             batch["reference_text"],
@@ -1683,12 +1669,14 @@ def render():
         st.text_area(
             "Footnotes",
             "\n\n".join(
-                f"{n['number']}. {n['text']}" for n in batch.get("footnotes", [])
+                f"{n['number']}. {n['text']}"
+                for n in batch.get("footnotes", [])
             ) or "(none detected)",
             height=300,
             key=f"chicago_dbg_fn_{selected_key}",
         )
 
+    # ---- Dashboard ----
     checked_notes = batch.get("checked_notes", [])
     detail_rows = batch.get("detail_rows", [])
     recency_stats = batch.get("recency_stats") or {}
@@ -1701,27 +1689,63 @@ def render():
 
     doi_checked = sum(1 for r in detail_rows if r.get("DOI Verified"))
     doi_suspicious = sum(1 for r in detail_rows if r.get("DOI Suspicious"))
-    doi_suspicious_pct = (doi_suspicious / total_refs * 100) if total_refs else 0.0
+    doi_suspicious_pct = (
+        doi_suspicious / total_refs * 100 if total_refs else 0.0
+    )
 
     overview_df = pd.DataFrame([
         {"Metric": "Total References", "Value": str(total_refs)},
-        {"Metric": "Citations > 15",
-         "Value": f"Yes ({citation_count})" if citation_count > 15 else f"No ({citation_count})"},
-        {"Metric": "% Last 10 Years", "Value": f"{recency_stats.get('recent_pct_all', 0.0)}%"},
-        {"Metric": "Footnotes Missing from Bibliography",
-         "Value": str(len(batch.get("missing_rows", [])))},
-        {"Metric": "Bibliography Missing from Footnotes",
-         "Value": str(total_refs - len(get_matched_bibliography_numbers(match_rows)))},
-        {"Metric": "DOI Checked (OpenAlex)", "Value": str(doi_checked)},
-        {"Metric": "DOI Suspicious (possible fabrication)",
-         "Value": f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)"},
+        {
+            "Metric": "Citations > 15",
+            "Value": (
+                f"Yes ({citation_count})"
+                if citation_count > 15
+                else f"No ({citation_count})"
+            ),
+        },
+        {
+            "Metric": "% Last 10 Years",
+            "Value": f"{recency_stats.get('recent_pct_all', 0.0)}%",
+        },
+        {
+            "Metric": "Footnotes Missing from Bibliography",
+            "Value": str(len(batch.get("missing_rows", []))),
+        },
+        {
+            "Metric": "Bibliography Missing from Footnotes",
+            "Value": str(
+                total_refs
+                - len(get_matched_bibliography_numbers(match_rows))
+            ),
+        },
+        {
+            "Metric": "DOI Checked (OpenAlex)",
+            "Value": str(doi_checked),
+        },
+        {
+            "Metric": "DOI Suspicious (possible fabrication)",
+            "Value": f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)",
+        },
     ])
 
-    source_lookup = {r["Source Type"]: f"{r['Count']} ({r['Percentage']}%)" for r in composition_rows}
+    source_lookup = {
+        r["Source Type"]: f"{r['Count']} ({r['Percentage']}%)"
+        for r in composition_rows
+    }
     composition_df = pd.DataFrame([
-        {"Source Type": st_, "Count / Percentage": source_lookup.get(st_, "0 (0.0%)")}
-        for st_ in ["Journal Article", "Book", "Government / Legal", "Report",
-                    "News / Newspaper", "Website", "Other"]
+        {
+            "Source Type": st_,
+            "Count / Percentage": source_lookup.get(st_, "0 (0.0%)"),
+        }
+        for st_ in [
+            "Journal Article",
+            "Book",
+            "Government / Legal",
+            "Report",
+            "News / Newspaper",
+            "Website",
+            "Other",
+        ]
     ])
 
     left, right = st.columns(2, gap="large")
@@ -1730,77 +1754,133 @@ def render():
     with right:
         st.dataframe(composition_df, use_container_width=True, hide_index=True)
 
+    # ---- Footnote comparison ----
     show_fn = st.toggle(
-        "Footnote Comparison", value=False,
+        "Footnote Comparison",
+        value=False,
         key=f"chicago_show_fn_{selected_key}",
     )
     if show_fn:
         fn_rows = []
         for note in checked_notes:
             raw = str(note.get("ai_status", "MANUAL_CHECK")).upper().strip()
-            disp = ("MATCH" if raw == "OK"
-                    else "REVISED" if raw == "REVISED"
-                    else "MANUAL CHECK")
+            disp = (
+                "MATCH" if raw == "OK"
+                else "REVISED" if raw == "REVISED"
+                else "MANUAL CHECK"
+            )
             fn_rows.append({
                 "No.": note.get("number", ""),
                 "Original Footnote": clean_text(note.get("text", "")),
-                "Corrected AI Version": clean_text(note.get("ai_revised_footnote_markdown", ""))
-                or clean_text(note.get("text", "")),
+                "Corrected AI Version": (
+                    clean_text(note.get("ai_revised_footnote_markdown", ""))
+                    or clean_text(note.get("text", ""))
+                ),
                 "Status": disp,
             })
         if fn_rows:
-            st.dataframe(pd.DataFrame(fn_rows), use_container_width=True,
-                         hide_index=True, height=230)
+            st.dataframe(
+                pd.DataFrame(fn_rows),
+                use_container_width=True,
+                hide_index=True,
+                height=230,
+            )
         else:
             st.info("No footnotes available for comparison.")
 
+    # ---- Bibliography comparison ----
     show_bib = st.toggle(
-        "Bibliography Comparison", value=False,
+        "Bibliography Comparison",
+        value=False,
         key=f"chicago_show_bib_{selected_key}",
     )
     if show_bib:
         if corrected_rows:
             df = pd.DataFrame(corrected_rows)
-            preferred = ["No.", "Source Type", "Publication Year",
-                         "Original Version", "Corrected Version", "Status",
-                         "Footnote in Bibliography", "Bibliography Missing from Footnotes",
-                         "Duplicate DOI", "Incomplete Author List", "Placeholders",
-                         "DOI Checked", "DOI Suspicious", "OpenAlex Title", "DOI Issues"]
+            preferred = [
+                "No.", "Source Type", "Publication Year",
+                "Original Version", "Corrected Version", "Status",
+                "Footnote in Bibliography",
+                "Bibliography Missing from Footnotes",
+                "Duplicate DOI", "Incomplete Author List",
+                "Placeholders", "DOI Checked", "DOI Suspicious",
+                "OpenAlex Title", "DOI Issues",
+            ]
             existing = [c for c in preferred if c in df.columns]
             rest = [c for c in df.columns if c not in existing]
             df = df[existing + rest]
-            st.caption(f"Showing {len(df)} of {len(batch.get('references', []))} extracted entries.")
-            st.dataframe(df, use_container_width=True, hide_index=True, height=280)
+            st.caption(
+                f"Showing {len(df)} of "
+                f"{len(batch.get('references', []))} extracted entries."
+            )
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                height=280,
+            )
         else:
             st.info("No bibliography entries available.")
 
+    # ---- DOCX download ----
     report_docx = batch.get("report_docx")
     if report_docx:
-        safe_name = Path(batch["filename"]).stem
+        safe_name = re.sub(
+            r"[^\w\-]+", "_", batch.get("filename", "manuscript")
+        )
         st.download_button(
-            "Download Diagnostic Report",
+            label="📄 Download Chicago Diagnostic Report (.docx)",
             data=report_docx,
             file_name=f"{safe_name}_chicago_diagnostic_report.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
             use_container_width=True,
             key=f"chicago_download_{selected_key}",
         )
 
+    # ---- Reset button (identical pattern to apa.py) ----
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-reset_btn"] button {
+            background-color: #dc2626 !important;
+            color: #ffffff !important;
+            border: 1px solid #b91c1c !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease;
+        }
+        div[class*="st-key-reset_btn"] button:hover {
+            background-color: #b91c1c !important;
+            color: #ffffff !important;
+            border-color: #991b1b !important;
+        }
+        div[class*="st-key-reset_btn"] button:focus {
+            box-shadow: 0 0 0 0.2rem rgba(220, 38, 38, 0.4) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     if st.button(
         "🔄 Start Fresh — Clear All Uploads & Results",
         use_container_width=True,
-        key="reset_btn_chicago_start_fresh",
+        key="reset_btn_start_fresh",
     ):
         for k in list(st.session_state.keys()):
-            if k == "chicago_batches":
+            if k == "chicago_batches" or k.startswith("chicago_batches"):
                 del st.session_state[k]
             if k.startswith("chicago_dbg_"):
                 del st.session_state[k]
             if k == "chicago_selected_pdf_key":
                 del st.session_state[k]
+
         st.session_state["chicago_batches"] = {}
         st.session_state["chicago_uploader_version"] = (
             st.session_state.get("chicago_uploader_version", 0) + 1
         )
         st.session_state["chicago_manuscript_year"] = datetime.now().year
+
         st.rerun()
