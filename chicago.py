@@ -966,6 +966,44 @@ class _BibliographySliceResult(BaseModel):
     references: list[str]
 
 
+def _deduplicate_references(references):
+    """
+    Collapse truly duplicate references — same DOI — keeping the longest.
+
+    Two references are considered the same source only if they share
+    an identical DOI. References without a DOI are never deduplicated.
+    This prevents false positives on different articles that happen
+    to share the same journal / volume / page range / DOI suffix.
+    """
+    if not references:
+        return references
+
+    keep = []
+    doi_to_index = {}
+
+    for ref in references:
+        ref = clean_text(ref)
+        if not ref:
+            continue
+        doi = normalize_doi_from_text(ref)
+
+        if not doi:
+            keep.append(ref)
+            continue
+
+        if doi in doi_to_index:
+            # Duplicate DOI — keep the longer (more complete) entry.
+            i = doi_to_index[doi]
+            if len(ref) > len(keep[i]):
+                keep[i] = ref
+            continue
+
+        doi_to_index[doi] = len(keep)
+        keep.append(ref)
+
+    return keep
+
+
 def slice_bibliography_with_llm(block: str, client) -> list[str]:
     if not block or not client:
         return []
@@ -1011,7 +1049,9 @@ def slice_bibliography_with_llm(block: str, client) -> list[str]:
         parsed = response.output_parsed
         if parsed is None or not parsed.references:
             return []
-        return [clean_text(r) for r in parsed.references if clean_text(r)]
+        cleaned = [clean_text(r) for r in parsed.references if clean_text(r)]
+        cleaned = _deduplicate_references(cleaned)
+        return cleaned
     except Exception as exc:
         st.error(f"Bibliography slicing failed: {exc}")
         return []
