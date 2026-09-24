@@ -87,12 +87,39 @@ def _fetch_openalex_metadata(doi):
 
     title = data.get("title") or ""
     year = data.get("publication_year")
+
     authors = []
     for a in data.get("authorships", []) or []:
         name = (a.get("author") or {}).get("display_name")
         if name:
             authors.append(name)
-    return {"title": title, "authors": authors, "year": year}
+
+    journal = ""
+    primary = data.get("primary_location") or {}
+    source = primary.get("source") or {}
+    journal = source.get("display_name") or ""
+
+    biblio = data.get("biblio") or {}
+    volume = biblio.get("volume") or ""
+    issue = biblio.get("issue") or ""
+    first_page = biblio.get("first_page") or ""
+    last_page = biblio.get("last_page") or ""
+    pages = ""
+    if first_page and last_page:
+        pages = f"{first_page}–{last_page}"
+    elif first_page:
+        pages = first_page
+
+    return {
+        "title": title,
+        "authors": authors,
+        "year": year,
+        "journal": journal,
+        "volume": volume,
+        "issue": issue,
+        "pages": pages,
+        "doi": clean,
+    }
 
 
 def _normalize_for_compare(s):
@@ -125,34 +152,6 @@ def _normalize_title_for_compare(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _is_same_work_from_reference(reference, openalex_title, openalex_authors):
-    if not openalex_title and not openalex_authors:
-        return False
-    ref_norm = _normalize_title_for_compare(reference)
-    oa_norm = _normalize_title_for_compare(openalex_title or "")
-    title_ok = False
-    if ref_norm and oa_norm:
-        title_ok = (oa_norm in ref_norm) or (ref_norm in oa_norm)
-    if not title_ok:
-        ref_tokens = set(ref_norm.split())
-        oa_tokens = set(oa_norm.split())
-        if ref_tokens and oa_tokens:
-            shared = len(ref_tokens & oa_tokens)
-            title_ok = shared / max(1, min(len(ref_tokens), len(oa_tokens))) >= 0.80
-    if not title_ok:
-        return False
-    if not openalex_authors:
-        return True
-    ref_tokens = set(ref_norm.split())
-    for full_name in openalex_authors:
-        surname = _surname_from_full_name(full_name)
-        if not surname:
-            continue
-        if surname in ref_tokens:
-            return True
-    return False
-
-
 def _extract_chicago_title(reference):
     """Extract the title. Chicago journals use SINGLE quotes for articles."""
     m = re.search(r"[\"\u201c](.+?)[\"\u201d]", reference)
@@ -178,25 +177,50 @@ def _surname_from_full_name(name):
 
 
 def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
+    """
+    Verify a DOI against OpenAlex.
+
+    Four outcomes, communicated via `doi_status`:
+      * "not_checked" — no DOI supplied, or OpenAlex unreachable.
+      * "not_found"   — DOI supplied but not indexed in OpenAlex.
+      * "verified"    — DOI resolves, title & authors agree.
+      * "mismatch"    — DOI resolves, but title and/or authors
+                        disagree with the manuscript.
+                        This is the only case that marks the
+                        reference as `suspicious`.
+    """
     result = {
-        "checked": False, "doi": parsed_doi, "title_similarity": None,
-        "author_overlap": None, "suspicious": False, "reasons": [],
-        "crossref_title": None, "crossref_authors": [],
+        "checked": False,
+        "doi": parsed_doi,
+        "doi_status": "not_checked",
+        "title_similarity": None,
+        "author_overlap": None,
+        "suspicious": False,
+        "reasons": [],
+        "crossref_title": None,
+        "crossref_authors": [],
     }
     if not parsed_doi:
         return result
+
     meta = _fetch_openalex_metadata(parsed_doi)
     if meta is None:
         return result
+
     if meta.get("_not_found"):
         result["checked"] = True
-        result["suspicious"] = True
-        result["reasons"].append("DOI does not resolve in OpenAlex (possible fake DOI).")
+        result["doi_status"] = "not_found"
+        result["suspicious"] = False
+        result["reasons"].append(
+            "DOI not found — could not verify against metadata."
+        )
         return result
 
     result["checked"] = True
     result["crossref_title"] = meta.get("title")
     result["crossref_authors"] = meta.get("authors", [])
+
+    mismatch_reasons = []
 
     ref_title = _extract_chicago_title(reference)
     oa_title = meta.get("title") or ""
@@ -204,33 +228,36 @@ def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
         sim = _title_similarity(ref_title, oa_title)
         result["title_similarity"] = sim
         if sim < 0.55:
-            result["suspicious"] = True
-            result["reasons"].append(
-                f"DOI resolves to a different title (similarity {sim:.0%})."
+            mismatch_reasons.append(
+                f"DOI resolves to a different title "
+                f"(similarity {sim:.0%})."
             )
 
     ref_surnames = {s.lower() for s in (parsed_authors or []) if s}
-    oa_surnames = {_surname_from_full_name(n) for n in meta.get("authors", []) if n}
+    oa_surnames = {
+        _surname_from_full_name(n)
+        for n in meta.get("authors", [])
+        if n
+    }
     oa_surnames.discard("")
     if oa_surnames:
         overlap = len(ref_surnames & oa_surnames) / max(1, len(oa_surnames))
         result["author_overlap"] = overlap
         if overlap < 0.50:
-            result["suspicious"] = True
-            result["reasons"].append(
+            mismatch_reasons.append(
                 f"DOI author list does not match the manuscript "
                 f"(only {overlap:.0%} of DOI surnames found)."
             )
-        if _is_same_work_from_reference(
-            reference, meta.get("title") or "", meta.get("authors") or []
-        ):
-            result["suspicious"] = False
-            result["reasons"] = []
-            result["rescued"] = True
-            result["rescue_note"] = (
-                "DOI is genuine — title and author confirmed in the "
-                "manuscript reference (fuzzy match)."
-            )
+
+    if mismatch_reasons:
+        result["doi_status"] = "mismatch"
+        result["suspicious"] = True
+        result["reasons"] = mismatch_reasons
+        return result
+
+    result["doi_status"] = "verified"
+    result["suspicious"] = False
+    result["reasons"] = []
     return result
 
 
@@ -866,30 +893,8 @@ def extract_chicago_footnotes(uploaded_file):
 # ============================================================
 # BIBLIOGRAPHY EXTRACTION (PyMuPDF) + LLM SLICING
 # ============================================================
-# We no longer classify references with regex. PyMuPDF grabs the raw
-# bibliography block, and the model slices it. This is what
-# DeepSeek/Claude/GPT do — they understand author names; regex
-# never can.
-# ============================================================
-
 
 def extract_bibliography_block(uploaded_file):
-    """
-    Return the raw text of the bibliography section as ONE string
-    in reading order, plus metadata for display.
-
-    Strategy:
-      1. Walk pages until we find a line whose text is exactly
-         "bibliography" / "references" / "daftar pustaka"
-         (case-insensitive).
-      2. From that line onward (skipping the heading itself),
-         collect every text line in page order.
-      3. Join with single spaces so PDF line wraps are healed at
-         the token level.
-
-    No regex classification. No margin/column detection. Just the
-    raw text between the heading and the end of the document.
-    """
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -902,7 +907,6 @@ def extract_bibliography_block(uploaded_file):
         page_height = page.rect.height
         page_text_dict = page.get_text("dict")
 
-        # Collect visual lines in reading order.
         page_lines = []
         for block in page_text_dict.get("blocks", []):
             if block.get("type") != 0:
@@ -922,7 +926,6 @@ def extract_bibliography_block(uploaded_file):
                     "y1": float(y1),
                 })
 
-        # If we haven't found the heading yet, look for it.
         if start_page is None:
             heading_y0 = None
             for ln in page_lines:
@@ -932,7 +935,6 @@ def extract_bibliography_block(uploaded_file):
             if heading_y0 is None:
                 continue
             start_page = page_number
-            # Collect only lines BELOW the heading on this page.
             for ln in page_lines:
                 if ln["y0"] <= heading_y0:
                     continue
@@ -941,7 +943,6 @@ def extract_bibliography_block(uploaded_file):
                 lines.append(ln["text"])
             continue
 
-        # Subsequent pages: collect everything except headers/footers.
         for ln in page_lines:
             if ln["y1"] > page_height * 0.94:
                 continue
@@ -966,10 +967,6 @@ class _BibliographySliceResult(BaseModel):
 
 
 def slice_bibliography_with_llm(block: str, client) -> list[str]:
-    """
-    Ask the model to slice the bibliography block into individual
-    references. Preserve the text exactly; only insert boundaries.
-    """
     if not block or not client:
         return []
 
@@ -1025,7 +1022,23 @@ def slice_bibliography_with_llm(block: str, client) -> list[str]:
 # ============================================================
 
 def footnote_has_indonesian_author_conjunction(text):
-    return bool(re.search(r"\s+dan\s+", clean_text(text), flags=re.I))
+    """
+    True only when `dan` (or `&`) appears BETWEEN two author names —
+    i.e. inside the author block, before the article/book title.
+    """
+    s = clean_text(text)
+    if not s:
+        return False
+
+    cut_pos = len(s)
+    for m in re.finditer(r"[\u2018\u201c'\"]", s):
+        cut_pos = m.start()
+        break
+    author_region = s[:cut_pos]
+
+    name = r"[A-Z\u00c0-\u00d6\u00d8-\u00dd][\w\u00c0-\u00ff'\u2019\-\.]*"
+    pattern = rf"\b{name}(?:\s+{name})*\s+(?:dan|&)\s+{name}"
+    return bool(re.search(pattern, author_region, flags=re.I))
 
 
 # ============================================================
@@ -1233,14 +1246,12 @@ def build_bibliography_statistics(references, gpt_results, manuscript_year):
             "Explanation": ai.get("explanation", ""),
             "Correction Note": local.get("Note", ""),
             "Placeholders": local.get("Placeholders", {}),
-            "DOI Verified": verification["checked"],
+            "DOI Checked": verification["checked"],
+            "DOI Status": verification["doi_status"],
             "DOI Suspicious": verification["suspicious"],
-            "DOI Rescued": verification.get("rescued", False),
             "DOI Verification Reasons": " | ".join(verification["reasons"]),
             "Title Similarity": verification.get("title_similarity"),
             "Author Overlap": verification.get("author_overlap"),
-            "OpenAlex Title": verification.get("crossref_title"),
-            "OpenAlex Authors": ", ".join(verification.get("crossref_authors", [])[:5]),
         })
 
     counts = Counter(row["Source Type"] for row in detail_rows)
@@ -1406,9 +1417,22 @@ def create_complete_chicago_report(
     matched_bib_numbers = get_matched_bibliography_numbers(match_rows)
     bib_missing_from_footnotes = max(0, total_refs - len(matched_bib_numbers))
 
-    doi_checked = sum(1 for r in bibliography_detail if r.get("DOI Verified"))
-    doi_suspicious = sum(1 for r in bibliography_detail if r.get("DOI Suspicious"))
-    doi_suspicious_pct = (doi_suspicious / total_refs * 100) if total_refs else 0.0
+    doi_checked = sum(
+        1 for r in bibliography_detail
+        if r.get("DOI Status") in {"verified", "mismatch"}
+    )
+    doi_not_found = sum(
+        1 for r in bibliography_detail
+        if r.get("DOI Status") == "not_found"
+    )
+    doi_mismatch = sum(
+        1 for r in bibliography_detail
+        if r.get("DOI Status") == "mismatch"
+    )
+    doi_suspicious = doi_mismatch
+    doi_suspicious_pct = (
+        doi_mismatch / total_refs * 100 if total_refs else 0.0
+    )
 
     recent_pct = recency_stats.get("recent_pct_all", 0.0)
     cutoff = recency_stats.get("cutoff", manuscript_year - 9)
@@ -1425,9 +1449,10 @@ def create_complete_chicago_report(
          str(footnotes_missing_from_bib), footnotes_missing_from_bib > 0),
         ("Bibliography entries not cited in footnotes",
          str(bib_missing_from_footnotes), bib_missing_from_footnotes > 0),
-        ("DOI checked (OpenAlex)", str(doi_checked), False),
-        ("DOI suspicious (possible fabricated references)",
-         f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)", doi_suspicious > 0),
+        ("DOI resolved in OpenAlex", str(doi_checked), False),
+        ("DOI not found in OpenAlex", str(doi_not_found), False),
+        ("DOI mismatch — possible fake DOI",
+         f"{doi_mismatch} ({doi_suspicious_pct:.1f}%)", doi_mismatch > 0),
         (f"% references within last 10 years "
          f"({cutoff}-{manuscript_year})",
          f"{recent_pct:.1f}%", False),
@@ -1592,8 +1617,10 @@ def create_complete_chicago_report(
 
             is_uncited = reference_no not in matched_bib_numbers
             truncated_authors = bool(row.get("Truncated Authors", False))
-            doi_suspicious = bool(row.get("DOI Suspicious", False))
             duplicate_doi = bool(row.get("Duplicate DOI", False))
+
+            doi_status = row.get("DOI Status", "not_checked")
+            withheld = (doi_status == "mismatch")
 
             chicago_status = str(row.get("Chicago Status", "NOT CHECKED")).upper().strip()
             display_status = (
@@ -1602,7 +1629,6 @@ def create_complete_chicago_report(
                 else "MANUAL CHECK" if chicago_status == "MANUAL_CHECK"
                 else chicago_status
             )
-            withheld = doi_suspicious and not bool(row.get("DOI Rescued", False))
 
             head = doc.add_paragraph()
             head.paragraph_format.space_before = Pt(6)
@@ -1632,7 +1658,7 @@ def create_complete_chicago_report(
             _add_run(p_orig, "Original: ", bold=True, size_pt=11)
             _add_run(
                 p_orig, original, size_pt=11,
-                red=(is_uncited or doi_suspicious or truncated_authors),
+                red=(is_uncited or doi_status == "mismatch" or truncated_authors),
             )
 
             if withheld:
@@ -1660,15 +1686,15 @@ def create_complete_chicago_report(
 
             comment = str(row.get("Explanation", "")).strip()
             if not comment:
-                if doi_suspicious and not row.get("DOI Rescued", False):
+                if doi_status == "mismatch":
                     comment = (
-                        "DOI does not resolve in OpenAlex to the claimed "
-                        "title/authors. Corrected version withheld."
+                        "DOI resolves in OpenAlex to a different work "
+                        "(mismatched title/authors) — possible fake DOI. "
+                        "Corrected version withheld."
                     )
-                elif row.get("DOI Rescued", False):
+                elif doi_status == "not_found":
                     comment = (
-                        "DOI verified — title and author matched "
-                        "(fuzzy match). No change needed."
+                        "DOI not found in OpenAlex — could not verify."
                     )
                 elif display_status == "MATCH":
                     comment = "Reference is consistent with Chicago style."
@@ -1679,26 +1705,11 @@ def create_complete_chicago_report(
 
             _add_run(
                 p_comment, comment, size_pt=10, italic=True,
-                red=(display_status in {"MANUAL CHECK", "NOT CHECKED"} or doi_suspicious),
+                red=(display_status in {"MANUAL CHECK", "NOT CHECKED"}
+                     or doi_status == "mismatch"),
             )
 
-            if row.get("OpenAlex Title"):
-                p_oa = doc.add_paragraph()
-                p_oa.paragraph_format.left_indent = Inches(0.25)
-                p_oa.paragraph_format.space_after = Pt(2)
-                r = p_oa.add_run(f'  OpenAlex says: "{row["OpenAlex Title"]}"')
-                r.italic = True
-                r.font.size = Pt(10)
-
-            if row.get("OpenAlex Authors"):
-                p_oa2 = doc.add_paragraph()
-                p_oa2.paragraph_format.left_indent = Inches(0.25)
-                p_oa2.paragraph_format.space_after = Pt(2)
-                r = p_oa2.add_run(f"  OpenAlex authors: {row['OpenAlex Authors']}")
-                r.italic = True
-                r.font.size = Pt(10)
-
-            if row.get("DOI Verification Reasons"):
+            if doi_status == "mismatch" and row.get("DOI Verification Reasons"):
                 p_reason = doc.add_paragraph()
                 p_reason.paragraph_format.left_indent = Inches(0.25)
                 p_reason.paragraph_format.space_after = Pt(2)
@@ -1706,6 +1717,15 @@ def create_complete_chicago_report(
                 r.italic = True
                 r.bold = True
                 r.font.color.rgb = RED
+                r.font.size = Pt(10)
+            elif doi_status == "not_found":
+                p_reason = doc.add_paragraph()
+                p_reason.paragraph_format.left_indent = Inches(0.25)
+                p_reason.paragraph_format.space_after = Pt(2)
+                r = p_reason.add_run(
+                    "  DOI not found in OpenAlex — could not verify."
+                )
+                r.italic = True
                 r.font.size = Pt(10)
 
             active_ph = [k for k, v in (row.get("Placeholders") or {}).items() if v]
@@ -1816,10 +1836,29 @@ def check_all_chicago_with_gpt(footnotes, references, client):
         }
         for note in footnotes
     ]
-    bibliography_payload = [
-        {"number": i, "text": clean_text(reference)}
-        for i, reference in enumerate(references, start=1)
-    ]
+
+    bibliography_payload = []
+    for i, reference in enumerate(references, start=1):
+        ref_clean = clean_text(reference)
+        doi = normalize_doi_from_text(ref_clean)
+        metadata = {}
+        if doi:
+            meta = _fetch_openalex_metadata(doi)
+            if meta and not meta.get("_not_found"):
+                metadata = {
+                    "title":   meta.get("title", ""),
+                    "authors": meta.get("authors", []),
+                    "journal": meta.get("journal", ""),
+                    "year":    meta.get("year"),
+                    "volume":  meta.get("volume", ""),
+                    "issue":   meta.get("issue", ""),
+                    "pages":   meta.get("pages", ""),
+                }
+        bibliography_payload.append({
+            "number": i,
+            "text": ref_clean,
+            "metadata": metadata,
+        })
 
     prompt = r"""
 You are a strict academic copyeditor specializing in CHICAGO NOTES AND
@@ -1832,7 +1871,9 @@ B. BIBLIOGRAPHY
 Do not extract anything from a PDF. Do not search the web.
 Do not invent missing bibliographic facts.
 
+============================================================
 A. FOOTNOTES
+============================================================
 For every supplied footnote:
 1. Audit as a Chicago FULL NOTE.
 2. Correct safely correctable formatting.
@@ -1843,7 +1884,9 @@ For every supplied footnote:
 
 Footnote STATUS: OK | REVISED | MANUAL_CHECK
 
+============================================================
 B. BIBLIOGRAPHY
+============================================================
 For every supplied bibliography entry:
 1. Identify source_type.
 2. Extract publication year if explicitly present, else null.
@@ -1858,6 +1901,78 @@ For every supplied bibliography entry:
 10. Flag author-list truncation (et al., dkk., and others) but never invent names.
 11. Use double quotation marks for contained titles.
 12. Ensure correct terminal punctuation (never ".," or ".." after a DOI/URL).
+
+============================================================
+B.1 CROSS-CHECK AGAINST `metadata` (IMPORTANT)
+============================================================
+Each bibliography entry may include a `metadata` object. This object
+is the authoritative record fetched from an external DOI registry
+for the entry's DOI. It may contain some or all of:
+
+   metadata.title    — authoritative article title
+   metadata.authors  — authoritative author list (ordered)
+   metadata.journal  — authoritative journal / container title
+   metadata.year     — authoritative publication year
+   metadata.volume   — authoritative volume
+   metadata.issue    — authoritative issue
+   metadata.pages    — authoritative page range
+   metadata.doi      — authoritative DOI
+
+Rules for using `metadata`:
+
+1. If `metadata` is EMPTY or ABSENT:
+   Work only from the reference text. Do not invent anything.
+   Apply Chicago style as usual.
+
+2. If `metadata` is PRESENT and NON-EMPTY:
+   Treat every field it contains as authoritative for THIS paper.
+
+   a. If the reference disagrees with a metadata field, CORRECT the
+      reference so it matches the metadata. Examples:
+        - reference journal name "Yurispruden" vs metadata journal
+          "Yurispruden: Jurnal Hukum" -> use the metadata value.
+        - reference year "2023" vs metadata year "2024" -> use the
+          metadata value.
+        - reference vol "7" vs metadata vol "8" -> use the metadata
+          value.
+        - reference pages "270-300" vs metadata pages "272-296"
+          -> use the metadata value.
+
+   b. If the metadata field is EMPTY or MISSING, do NOT change that
+      part of the reference. Never invent a journal name, volume,
+      issue, or page range that is not in the metadata.
+
+   c. If the reference contains a field that the metadata does NOT
+      cover, leave the reference's value untouched.
+
+   d. Do NOT rewrite the entry from scratch. Reuse the reference's
+      own wording and punctuation except where a metadata correction
+      is required. In particular:
+        - Keep the reference's quotation style around titles.
+        - Keep the reference's italics marking for container titles.
+        - Keep the reference's author separator style ("and" / "dan").
+        - Keep the reference's own choice of en-dash vs hyphen in
+          page ranges, EXCEPT where metadata supplies a new range.
+
+   e. Author names:
+        - If the metadata author list differs from the reference
+          author list, use the metadata list.
+        - Invert only the FIRST author (Surname, Given Name).
+        - Subsequent authors stay in natural order (Given Surname).
+        - Use "and" before the final author, not "&" or "dan".
+
+3. If metadata fields CONTRADICT what the reference says AND the
+   metadata itself is internally consistent, always trust metadata.
+
+4. Never copy the metadata's raw formatting (e.g., ALL CAPS titles,
+   or straight quotes). Convert it to proper Chicago BIBLIOGRAPHY
+   style before using it. The metadata is a source of FACTS, not a
+   source of FORMAT.
+
+5. Never report the metadata object back to the caller. The response
+   only contains the corrected reference text.
+
+============================================================
 
 Bibliography STATUS: OK | REVISED | MANUAL_CHECK
 
@@ -1913,7 +2028,6 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
     for n in footnotes:
         n["has_dan_warning"] = footnote_has_indonesian_author_conjunction(n["text"])
 
-    # --- Bibliography: PyMuPDF block, then LLM slice ---
     bib_block_result = extract_bibliography_block(uploaded_file)
     if not bib_block_result.get("found"):
         references = []
@@ -1993,7 +2107,9 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
             else "MANUAL CHECK" if chicago_status == "MANUAL_CHECK"
             else chicago_status
         )
-        withheld = bool(row.get("DOI Suspicious")) and not bool(row.get("DOI Rescued"))
+
+        doi_status = row.get("DOI Status", "not_checked")
+        withheld = (doi_status == "mismatch")
 
         corrected_bibliography_rows.append({
             "No.": reference_no,
@@ -2007,9 +2123,12 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
                 k for k, v in (row.get("Placeholders") or {}).items() if v
             ) or "—",
             "Status": display_status,
-            "DOI Checked": "YES" if row.get("DOI Verified") else "NO",
-            "DOI Suspicious": "⚠️ YES" if withheld else "—",
-            "OpenAlex Title": (row.get("OpenAlex Title") or "")[:60],
+            "DOI Status": {
+                "not_checked": "— not checked",
+                "not_found":   "⚠ not found in OpenAlex",
+                "verified":    "☑ verified",
+                "mismatch":    "⚠ mismatch — possible fake DOI",
+            }.get(doi_status, "— not checked"),
             "DOI Issues": row.get("DOI Verification Reasons", ""),
             "Footnote in Bibliography": "☑ Checked" if cited_in_footnotes else "☐ Unchecked",
             "Bibliography Missing from Footnotes": "No" if cited_in_footnotes else "Yes",
@@ -2274,7 +2393,6 @@ def render():
         st.session_state.get("chicago_manuscript_year", current_year)
     )
 
-    # --- Raw bibliography block expander ---
     raw_block = batch.get("bibliography_raw_block", "")
     with st.expander(
         f"Bibliography — raw block ({len(raw_block)} chars)",
@@ -2287,7 +2405,6 @@ def render():
             key=f"chicago_dbg_rawblock_{selected_key}",
         )
 
-    # --- Sliced references expander ---
     sliced = batch.get("references_raw_slice", [])
     with st.expander(
         f"Bibliography — sliced references ({len(sliced)} entries)",
@@ -2299,7 +2416,6 @@ def render():
         else:
             st.info("No references were sliced from the bibliography block.")
 
-    # --- Footnotes expander ---
     with st.expander("View extracted footnotes", expanded=False):
         st.text_area(
             "Footnotes",
@@ -2321,9 +2437,22 @@ def render():
     total_refs = recency_stats.get("total", len(detail_rows))
     citation_count = len(batch.get("footnotes", []))
 
-    doi_checked = sum(1 for r in detail_rows if r.get("DOI Verified"))
-    doi_suspicious = sum(1 for r in detail_rows if r.get("DOI Suspicious"))
-    doi_suspicious_pct = doi_suspicious / total_refs * 100 if total_refs else 0.0
+    doi_checked = sum(
+        1 for r in detail_rows
+        if r.get("DOI Status") in {"verified", "mismatch"}
+    )
+    doi_not_found = sum(
+        1 for r in detail_rows
+        if r.get("DOI Status") == "not_found"
+    )
+    doi_mismatch = sum(
+        1 for r in detail_rows
+        if r.get("DOI Status") == "mismatch"
+    )
+    doi_suspicious = doi_mismatch
+    doi_suspicious_pct = (
+        doi_mismatch / total_refs * 100 if total_refs else 0.0
+    )
 
     overview_df = pd.DataFrame([
         {"Metric": "Total References", "Value": str(total_refs)},
@@ -2334,9 +2463,10 @@ def render():
          "Value": str(len(batch.get("missing_rows", [])))},
         {"Metric": "Bibliography Missing from Footnotes",
          "Value": str(total_refs - len(get_matched_bibliography_numbers(match_rows)))},
-        {"Metric": "DOI Checked (OpenAlex)", "Value": str(doi_checked)},
-        {"Metric": "DOI Suspicious (possible fabrication)",
-         "Value": f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)"},
+        {"Metric": "DOI resolved in OpenAlex", "Value": str(doi_checked)},
+        {"Metric": "DOI not found in OpenAlex", "Value": str(doi_not_found)},
+        {"Metric": "DOI mismatch — possible fake DOI",
+         "Value": f"{doi_mismatch} ({doi_suspicious_pct:.1f}%)"},
     ])
 
     source_lookup = {r["Source Type"]: f"{r['Count']} ({r['Percentage']}%)" for r in composition_rows}
