@@ -1100,33 +1100,51 @@ def _split_glued_line(text: str) -> list[str]:
             merged[-1] = merged[-1] + " " + piece
     return merged
 
+def _joined_lookahead(lines, start_index, max_lines=3):
+    """
+    Concatenate up to `max_lines` starting at `start_index`.
+    Handles author names that wrap across two or three visual lines,
+    e.g. "Firdaus," followed by "Muhammad," on the next line.
+    """
+    parts = []
+    for j in range(start_index, min(start_index + max_lines, len(lines))):
+        parts.append(lines[j]["text"].strip())
+    return " ".join(parts)
+
+
+def _starts_new_reference_at(lines, index):
+    """
+    True if line `index` — possibly joined with the next two lines to
+    handle wrapped author names — begins a new bibliography entry.
+    """
+    joined = _joined_lookahead(lines, index, max_lines=3)
+    return _looks_like_reference_start(joined)
+
 
 def split_references_from_lines(lines):
     """
     Split bibliography lines into individual references.
 
-    Two operating modes:
+    Works in two modes:
 
-      (A) GEOMETRY MODE — lines are dicts from PyMuPDF with real x0 and
-          column. Use hanging-indent clustering: a line whose x0 equals
-          the column's left margin starts a new reference; a line
-          further right continues the previous one. URL-start lines are
-          ALWAYS treated as continuations, never as new references.
+      (A) GEOMETRY MODE — PyMuPDF dicts with real x0 and column.
+          Uses hanging-indent x0 clustering PLUS a hybrid content
+          check that recognizes when a line starts a new reference
+          by its author signature — even when the author name has
+          wrapped across two or three visual lines.
 
-      (B) HEURISTIC MODE — lines are plain strings (MarkItDown or
-          plain-text input with no geometry). Use the reference-start
-          signature `.<space>Surname, Initial` to find boundaries.
+      (B) HEURISTIC MODE — plain strings. Relies purely on the
+          reference-start signature `.<space>Surname, Initial`.
     """
     if not lines:
         return []
 
-    # Detect mode: geometry only if every line is a dict with real x0.
     has_geometry = all(
         isinstance(x, dict) and x.get("x0", 0.0) > 0.0
         for x in lines
     )
 
-    # --- Normalise input -------------------------------------------------
+    # --- Normalise ------------------------------------------------------
     normalised = []
     for item in lines:
         if isinstance(item, dict):
@@ -1147,7 +1165,7 @@ def split_references_from_lines(lines):
         return []
 
     # ================================================================
-    # HEURISTIC MODE — no geometry available.
+    # HEURISTIC MODE
     # ================================================================
     if not has_geometry:
         expanded = []
@@ -1159,7 +1177,7 @@ def split_references_from_lines(lines):
 
         references = []
         current = []
-        for line in expanded:
+        for idx, line in enumerate(expanded):
             text = line["text"].strip()
             if not text:
                 continue
@@ -1169,7 +1187,7 @@ def split_references_from_lines(lines):
             prev_ends_sentence = bool(re.search(r"[.?!]\s*$", current[-1]))
             starts_new = (
                 prev_ends_sentence
-                and _looks_like_reference_start(text)
+                and _starts_new_reference_at(expanded, idx)
                 and not _URL_OR_DOI_RE.match(text)
             )
             if starts_new:
@@ -1182,12 +1200,7 @@ def split_references_from_lines(lines):
         return [clean_text(r) for r in references if clean_text(r)]
 
     # ================================================================
-    # GEOMETRY MODE — real x0 + column from PyMuPDF.
-    #
-    # We do NOT pre-split glued lines here: PyMuPDF has already split
-    # every visual line, and the hanging-indent rule is the correct
-    # boundary signal. Pre-splitting would give every fragment the
-    # same x0 as its parent, corrupting column assignment.
+    # GEOMETRY MODE — hybrid hanging-indent + content check
     # ================================================================
     expanded = normalised
 
@@ -1231,7 +1244,7 @@ def split_references_from_lines(lines):
     references = []
     current = []
 
-    for line in expanded:
+    for idx, line in enumerate(expanded):
         text = line["text"].strip()
         if not text:
             continue
@@ -1239,31 +1252,48 @@ def split_references_from_lines(lines):
         column = line["column"]
         base_x = start_margin.get(column)
 
-        # If we have no margin for this column, fall back to the
-        # reference-start heuristic on the current line.
         if base_x is None:
+            # No margin — rely on content heuristic alone.
             if not current:
                 current = [text]
+                continue
+            prev_ends = bool(re.search(r"[.?!]\s*$", current[-1]))
+            if (
+                prev_ends
+                and _starts_new_reference_at(expanded, idx)
+                and not _URL_OR_DOI_RE.match(text)
+            ):
+                references.append(" ".join(current))
+                current = [text]
             else:
-                prev_ends = bool(re.search(r"[.?!]\s*$", current[-1]))
-                if prev_ends and _looks_like_reference_start(text):
-                    references.append(" ".join(current))
-                    current = [text]
-                else:
-                    current.append(text)
+                current.append(text)
             continue
 
-        # GEOMETRY-BASED DECISION — the ONLY boundary signal here.
         at_base_margin = abs(line["x0"] - base_x) <= margin_tolerance
 
-        # URLs and DOIs never start a new reference in geometry mode;
-        # they are always wraps of the preceding entry.
+        # URLs are never reference starts.
         if _URL_OR_DOI_RE.match(text):
             at_base_margin = False
 
-        if at_base_margin:
-            if current:
-                references.append(" ".join(current))
+        # -----------------------------------------------------------
+        # HYBRID DECISION
+        #
+        # A line at the base margin starts a new reference ONLY IF:
+        #   (a) the previous reference looks complete (ends with . or ? or !)
+        #   (b) the current line — possibly joined with the next 1–2
+        #       lines to handle wrapped author names — begins with a
+        #       reference-start signature.
+        # -----------------------------------------------------------
+        prev_complete = False
+        if current:
+            prev_complete = bool(re.search(r"[.?!]\s*$", current[-1]))
+
+        line_looks_new = _starts_new_reference_at(expanded, idx)
+
+        starts_new = at_base_margin and prev_complete and line_looks_new
+
+        if starts_new:
+            references.append(" ".join(current))
             current = [text]
         else:
             if current:
