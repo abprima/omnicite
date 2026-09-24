@@ -1293,19 +1293,45 @@ def _split_stream_on_text_boundaries(stream):
     if not stream:
         return []
 
+    # Candidate boundary patterns. Each alternative ends with a
+    # captured position `match.end()` that is the start of the
+    # right fragment (after the whitespace run).
+    #
+    # We use capturing alternations rather than look-behind because
+    # Python's `re` module does not support variable-width look-behind
+    # (needed for `\S{2,}`).
     candidates = []
-    # Candidate boundary positions:
-    #   * after `.?!` + whitespace + capital
-    #   * after a URL/DOI + whitespace + capital
-    #   * after a page range/number + whitespace + capital
-    candidate_re = re.compile(
-        r"(?<=[.?!])\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])"
-        r"|(?<=https?://\S{2,})\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])"
-        r"|(?<=doi\.org/\S{2,})\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])"
-        r"|(?<=\d[-\u2013\u2014]\d{1,5})\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])"
-    )
-    for m in candidate_re.finditer(stream):
-        candidates.append(m.start())
+
+    # 1. After `.?!` + whitespace, before a capital.
+    for m in re.finditer(
+        r"[.?!]\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
+        stream,
+    ):
+        candidates.append(m.end())
+
+    # 2. After a URL (http/https/www + non-space chars) + whitespace,
+    #    before a capital.
+    for m in re.finditer(
+        r"(?:https?://|www\.)\S+\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
+        stream,
+    ):
+        candidates.append(m.end())
+
+    # 3. After a DOI (10.NNNN/...) + whitespace, before a capital.
+    for m in re.finditer(
+        r"10\.\d{4,9}/\S+\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
+        stream,
+    ):
+        candidates.append(m.end())
+
+    # 4. After a page range/number + whitespace, before a capital.
+    for m in re.finditer(
+        r"\d[-\u2013\u2014]\d{1,5}\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
+        stream,
+    ):
+        candidates.append(m.end())
+
+    candidates = sorted(set(candidates))
 
     boundaries = [0]
     for pos in candidates:
@@ -1317,8 +1343,6 @@ def _split_stream_on_text_boundaries(stream):
             continue
 
         # --- STRONG RIGHT SIGNAL ---
-        # "Capitalized word, " or "Capitalized word. " where the word
-        # is not a continuation starter.
         strong_right = False
         m = re.match(
             r"^([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+)"
@@ -1331,9 +1355,6 @@ def _split_stream_on_text_boundaries(stream):
                 strong_right = True
 
         # --- RESCUE: `<Capital>. <Capital> ... <year>` ---
-        # A single-name author followed by a title that contains a
-        # 4-digit year is a legitimate reference, even if the second
-        # word would otherwise look like a continuation starter.
         if not strong_right:
             if re.match(
                 r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,}\.\s+"
