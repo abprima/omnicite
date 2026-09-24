@@ -26,24 +26,6 @@ from openalex_config import get_openalex_api_key
 
 
 # ============================================================
-# DEV MODE
-# ============================================================
-# When True:
-#   * OpenAI is NOT called.
-#   * OpenAlex is NOT called.
-#   * DOCX is NOT generated.
-#   * The UI shows only:
-#       - the extracted footnotes (Markdown)
-#       - the segmented references (Markdown)
-#       - a per-reference char-count debug list
-#
-# Use this while tuning the extractor. Set to False for production.
-# ============================================================
-
-DEV_MODE = True
-
-
-# ============================================================
 # OPENAI CLIENT
 # ============================================================
 
@@ -201,8 +183,6 @@ def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
         "author_overlap": None, "suspicious": False, "reasons": [],
         "crossref_title": None, "crossref_authors": [],
     }
-    if DEV_MODE:
-        return result
     if not parsed_doi:
         return result
     meta = _fetch_openalex_metadata(parsed_doi)
@@ -884,21 +864,16 @@ def extract_chicago_footnotes(uploaded_file):
 
 
 # ============================================================
-# BIBLIOGRAPHY EXTRACTION — PyMuPDF column-aware
+# BIBLIOGRAPHY EXTRACTION — PyMuPDF, reading order only
 # ============================================================
-
-def looks_like_running_header_footer(text, y0, y1, page_height):
-    clean = re.sub(r"\s+", " ", text).strip()
-    if re.fullmatch(r"\d{1,4}", clean):
-        if y0 < page_height * 0.08 or y1 > page_height * 0.94:
-            return True
-    if y0 < page_height * 0.08:
-        if re.search(r"\bvol\.?\s*\d+", clean, re.I):
-            return True
-        if re.search(r"\bvolume\s+\d+", clean, re.I):
-            return True
-    return False
-
+# Notes:
+#   The splitter is text-first (DeepSeek-style). It does NOT need
+#   column classification, margin detection, or hanging-indent
+#   clustering. All it needs is a flat list of visual lines in the
+#   natural reading order. PyMuPDF already returns blocks in the
+#   order the PDF authoring tool wrote them, so a simple
+#   page-by-page y-sorted flatten is sufficient.
+# ============================================================
 
 def is_bibliography_heading(text):
     normalized = re.sub(r"\s+", " ", text).strip().lower()
@@ -957,52 +932,38 @@ def line_is_header_footer(line, page_height):
     return False
 
 
-def get_line_column(line, page_width):
-    midpoint = page_width / 2
-    center = (line["x0"] + line["x1"]) / 2
-    return "LEFT" if center < midpoint else "RIGHT"
-
-
-def detect_single_column_page(all_lines):
-    xs = [l["x0"] for l in all_lines if l.get("text", "").strip()]
-    if not xs:
-        return True
-    xs_sorted = sorted(xs)
-    left = xs_sorted[0]
-    near_left = sum(1 for x in xs if x <= left + 30.0)
-    return near_left >= int(len(xs) * 0.60)
-
-
 def extract_bibliography_lines(uploaded_file):
+    """
+    Return every bibliography line in the natural reading order as a
+    flat list of dicts.
+
+    Because the splitter is text-first, we do NOT classify LEFT/RIGHT
+    columns and we do NOT compute margins. PyMuPDF's block order
+    already reflects reading order for well-formed PDFs.
+    """
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     bibliography_found = False
     start_page = None
-    start_column = None
-    start_y = None
     ordered_lines = []
 
     for page_number, page in enumerate(doc, start=1):
-        page_width = page.rect.width
         page_height = page.rect.height
         all_lines = extract_pdf_lines(page)
 
-        heading = None
         if not bibliography_found:
+            heading_found = False
             for line in all_lines:
                 if is_bibliography_heading(line["text"]):
-                    heading = line
+                    heading_found = True
                     break
-            if heading is None:
+            if not heading_found:
                 continue
             bibliography_found = True
             start_page = page_number
-            start_column = get_line_column(heading, page_width)
-            start_y = heading["y0"]
 
-        lines = []
         for line in all_lines:
             if is_bibliography_heading(line["text"]):
                 continue
@@ -1010,37 +971,8 @@ def extract_bibliography_lines(uploaded_file):
                 continue
             if line["y1"] > page_height * 0.94:
                 continue
-            lines.append(line)
-
-        single_column_page = detect_single_column_page(all_lines)
-
-        left, right = [], []
-        for line in lines:
-            if single_column_page:
-                column = "LEFT"
-            else:
-                column = get_line_column(line, page_width)
             line["page"] = page_number
-            line["column"] = column
-            if column == "LEFT":
-                left.append(line)
-            else:
-                right.append(line)
-
-        left.sort(key=lambda line: (line["y0"], line["x0"]))
-        right.sort(key=lambda line: (line["y0"], line["x0"]))
-
-        if page_number == start_page:
-            if start_column == "RIGHT":
-                right = [line for line in right if line["y0"] > start_y]
-                ordered_lines.extend(right)
-            else:
-                left = [line for line in left if line["y0"] > start_y]
-                ordered_lines.extend(left)
-                ordered_lines.extend(right)
-        else:
-            ordered_lines.extend(left)
-            ordered_lines.extend(right)
+            ordered_lines.append(line)
 
     doc.close()
     uploaded_file.seek(0)
@@ -1048,104 +980,164 @@ def extract_bibliography_lines(uploaded_file):
     return {
         "found": bibliography_found,
         "start_page": start_page,
-        "start_column": start_column,
+        "start_column": None,
         "lines": ordered_lines,
     }
 
 
 # ============================================================
-# REFERENCE SPLITTING — geometry mode vs heuristic mode
+# DEEPSEEK-STYLE REFERENCE SEGMENTATION
+# ============================================================
+# Text-first. Boundaries are found by reading the bibliography as
+# one continuous stream and identifying ". Capital" positions where
+# the left side ends a reference and the right side begins a new one.
+# Geometry (x0, column) is NOT used.
 # ============================================================
 
-_URL_OR_DOI_RE = re.compile(r"^(?:https?://|www\.|10\.\d{4,9}/|doi\s*:)", re.I)
 
-_AUTHOR_START_RE = re.compile(
-    r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s+[A-Z]"
-)
+def _flow_lines_into_stream(lines):
+    """
+    Convert a list of PyMuPDF line dicts into one continuous text
+    stream, preserving page boundaries as a sentinel token.
+    """
+    if not lines:
+        return ""
 
-_CORPORATE_START_RE = re.compile(r"^[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6}\.")
-
-_QUOTED_START_RE = re.compile(r"^[\u201c\"]")
-
-_NUMBERED_START_RE = re.compile(r"^\d{1,3}\.\s+[A-Z]")
-
-
-def _looks_like_reference_start(fragment: str) -> bool:
-    s = fragment.lstrip()
-    if not s:
-        return False
-    if _AUTHOR_START_RE.match(s):
-        return True
-    if _QUOTED_START_RE.match(s):
-        return True
-    if _NUMBERED_START_RE.match(s):
-        return True
-    m = _CORPORATE_START_RE.match(s)
-    if m:
-        first_two = " ".join(m.group(0).split()[:2]).rstrip(".")
-        if re.match(
-            r"^(?:WSEAS|Journal|Jurnal|Review|International|Proceedings|"
-            r"Transactions|Bulletin|Studies|Research)\b",
-            first_two, re.I,
-        ):
-            return False
-        return True
-    return False
-
-
-def _split_glued_line(text: str) -> list[str]:
-    """Split a single physical line that glued several references together."""
-    if not text:
-        return []
-    if not re.search(r"\.\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd]", text):
-        return [text.strip()]
-
-    candidates = []
-    for m in re.finditer(r"(?<=\.)\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])", text):
-        candidates.append(m.start())
-    if not candidates:
-        return [text.strip()]
-
-    boundaries = [0]
-    for pos in candidates:
-        before = text[:pos]
-        after = text[pos:].lstrip()
-        if re.search(r"https?://[^\s]*$", before):
-            continue
-        if _URL_OR_DOI_RE.match(after):
-            continue
-        if _looks_like_reference_start(after):
-            boundaries.append(pos)
-    boundaries.append(len(text))
-
-    pieces = []
-    for i in range(len(boundaries) - 1):
-        piece = text[boundaries[i]:boundaries[i + 1]].strip()
-        if piece:
-            pieces.append(piece)
-
-    merged = []
-    for piece in pieces:
-        if not merged:
-            merged.append(piece)
-            continue
-        if _looks_like_reference_start(piece):
-            merged.append(piece)
-        else:
-            merged[-1] = merged[-1] + " " + piece
-    return merged
-
-
-def _joined_lookahead(lines, start_index, max_lines=3):
     parts = []
-    for j in range(start_index, min(start_index + max_lines, len(lines))):
-        parts.append(lines[j]["text"].strip())
+    last_page = None
+
+    for line in lines:
+        text = clean_text(line.get("text", ""))
+        if not text:
+            continue
+
+        page = line.get("page")
+        if page is not None and page != last_page:
+            parts.append(f"<<<PAGE:{page}>>>")
+            last_page = page
+
+        parts.append(text)
+
     return " ".join(parts)
 
 
-def _starts_new_reference_at(lines, index):
-    joined = _joined_lookahead(lines, index, max_lines=3)
-    return _looks_like_reference_start(joined)
+def _fragment_is_reference_start(fragment):
+    """
+    Text-level predicate: does `fragment` begin a new reference?
+    """
+    s = (fragment or "").lstrip()
+    if not s:
+        return False
+
+    # Inverted personal name: "Surname, I."
+    if re.match(
+        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s+[A-Z]",
+        s,
+    ):
+        return True
+
+    # Non-inverted single-name author: "Syafliansah. Metode ..."
+    if re.match(
+        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,}\.\s+"
+        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
+        s,
+    ):
+        return True
+
+    # Numbered entries
+    if re.match(r"^\d{1,3}\.\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd]", s):
+        return True
+
+    # Quoted titles
+    if s[:1] in ('"', "\u201c"):
+        return True
+
+    # Corporate author (reject journal-name wraps)
+    m = re.match(
+        r"^([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6})\.\s+"
+        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
+        s,
+    )
+    if m:
+        head = m.group(1)
+        first_two = " ".join(head.split()[:2])
+        if re.match(
+            r"^(?:WSEAS|Journal|Jurnal|Review|International|Proceedings|"
+            r"Transactions|Bulletin|Studies|Research|The|In|On|For)\b",
+            first_two,
+            re.I,
+        ):
+            return False
+        return True
+
+    return False
+
+
+def _fragment_ends_reference(fragment):
+    """
+    Text-level predicate: does `fragment` look like the *end* of a
+    reference?
+    """
+    s = (fragment or "").rstrip()
+    if not s:
+        return False
+
+    if s[-1:] in ".?!":
+        return True
+    if s[-1:] in ")]\u201d":
+        return True
+    if re.search(r"(?:https?://\S+|10\.\d{4,9}/\S+)$", s, re.I):
+        return True
+    if re.search(r"\b\d+\s*[-\u2013\u2014]\s*\d+[.,;)]?$", s):
+        return True
+
+    return False
+
+
+def _split_stream_on_text_boundaries(stream):
+    """
+    Split the bibliography stream on every ". Capital" boundary that
+    follows a plausible reference closure.
+    """
+    if not stream:
+        return []
+
+    candidates = []
+    for m in re.finditer(
+        r"(?<=[.?!])\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
+        stream,
+    ):
+        candidates.append(m.start())
+
+    boundaries = [0]
+    for pos in candidates:
+        left = stream[boundaries[-1]:pos].strip()
+        right = stream[pos:].strip()
+
+        if re.search(r"https?://[^\s]*$", left):
+            continue
+        if not _fragment_is_reference_start(right):
+            continue
+        if not _fragment_ends_reference(left):
+            continue
+
+        boundaries.append(pos)
+
+    boundaries.append(len(stream))
+
+    pieces = []
+    for i in range(len(boundaries) - 1):
+        chunk = stream[boundaries[i]:boundaries[i + 1]].strip()
+        chunk = re.sub(r"<<<PAGE:\d+>>>", "", chunk).strip()
+        if chunk:
+            pieces.append(chunk)
+
+    return pieces
+
+
+# ============================================================
+# PDF-wrap repair (unchanged)
+# ============================================================
 
 
 def _repair_single_segment(text: str) -> str:
@@ -1196,221 +1188,54 @@ def _repair_bibliography_pdf_breaks(text: str) -> str:
     return clean_text(" ".join(p for p in repaired if p))
 
 
-def _probable_bibliography_start(text: str) -> bool:
-    s = clean_text(text or "")
-    if not s or _URL_OR_DOI_RE.match(s):
-        return False
+# ============================================================
+# Top-level splitter
+# ============================================================
 
-    if re.match(
-        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s*"
-        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
-        s,
-    ):
-        return True
-
-    if re.match(r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s*$", s):
-        return True
-
-    if re.match(
-        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,}\.\s+"
-        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
-        s,
-    ):
-        return True
-
-    return _looks_like_reference_start(s)
-
-
-def _column_start_margins(lines, cluster_tolerance=5.0):
-    by_col = {"LEFT": [], "RIGHT": []}
-    for line in lines:
-        by_col.setdefault(line.get("column", "LEFT"), []).append(
-            float(line.get("x0", 0.0))
-        )
-
-    left_min = min(by_col["LEFT"], default=None)
-    right_min = min(by_col["RIGHT"], default=None)
-
-    single_column = (
-        left_min is not None
-        and right_min is not None
-        and abs(left_min - right_min) <= 10.0
-    )
-
-    def clusters(values):
-        groups = []
-        for value in sorted(values):
-            best = None
-            for group in groups:
-                center = sum(group) / len(group)
-                if abs(value - center) <= cluster_tolerance:
-                    best = group
-                    break
-            if best is None:
-                groups.append([value])
-            else:
-                best.append(value)
-        return [{"x": sum(g) / len(g), "count": len(g)} for g in groups]
-
-    if single_column:
-        all_values = by_col["LEFT"] + by_col["RIGHT"]
-        cs = clusters(all_values)
-        if not cs:
-            return {"LEFT": None, "RIGHT": None, "_unified": True}
-        repeated = [c for c in cs if c["count"] >= 2]
-        unified = min(c["x"] for c in (repeated or cs))
-        return {"LEFT": unified, "RIGHT": unified, "_unified": True}
-
-    margins = {"_unified": False}
-    for col, values in by_col.items():
-        cs = clusters(values)
-        if not cs:
-            margins[col] = None
-            continue
-        repeated = [c for c in cs if c["count"] >= 2]
-        margins[col] = min(c["x"] for c in (repeated or cs))
-    return margins
-
-
-# ------------------------------------------------------------
-# Top-level splitter — FIXED
-# ------------------------------------------------------------
-# The critical change: `_split_glued_line` now runs as a
-# PRE-PASS in geometry mode, before the margin-based segmentation.
-# PyMuPDF occasionally returns two logical references on the same
-# visual line (two-column wrap). Splitting them before geometry
-# analysis lets the geometry loop see each reference's own start.
-# ------------------------------------------------------------
 
 def split_references_from_lines(lines):
+    """
+    Split bibliography into individual references.
+
+    Text-first (DeepSeek-style) segmentation:
+
+      1. Flow all visual lines into a single text stream.
+      2. Split on ". Capital" boundaries where the left side ends a
+         reference and the right side begins a new one.
+      3. Repair PDF-induced wraps inside each reference.
+      4. Merge pathological fragments.
+
+    Geometry (x0, column) is NOT used to create boundaries. This
+    handles single-column and two-column bibliographies identically,
+    because segmentation is driven by the source text.
+    """
     if not lines:
         return []
 
-    has_geometry = all(
-        isinstance(x, dict) and float(x.get("x0", 0.0)) > 0.0
-        for x in lines
-    )
-
-    normalised = []
-    for item in lines:
-        if isinstance(item, dict):
-            text = clean_text(item.get("text", ""))
-            if text:
-                normalised.append({
-                    "text": text,
-                    "x0": float(item.get("x0", 0.0)),
-                    "y0": float(item.get("y0", 0.0)),
-                    "page": item.get("page"),
-                    "column": item.get("column", "LEFT"),
-                })
-        else:
-            text = clean_text(str(item))
-            if text:
-                normalised.append({
-                    "text": text, "x0": 0.0, "y0": 0.0,
-                    "page": None, "column": "LEFT",
-                })
-
-    if not normalised:
+    stream = _flow_lines_into_stream(lines)
+    if not stream:
         return []
 
-    # ================================================================
-    # HEURISTIC MODE
-    # ================================================================
-    if not has_geometry:
-        expanded = []
-        for record in normalised:
-            for piece in _split_glued_line(record["text"]):
-                new = dict(record)
-                new["text"] = piece
-                expanded.append(new)
+    raw_pieces = _split_stream_on_text_boundaries(stream)
+    repaired = [_repair_bibliography_pdf_breaks(p) for p in raw_pieces]
 
-        refs, current = [], []
-        for idx, line in enumerate(expanded):
-            text = line["text"]
-            if not current:
-                current = [text]
-                continue
-            prev_ends = bool(re.search(r"[.?!]\s*$", current[-1]))
-            starts_new = (
-                prev_ends
-                and not _URL_OR_DOI_RE.match(text)
-                and (
-                    _starts_new_reference_at(expanded, idx)
-                    or _probable_bibliography_start(text)
-                )
-            )
-            if starts_new:
-                refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
-                current = [text]
-            else:
-                current.append(text)
-        if current:
-            refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
-        return [clean_text(r) for r in refs if clean_text(r)]
+    merged = []
+    for ref in repaired:
+        ref = clean_text(ref)
+        if not ref:
+            continue
 
-    # ================================================================
-    # GEOMETRY MODE — FIX: pre-split glued lines BEFORE geometry.
-    # ================================================================
-    expanded = []
-    for record in normalised:
-        for piece in _split_glued_line(record["text"]):
-            new = dict(record)
-            new["text"] = piece
-            expanded.append(new)
-    normalised = expanded
+        if len(ref) < 40 and merged:
+            merged[-1] = merged[-1] + " " + ref
+            continue
 
-    margins = _column_start_margins(normalised)
-    single_column_page = bool(margins.get("_unified"))
-    margin_tolerance = 7.0
+        if merged and not _fragment_is_reference_start(ref):
+            merged[-1] = merged[-1] + " " + ref
+            continue
 
-    refs, current = [], []
-    current_column = None
+        merged.append(ref)
 
-    for idx, line in enumerate(normalised):
-        text = line["text"]
-        col = line["column"]
-        base = margins.get(col)
-
-        at_start_margin = (
-            base is not None
-            and abs(line["x0"] - base) <= margin_tolerance
-        )
-        url_or_doi = bool(_URL_OR_DOI_RE.match(text))
-        content_start = (
-            _starts_new_reference_at(normalised, idx)
-            or _probable_bibliography_start(text)
-        )
-
-        column_changed = (
-            not single_column_page
-            and current
-            and current_column is not None
-            and col != current_column
-        )
-
-        starts_new = bool(
-            current
-            and at_start_margin
-            and not url_or_doi
-            and content_start
-        )
-
-        if column_changed and at_start_margin and not url_or_doi and content_start:
-            starts_new = True
-
-        if starts_new:
-            refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
-            current = [text]
-        else:
-            current.append(text)
-
-        current_column = col
-
-    if current:
-        refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
-
-    return [clean_text(r) for r in refs if clean_text(r)]
+    return merged
 
 
 # ============================================================
@@ -2201,23 +2026,6 @@ class CombinedChicagoResult(BaseModel):
 
 
 def check_all_chicago_with_gpt(footnotes, references, client):
-    if DEV_MODE or client is None:
-        return {
-            "footnotes": [
-                {"number": int(note["number"]), "status": "OK",
-                 "revised_footnote_markdown": "",
-                 "explanation": "DEV_MODE — no AI review."}
-                for note in footnotes
-            ],
-            "bibliography": [
-                {"number": i, "source_type": heuristic_source_type(ref),
-                 "year": extract_reference_year(ref), "status": "OK",
-                 "revised_bibliography_markdown": "",
-                 "explanation": "DEV_MODE — no AI review."}
-                for i, ref in enumerate(references, start=1)
-            ],
-        }
-
     footnote_payload = [
         {
             "number": int(note["number"]),
@@ -2311,7 +2119,7 @@ INPUT:
 
 
 # ============================================================
-# PIPELINE — one PDF
+# PIPELINE — one PDF (PyMuPDF extraction + GPT review)
 # ============================================================
 
 def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
@@ -2329,18 +2137,6 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
         references = [clean_text(r) for r in references if clean_text(r)]
     else:
         references = []
-
-    # ============================================================
-    # DEV_MODE: store partial results and stop.
-    # ============================================================
-    if DEV_MODE:
-        batch.update({
-            "footnotes": footnotes,
-            "references": references,
-            "ai_done": True,
-            "dev_mode": True,
-        })
-        return
 
     match_rows = match_footnotes_to_bibliography(footnotes, references)
 
@@ -2489,33 +2285,23 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
 
 
 # ============================================================
-# RENDER — upload → year → button → selector → DEV or PROD panel
+# RENDER — upload → year → button → selector → results
 # ============================================================
 
 def render():
-    st.title("OmniCite Auditor — Chicago Style" +
-             (" (DEV MODE)" if DEV_MODE else ""))
+    st.title("OmniCite Auditor — Chicago Style")
 
     client = get_openai_client()
-
-    if DEV_MODE:
-        st.info(
-            "**DEV MODE is ON.** OpenAI, OpenAlex, and DOCX generation "
-            "are disabled. Only extraction + segmentation run. "
-            "Set `DEV_MODE = False` at the top of `chicago.py` to "
-            "re-enable the full pipeline."
+    if client is None:
+        st.error(
+            "OPENAI_API_KEY was not found. "
+            "Add it to .streamlit/secrets.toml or your environment variables."
         )
-    else:
-        if client is None:
-            st.error(
-                "OPENAI_API_KEY was not found. "
-                "Add it to .streamlit/secrets.toml or your environment variables."
-            )
-            st.stop()
+        st.stop()
 
-        openalex_key = _get_openalex_api_key()
-        if not openalex_key:
-            st.warning("OA key was not found — DOI verification will be skipped.")
+    openalex_key = _get_openalex_api_key()
+    if not openalex_key:
+        st.warning("OA key was not found — DOI verification will be skipped.")
 
     if "chicago_uploader_version" not in st.session_state:
         st.session_state["chicago_uploader_version"] = 0
@@ -2703,91 +2489,6 @@ def render():
         st.session_state.get("chicago_manuscript_year", current_year)
     )
 
-    # ============================================================
-    # DEV_MODE PANEL — show only extraction + segmentation
-    # ============================================================
-    if batch.get("dev_mode") or DEV_MODE:
-        footnotes = batch.get("footnotes", [])
-        references = batch.get("references", [])
-
-        col1, col2 = st.columns(2)
-        col1.metric("Footnotes extracted", len(footnotes))
-        col2.metric("References extracted", len(references))
-
-        st.subheader("1. Footnotes — Markdown")
-        st.caption("One footnote per numbered item. Blank line between notes.")
-        if footnotes:
-            md = "\n\n".join(
-                f"{int(n['number'])}. {clean_text(n['text'])}"
-                + (
-                    f"  _(p. {', '.join(map(str, n.get('pages', [])))})_"
-                    if n.get("pages") else ""
-                )
-                for n in footnotes
-            )
-            st.code(md, language="markdown")
-        else:
-            st.info("No footnotes detected.")
-
-        st.subheader("2. References — Markdown")
-        st.caption(
-            "One reference per line. Blank line (double enter) between "
-            "references."
-        )
-        if references:
-            md = "\n\n".join(
-                f"**[{i}]**  {clean_text(r)}"
-                for i, r in enumerate(references, start=1)
-            )
-            st.code(md, language="markdown")
-
-            st.subheader("3. Per-reference char counts (debug)")
-            st.caption(
-                "Use this to spot glued references: entries with unusually "
-                "high char counts likely contain more than one reference."
-            )
-            for i, r in enumerate(references, start=1):
-                st.caption(f"**{i}.** [{len(r)} chars] {r[:200]}")
-        else:
-            st.info("No references detected.")
-
-        st.subheader("4. Bibliography slice (raw extraction)")
-        with st.expander("Show raw extracted lines", expanded=False):
-            st.text_area(
-                "Raw bibliography lines",
-                batch.get("reference_text", ""),
-                height=400,
-                key=f"chicago_dev_raw_{selected_key}",
-            )
-
-        if st.button(
-            "🔄 Start Fresh — Clear All Uploads & Results",
-            use_container_width=True,
-            key="dev_reset_btn",
-        ):
-            for k in list(st.session_state.keys()):
-                if k == "chicago_batches" or k.startswith("chicago_batches"):
-                    del st.session_state[k]
-                if k.startswith("chicago_dbg_"):
-                    del st.session_state[k]
-                if k.startswith("chicago_dev_"):
-                    del st.session_state[k]
-                if k == "chicago_selected_pdf_key":
-                    del st.session_state[k]
-
-            st.session_state["chicago_batches"] = {}
-            st.session_state["chicago_uploader_version"] = (
-                st.session_state.get("chicago_uploader_version", 0) + 1
-            )
-            st.session_state["chicago_manuscript_year"] = datetime.now().year
-
-            st.rerun()
-
-        return
-
-    # ============================================================
-    # PRODUCTION PANEL — full pipeline (unchanged)
-    # ============================================================
     with st.expander("View bibliography section", expanded=False):
         st.text_area(
             "Bibliography slice",
