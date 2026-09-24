@@ -1121,52 +1121,136 @@ def _starts_new_reference_at(lines, index):
     return _looks_like_reference_start(joined)
 
 
+def _repair_bibliography_pdf_breaks(text: str) -> str:
+    """Repair conservative PDF wrapping artifacts after one entry is segmented."""
+    value = clean_text(text or "")
+    if not value:
+        return ""
+
+    # Remove spaces that PyMuPDF may insert inside DOI tokens at a visual wrap.
+    # Keep this conservative: only join when the left side is already inside a DOI.
+    doi_pat = re.compile(r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\s+([A-Za-z0-9][A-Za-z0-9._;()/:\-]*)", re.I)
+    previous = None
+    while value != previous:
+        previous = value
+        value = doi_pat.sub(lambda m: m.group(1) + m.group(2), value)
+
+    # Common URL wraps: slash/hyphen followed by an artificial space.
+    value = re.sub(r"(https?://\S+/)\s+(?=[A-Za-z0-9])", r"\1", value, flags=re.I)
+    value = re.sub(r"(https?://\S+-)\s+(?=[A-Za-z0-9])", r"\1", value, flags=re.I)
+
+    # Canonicalise accidental duplicate DOI prefixes without changing the DOI itself.
+    value = re.sub(
+        r"https?://(?:dx\.)?doi\.org/\s*https?://(?:dx\.)?doi\.org/",
+        "https://doi.org/", value, flags=re.I,
+    )
+    return clean_text(value)
+
+
+def _probable_bibliography_start(text: str) -> bool:
+    """Permissive validator used *after* geometry says a line is at the first-line margin."""
+    s = clean_text(text or "")
+    if not s or _URL_OR_DOI_RE.match(s):
+        return False
+
+    # Standard inverted bibliography name: Surname, Given ...
+    if re.match(
+        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s*"
+        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
+        s,
+    ):
+        return True
+
+    # A surname may occupy a whole visual line: "Firdaus,".
+    if re.match(r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s*$", s):
+        return True
+
+    # Indonesian single-name author followed by title: "Syafliansah. Metode ..."
+    if re.match(
+        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,}\.\s+"
+        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
+        s,
+    ):
+        return True
+
+    # Preserve existing recognisers for numbered, quoted, and corporate entries.
+    return _looks_like_reference_start(s)
+
+
+def _column_start_margins(lines, cluster_tolerance=2.5):
+    """Infer bibliography first-line x positions independently for left/right columns."""
+    by_col = {"LEFT": [], "RIGHT": []}
+    for line in lines:
+        by_col.setdefault(line.get("column", "LEFT"), []).append(float(line.get("x0", 0.0)))
+
+    def clusters(values):
+        groups = []
+        for value in sorted(values):
+            best = None
+            for group in groups:
+                center = sum(group) / len(group)
+                if abs(value - center) <= cluster_tolerance:
+                    best = group
+                    break
+            if best is None:
+                groups.append([value])
+            else:
+                best.append(value)
+        return [
+            {"x": sum(g) / len(g), "count": len(g)}
+            for g in groups
+        ]
+
+    margins = {}
+    for col, values in by_col.items():
+        cs = clusters(values)
+        if not cs:
+            margins[col] = None
+            continue
+        # A first-line margin repeats. Prefer the left-most repeated cluster.
+        repeated = [c for c in cs if c["count"] >= 2]
+        margins[col] = min(c["x"] for c in (repeated or cs))
+    return margins
+
+
 def split_references_from_lines(lines):
     """
-    Split bibliography lines into individual references.
+    Split bibliography into entries.
 
-    Works in two modes:
-
-      (A) GEOMETRY MODE — PyMuPDF dicts with real x0 and column.
-          Uses hanging-indent x0 clustering PLUS a hybrid content
-          check that recognizes when a line starts a new reference
-          by its author signature — even when the author name has
-          wrapped across two or three visual lines.
-
-      (B) HEURISTIC MODE — plain strings. Relies purely on the
-          reference-start signature `.<space>Surname, Initial`.
+    Geometry mode deliberately treats hanging-indent reset as the primary signal.
+    Textual author detection is supporting evidence, not a requirement that the
+    previous physical line must end in punctuation. This avoids glued references
+    when a DOI/URL/name wraps at the end of a PDF line.
     """
     if not lines:
         return []
 
     has_geometry = all(
-        isinstance(x, dict) and x.get("x0", 0.0) > 0.0
+        isinstance(x, dict) and float(x.get("x0", 0.0)) > 0.0
         for x in lines
     )
 
-    # --- Normalise ------------------------------------------------------
     normalised = []
     for item in lines:
         if isinstance(item, dict):
-            normalised.append({
-                "text": item.get("text", ""),
-                "x0": float(item.get("x0", 0.0)),
-                "y0": float(item.get("y0", 0.0)),
-                "column": item.get("column", "LEFT"),
-            })
-        else:
-            text = str(item).strip()
+            text = clean_text(item.get("text", ""))
             if text:
                 normalised.append({
-                    "text": text, "x0": 0.0, "y0": 0.0, "column": "LEFT",
+                    "text": text,
+                    "x0": float(item.get("x0", 0.0)),
+                    "y0": float(item.get("y0", 0.0)),
+                    "page": item.get("page"),
+                    "column": item.get("column", "LEFT"),
                 })
+        else:
+            text = clean_text(str(item))
+            if text:
+                normalised.append({"text": text, "x0": 0.0, "y0": 0.0, "page": None, "column": "LEFT"})
 
     if not normalised:
         return []
 
-    # ================================================================
-    # HEURISTIC MODE
-    # ================================================================
+    # ----------------------- HEURISTIC FALLBACK -----------------------
     if not has_geometry:
         expanded = []
         for record in normalised:
@@ -1175,136 +1259,80 @@ def split_references_from_lines(lines):
                 new["text"] = piece
                 expanded.append(new)
 
-        references = []
-        current = []
+        refs, current = [], []
         for idx, line in enumerate(expanded):
-            text = line["text"].strip()
-            if not text:
-                continue
+            text = line["text"]
             if not current:
                 current = [text]
                 continue
-            prev_ends_sentence = bool(re.search(r"[.?!]\s*$", current[-1]))
             starts_new = (
-                prev_ends_sentence
-                and _starts_new_reference_at(expanded, idx)
-                and not _URL_OR_DOI_RE.match(text)
+                not _URL_OR_DOI_RE.match(text)
+                and (_starts_new_reference_at(expanded, idx) or _probable_bibliography_start(text))
+                and bool(re.search(r"[.?!]\s*$", current[-1]))
             )
             if starts_new:
-                references.append(" ".join(current))
+                refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
                 current = [text]
             else:
                 current.append(text)
         if current:
-            references.append(" ".join(current))
-        return [clean_text(r) for r in references if clean_text(r)]
+            refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
+        return [r for r in refs if r]
 
-    # ================================================================
-    # GEOMETRY MODE — hybrid hanging-indent + content check
-    # ================================================================
-    expanded = normalised
+    # ------------------------- GEOMETRY MODE --------------------------
+    margins = _column_start_margins(normalised)
+    margin_tolerance = 4.5
+    refs, current = [], []
+    current_column = None
 
-    column_x_values = {"LEFT": [], "RIGHT": []}
-    for line in expanded:
-        column_x_values[line["column"]].append(round(line["x0"], 1))
+    for idx, line in enumerate(normalised):
+        text = line["text"]
+        col = line["column"]
+        base = margins.get(col)
+        at_start_margin = base is not None and abs(line["x0"] - base) <= margin_tolerance
+        url_or_doi = bool(_URL_OR_DOI_RE.match(text))
 
-    def cluster_x_positions(values, tolerance=2.5):
-        if not values:
-            return []
-        values = sorted(values)
-        clusters = []
-        for value in values:
-            matched = False
-            for cluster in clusters:
-                center = sum(cluster) / len(cluster)
-                if abs(value - center) <= tolerance:
-                    cluster.append(value)
-                    matched = True
-                    break
-            if not matched:
-                clusters.append([value])
-        return sorted(
-            [{"x": sum(c) / len(c), "count": len(c)} for c in clusters],
-            key=lambda c: c["x"],
+        # Look ahead because an author's inverted name can wrap over visual lines.
+        content_start = _starts_new_reference_at(normalised, idx) or _probable_bibliography_start(text)
+
+        # Column transition is important: the first item in a new column is a new
+        # reference if it is at that column's first-line margin and looks plausible.
+        column_changed = current and current_column is not None and col != current_column
+
+        starts_new = bool(
+            current
+            and at_start_margin
+            and not url_or_doi
+            and content_start
         )
 
-    start_margin = {}
-    for column in ("LEFT", "RIGHT"):
-        clusters = cluster_x_positions(column_x_values[column])
-        if not clusters:
-            start_margin[column] = None
-            continue
-        meaningful = [c for c in clusters if c["count"] >= 2]
-        start_margin[column] = (
-            min(c["x"] for c in meaningful) if meaningful else clusters[0]["x"]
-        )
-
-    margin_tolerance = 4.0
-
-    references = []
-    current = []
-
-    for idx, line in enumerate(expanded):
-        text = line["text"].strip()
-        if not text:
-            continue
-
-        column = line["column"]
-        base_x = start_margin.get(column)
-
-        if base_x is None:
-            # No margin — rely on content heuristic alone.
-            if not current:
-                current = [text]
-                continue
-            prev_ends = bool(re.search(r"[.?!]\s*$", current[-1]))
-            if (
-                prev_ends
-                and _starts_new_reference_at(expanded, idx)
-                and not _URL_OR_DOI_RE.match(text)
-            ):
-                references.append(" ".join(current))
-                current = [text]
-            else:
-                current.append(text)
-            continue
-
-        at_base_margin = abs(line["x0"] - base_x) <= margin_tolerance
-
-        # URLs are never reference starts.
-        if _URL_OR_DOI_RE.match(text):
-            at_base_margin = False
-
-        # -----------------------------------------------------------
-        # HYBRID DECISION
-        #
-        # A line at the base margin starts a new reference ONLY IF:
-        #   (a) the previous reference looks complete (ends with . or ? or !)
-        #   (b) the current line — possibly joined with the next 1–2
-        #       lines to handle wrapped author names — begins with a
-        #       reference-start signature.
-        # -----------------------------------------------------------
-        prev_complete = False
-        if current:
-            prev_complete = bool(re.search(r"[.?!]\s*$", current[-1]))
-
-        line_looks_new = _starts_new_reference_at(expanded, idx)
-
-        starts_new = at_base_margin and prev_complete and line_looks_new
+        # If geometry is very clear at a column transition, do not require the
+        # previous physical line to end in punctuation.
+        if column_changed and at_start_margin and not url_or_doi and content_start:
+            starts_new = True
 
         if starts_new:
-            references.append(" ".join(current))
+            refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
             current = [text]
         else:
-            if current:
-                current.append(text)
-            else:
-                current = [text]
+            current.append(text)
+
+        current_column = col
 
     if current:
-        references.append(" ".join(current))
+        refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
 
-    return [clean_text(r) for r in references if clean_text(r)]
+    # Final guard: split any residual same-line glue, but only at highly probable
+    # author starts. This is intentionally after geometry segmentation.
+    final_refs = []
+    for ref in refs:
+        pieces = _split_glued_line(ref)
+        if len(pieces) > 1:
+            final_refs.extend(_repair_bibliography_pdf_breaks(p) for p in pieces if clean_text(p))
+        elif ref:
+            final_refs.append(ref)
+
+    return [clean_text(r) for r in final_refs if clean_text(r)]
 
 
 # ============================================================
