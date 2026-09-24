@@ -1077,11 +1077,177 @@ def _repair_bibliography_pdf_breaks(text: str) -> str:
 # DEEPSEEK-STYLE REFERENCE SEGMENTATION
 # ============================================================
 # Text-first. The bibliography is read as one continuous stream and
-# split on ". Capital" boundaries where:
+# split on `. Capital` boundaries where:
 #   * the LEFT fragment ends a reference
 #   * the RIGHT fragment begins a new reference
 # Geometry (x0, column) is not used.
 # ============================================================
+
+
+# ------------------------------------------------------------
+# Continuation starters: words that should NEVER begin a new
+# reference. If the right fragment starts with one of these, it
+# is a continuation of the previous reference, not a new one.
+# ------------------------------------------------------------
+_CONTINUATION_STARTERS = re.compile(
+    r"^(?:"
+    # --- Indonesian function words & common title words ---
+    r"dan|atau|dengan|dari|di|ke|pada|untuk|dalam|oleh|yang|ini|itu|"
+    r"sebagai|adalah|merupakan|tentang|terhadap|melalui|secara|"
+    r"juga|serta|namun|tetapi|karena|sehingga|agar|jika|bila|"
+    r"metode|metodologi|penelitian|pendekatan|analisis|kajian|studi|"
+    r"hasil|pembahasan|kesimpulan|pendahuluan|latar|tinjauan|"
+    r"vol|volume|no|nomor|hlm|halaman|pp|page|edisi|edition|"
+    r"accessed|diakses|retrieved|available|tersedia|"
+    # --- English function words ---
+    r"and|or|with|from|in|on|at|to|for|of|by|the|a|an|this|that|"
+    r"these|those|as|is|are|was|were|be|been|being|"
+    # --- Journal / publisher name fragments ---
+    r"journal|jurnal|review|international|proceedings|"
+    r"transactions|bulletin|studies|research|"
+    r"university|universitas|press|penerbit|publishing|"
+    r"springer|routledge|palgrave|wiley|sage|taylor|francis|"
+    r"oxford|cambridge|harvard|yale|mit|"
+    # --- Locators / protocols ---
+    r"http|https|www|doi"
+    r")\b",
+    re.I,
+)
+
+
+def _fragment_is_reference_start(fragment):
+    """
+    Text predicate: does `fragment` begin a new reference?
+
+    A new reference almost always begins with an author's surname,
+    which is:
+      * a capitalized token (or inverted "Surname, Initial")
+      * NOT a function word / title word / publisher word
+      * followed by a comma, a period, or another capitalized token
+
+    The check is intentionally asymmetric: we trust a strong
+    author-name signal on the RIGHT much more than terminal
+    punctuation on the LEFT, because PDF extraction frequently
+    drops the final period at a column break.
+    """
+    s = (fragment or "").lstrip()
+    if not s:
+        return False
+
+    # --- Reject obvious continuations FIRST. ---
+    # If the fragment begins with a function word / title word /
+    # publisher word, it cannot be the start of a new reference.
+    first_word_match = re.match(r"^([A-Za-z\u00c0-\u00ff'\u2019\-]+)", s)
+    if first_word_match:
+        first_word = first_word_match.group(1)
+        if _CONTINUATION_STARTERS.match(first_word):
+            return False
+
+    # --- Inverted personal name: "Surname, Initial." ---
+    if re.match(
+        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s+[A-Z]",
+        s,
+    ):
+        return True
+
+    # --- Non-inverted single-name author: "Syafliansah. Metode ..." ---
+    # Require the name to be followed by a period AND a capitalized
+    # word that is NOT a continuation starter.
+    m = re.match(
+        r"^([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,})\.\s+"
+        r"([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]*)",
+        s,
+    )
+    if m:
+        surname = m.group(1)
+        next_word = m.group(2)
+        # The word after the surname must NOT be a function word.
+        # e.g. "Syafliansah. Metode ..." -> "Metode" is a continuation
+        #      starter, so this is NOT a new reference.
+        if not _CONTINUATION_STARTERS.match(next_word):
+            return True
+
+    # --- Numbered entries ---
+    if re.match(r"^\d{1,3}\.\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd]", s):
+        return True
+
+    # --- Legal / constitutional citation: "30 (4) of the 1945 ..." ---
+    if re.match(r"^\d+\s*\(\d+\)\s+(?:of|dari|dalam)\s+", s, re.I):
+        return True
+
+    # --- Quoted titles ---
+    if s[:1] in ('"', "\u201c"):
+        return True
+
+    # --- Corporate author. ---
+    # Still useful, but require the head to look like an organization
+    # and be at least three tokens long, and reject journal-name wraps.
+    m = re.match(
+        r"^([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6})\.\s+"
+        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
+        s,
+    )
+    if m:
+        head = m.group(1)
+        first_two = " ".join(head.split()[:2])
+        if re.match(
+            r"^(?:WSEAS|Journal|Jurnal|Review|International|Proceedings|"
+            r"Transactions|Bulletin|Studies|Research|The|In|On|For|"
+            r"Metode|Metodologi|Penelitian|Pendekatan)\b",
+            first_two,
+            re.I,
+        ):
+            return False
+        # Require at least 3 tokens for a corporate author to be
+        # considered a valid reference start.
+        if len(head.split()) >= 3:
+            return True
+
+    return False
+
+
+def _fragment_ends_reference(fragment):
+    """
+    Text predicate: does `fragment` look like the end of a reference?
+
+    Loosened compared to a strict terminal-punctuation check: a
+    reference can end with a page number, a bare year, a closing
+    bracket, a DOI/URL, or simply be long enough that the next
+    capitalized token is almost certainly a new author.
+
+    The real discriminator is the RIGHT fragment. Missing terminal
+    punctuation on the LEFT is weak evidence against a boundary.
+    """
+    s = (fragment or "").rstrip()
+    if not s:
+        return False
+
+    # --- Terminal punctuation ---
+    if s[-1:] in ".?!)]\u201d":
+        return True
+
+    # --- URL or DOI at end ---
+    if re.search(r"(?:https?://\S+|10\.\d{4,9}/\S+)$", s, re.I):
+        return True
+
+    # --- Page range at end: "123-145" or "123–145" ---
+    if re.search(r"\b\d+\s*[-\u2013\u2014]\s*\d+[.,;)]?$", s):
+        return True
+
+    # --- Bare year at end: "... 2023" ---
+    if re.search(r"\b(?:18|19|20)\d{2}[a-z]?$", s, re.I):
+        return True
+
+    # --- Ends with a digit (page number, volume, issue) ---
+    if re.search(r"\d$", s):
+        return True
+
+    # --- Long enough that a new capitalized token is almost
+    #     certainly a new reference, not a title continuation. ---
+    if len(s) >= 60:
+        return True
+
+    return False
 
 
 def _flow_lines_into_stream(lines):
@@ -1108,78 +1274,6 @@ def _flow_lines_into_stream(lines):
         parts.append(text)
 
     return " ".join(parts)
-
-
-def _fragment_is_reference_start(fragment):
-    """
-    Text predicate: does `fragment` begin a new reference?
-    """
-    s = (fragment or "").lstrip()
-    if not s:
-        return False
-
-    # Inverted personal name: "Surname, Initial."
-    if re.match(
-        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s+[A-Z]",
-        s,
-    ):
-        return True
-
-    # Non-inverted single-name author: "Syafliansah. Metode ..."
-    if re.match(
-        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,}\.\s+"
-        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
-        s,
-    ):
-        return True
-
-    # Numbered entries
-    if re.match(r"^\d{1,3}\.\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd]", s):
-        return True
-
-    # Quoted titles
-    if s[:1] in ('"', "\u201c"):
-        return True
-
-    # Corporate author (reject journal-name wraps).
-    m = re.match(
-        r"^([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6})\.\s+"
-        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
-        s,
-    )
-    if m:
-        head = m.group(1)
-        first_two = " ".join(head.split()[:2])
-        if re.match(
-            r"^(?:WSEAS|Journal|Jurnal|Review|International|Proceedings|"
-            r"Transactions|Bulletin|Studies|Research|The|In|On|For)\b",
-            first_two,
-            re.I,
-        ):
-            return False
-        return True
-
-    return False
-
-
-def _fragment_ends_reference(fragment):
-    """
-    Text predicate: does `fragment` look like the end of a reference?
-    """
-    s = (fragment or "").rstrip()
-    if not s:
-        return False
-
-    if s[-1:] in ".?!":
-        return True
-    if s[-1:] in ")]\u201d":
-        return True
-    if re.search(r"(?:https?://\S+|10\.\d{4,9}/\S+)$", s, re.I):
-        return True
-    if re.search(r"\b\d+\s*[-\u2013\u2014]\s*\d+[.,;)]?$", s):
-        return True
-
-    return False
 
 
 def _split_stream_on_text_boundaries(stream):
@@ -1286,6 +1380,11 @@ def split_references_from_lines(lines):
 
     # Merge step with per-item logging so we can see which entries are
     # being absorbed into their predecessors.
+    #
+    # The merge predicate is now tightened: a fragment is merged into
+    # the previous reference ONLY when it is short AND it does not
+    # itself look like the start of a new reference. This prevents
+    # short legitimate references from being swallowed.
     merged = []
     for idx, ref in enumerate(repaired, start=1):
         ref = clean_text(ref)
@@ -1293,10 +1392,10 @@ def split_references_from_lines(lines):
             st.write(f"### [DEBUG] item {idx}: skipped (empty after clean)")
             continue
 
-        if len(ref) < 40 and merged:
+        if len(ref) < 25 and merged and not _fragment_is_reference_start(ref):
             st.write(
                 f"### [DEBUG] item {idx}: MERGED into previous "
-                f"(too short, {len(ref)} chars): {ref[:80]}"
+                f"(too short AND not a reference start, {len(ref)} chars): {ref[:80]}"
             )
             merged[-1] = merged[-1] + " " + ref
             continue
