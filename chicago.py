@@ -925,14 +925,6 @@ def line_is_header_footer(line, page_height):
 
 
 def extract_bibliography_lines(uploaded_file):
-    """
-    Return every bibliography line in reading order.
-
-    Because the splitter is text-first (DeepSeek-style), we do not
-    classify LEFT/RIGHT columns and we do not compute margins.
-    PyMuPDF's block order already reflects reading order for
-    well-formed PDFs.
-    """
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -940,22 +932,43 @@ def extract_bibliography_lines(uploaded_file):
     bibliography_found = False
     start_page = None
     ordered_lines = []
+    first_page_number = None
 
     for page_number, page in enumerate(doc, start=1):
         page_height = page.rect.height
         all_lines = extract_pdf_lines(page)
 
         if not bibliography_found:
-            heading_found = False
+            heading_line = None
             for line in all_lines:
                 if is_bibliography_heading(line["text"]):
-                    heading_found = True
+                    heading_line = line
                     break
-            if not heading_found:
+            if heading_line is None:
                 continue
             bibliography_found = True
             start_page = page_number
+            first_page_number = page_number
+            heading_y0 = heading_line["y0"]
 
+            for line in all_lines:
+                if line["y0"] <= heading_y0:
+                    continue
+                if is_bibliography_heading(line["text"]):
+                    continue
+                if line_is_header_footer(line, page_height):
+                    continue
+                if line["y1"] > page_height * 0.94:
+                    continue
+                # Skip obvious body-text fragments on the heading page.
+                stripped = line["text"].lstrip()
+                if re.match(r"^\d+\s*\(", stripped):
+                    continue
+                line["page"] = page_number
+                ordered_lines.append(line)
+            continue
+
+        # Subsequent pages: collect everything that isn't a header/footer.
         for line in all_lines:
             if is_bibliography_heading(line["text"]):
                 continue
@@ -1171,10 +1184,6 @@ def _fragment_is_reference_start(fragment):
     if re.match(r"^\d{1,3}\.\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd]", s):
         return True
 
-    # --- Legal / constitutional citation: "30 (4) of the 1945 ..." ---
-    if re.match(r"^\d+\s*\(\d+\)\s+(?:of|dari|dalam)\s+", s, re.I):
-        return True
-
     # --- Quoted titles ---
     if s[:1] in ('"', "\u201c"):
         return True
@@ -1279,8 +1288,13 @@ def _flow_lines_into_stream(lines):
 def _split_stream_on_text_boundaries(stream):
     """
     Split the bibliography stream on every `. Capital` boundary where
-    the left fragment ends a reference and the right fragment begins a
-    new one.
+    the right fragment begins a new reference.
+
+    Asymmetric by design:
+      * STRONG right signal (inverted name "Surname, Initial." or
+        "Surname, I." with a comma) → split unconditionally.
+      * WEAK right signal (single capitalized word, corporate author)
+        → require the left fragment to look like a reference ending.
     """
     if not stream:
         return []
@@ -1297,10 +1311,34 @@ def _split_stream_on_text_boundaries(stream):
         left = stream[boundaries[-1]:pos].strip()
         right = stream[pos:].strip()
 
-        # Never split inside a URL.
-        if re.search(r"https?://[^\s]*$", left):
+        # Never split inside a URL or DOI.
+        if re.search(r"(?:https?://\S*|10\.\d{4,9}/\S*)$", left):
             continue
 
+        # --- STRONG RIGHT SIGNAL ---
+        # A new reference begins with "<Capitalized word>, " or
+        # "<Capitalized word>. " where the word is NOT a
+        # continuation starter. This one rule handles both inverted
+        # ("Surname, Given") and non-inverted ("Surname. Title")
+        # author names, and rejects title/publisher/function words.
+        strong_right = False
+        m = re.match(
+            r"^([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+)"
+            r"([.,])\s+",
+            right,
+        )
+        if m:
+            candidate = m.group(1)
+            if not _CONTINUATION_STARTERS.match(candidate):
+                strong_right = True
+
+        if strong_right:
+            boundaries.append(pos)
+            continue
+
+        # --- WEAK RIGHT SIGNAL ---
+        # Fall back to the full predicate, plus require the left side
+        # to look like a completed reference.
         if not _fragment_is_reference_start(right):
             continue
         if not _fragment_ends_reference(left):
