@@ -993,69 +993,58 @@ def _is_running_banner_line(line_text: str, page_number=None) -> bool:
 
 
 def extract_bibliography_block(uploaded_file):
+    """
+    Return the raw text of the bibliography section as ONE string.
+
+    We use page.get_text("text") instead of page.get_text("dict")
+    because the dict-mode extractor silently drops spans that use
+    certain fonts or encodings. Confirmed on the Demas PDF: dict
+    mode misses two entries (Firdaus and Firmantoro) that text mode
+    captures correctly.
+    """
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     headings = {"bibliography", "references", "daftar pustaka"}
     start_page = None
-    lines = []
+    block_parts = []
 
     for page_number, page in enumerate(doc, start=1):
-        page_height = page.rect.height
-        page_text_dict = page.get_text("dict")
+        page_text = page.get_text("text") or ""
+        if not page_text.strip():
+            continue
 
-        page_lines = []
-        for block in page_text_dict.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            for line in block.get("lines", []):
-                spans = line.get("spans", [])
-                if not spans:
-                    continue
-                text = "".join(span.get("text", "") for span in spans)
-                text = re.sub(r"\s+", " ", text).strip()
-                if not text:
-                    continue
-                x0, y0, x1, y1 = line["bbox"]
-                page_lines.append({
-                    "text": text,
-                    "y0": float(y0),
-                    "y1": float(y1),
-                })
+        page_lines = [
+            re.sub(r"\s+", " ", ln).strip()
+            for ln in page_text.splitlines()
+            if ln.strip()
+        ]
 
         if start_page is None:
-            heading_y0 = None
-            for ln in page_lines:
-                if ln["text"].lower() in headings:
-                    heading_y0 = ln["y0"]
+            heading_idx = None
+            for i, ln in enumerate(page_lines):
+                if ln.lower() in headings:
+                    heading_idx = i
                     break
-            if heading_y0 is None:
+            if heading_idx is None:
                 continue
             start_page = page_number
-            for ln in page_lines:
-                if ln["y0"] <= heading_y0:
+            for ln in page_lines[heading_idx + 1:]:
+                if _is_running_banner_line(ln, page_number):
                     continue
-                if ln["y1"] > page_height * 0.94:
-                    continue
-                # NO top-6% filter
-                if _is_running_banner_line(ln["text"], page_number):
-                    continue
-                lines.append(ln["text"])
+                block_parts.append(ln)
             continue
 
         for ln in page_lines:
-            if ln["y1"] > page_height * 0.94:
+            if _is_running_banner_line(ln, page_number):
                 continue
-            # NO top-6% filter
-            if _is_running_banner_line(ln["text"], page_number):
-                continue
-            lines.append(ln["text"])
+            block_parts.append(ln)
 
     doc.close()
     uploaded_file.seek(0)
 
-    block = " ".join(lines)
+    block = " ".join(block_parts)
     block = re.sub(r"\s+", " ", block).strip()
     block = _heal_doi_wraps_in_block(block)
 
@@ -1063,7 +1052,7 @@ def extract_bibliography_block(uploaded_file):
         "found": start_page is not None,
         "start_page": start_page,
         "block": block,
-        "line_count": len(lines),
+        "line_count": len(block_parts),
     }
 
 
@@ -1879,7 +1868,7 @@ def create_complete_chicago_report(
             if not comment:
                 if doi_status == "mismatch":
                     comment = (
-                        "DOI resolves in OpenAlex to a different work "
+                        "DOI resolves in databse to a different work "
                         "(mismatched title/authors) — possible fake DOI. "
                         "Corrected version withheld."
                     )
@@ -1914,7 +1903,7 @@ def create_complete_chicago_report(
                 p_reason.paragraph_format.left_indent = Inches(0.25)
                 p_reason.paragraph_format.space_after = Pt(2)
                 r = p_reason.add_run(
-                    "  DOI not found in OpenAlex — could not verify."
+                    "  DOI not found in database — could not verify."
                 )
                 r.italic = True
                 r.font.size = Pt(10)
