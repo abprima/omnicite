@@ -943,6 +943,25 @@ def get_line_column(line, page_width):
     return "LEFT" if center < midpoint else "RIGHT"
 
 
+# ------------------------------------------------------------
+# FIX: page-level single-column detection
+# ------------------------------------------------------------
+
+def detect_single_column_page(all_lines):
+    """
+    Return True if the page looks single-column:
+    at least 75% of the non-empty lines start within 30 pt of the
+    leftmost x0 on the page.
+    """
+    xs = [l["x0"] for l in all_lines if l.get("text", "").strip()]
+    if not xs:
+        return True
+    xs_sorted = sorted(xs)
+    left = xs_sorted[0]
+    near_left = sum(1 for x in xs if x <= left + 30.0)
+    return near_left >= int(len(xs) * 0.60)
+
+
 def extract_bibliography_lines(uploaded_file):
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
@@ -982,9 +1001,15 @@ def extract_bibliography_lines(uploaded_file):
                 continue
             lines.append(line)
 
+        # FIX: collapse LEFT/RIGHT to LEFT for single-column pages.
+        single_column_page = detect_single_column_page(all_lines)
+
         left, right = [], []
         for line in lines:
-            column = get_line_column(line, page_width)
+            if single_column_page:
+                column = "LEFT"
+            else:
+                column = get_line_column(line, page_width)
             line["page"] = page_number
             line["column"] = column
             if column == "LEFT":
@@ -1102,11 +1127,6 @@ def _split_glued_line(text: str) -> list[str]:
 
 
 def _joined_lookahead(lines, start_index, max_lines=3):
-    """
-    Concatenate up to `max_lines` starting at `start_index`.
-    Handles author names that wrap across two or three visual lines,
-    e.g. "Firdaus," followed by "Muhammad," on the next line.
-    """
     parts = []
     for j in range(start_index, min(start_index + max_lines, len(lines))):
         parts.append(lines[j]["text"].strip())
@@ -1114,29 +1134,19 @@ def _joined_lookahead(lines, start_index, max_lines=3):
 
 
 def _starts_new_reference_at(lines, index):
-    """
-    True if line `index` — possibly joined with the next two lines to
-    handle wrapped author names — begins a new bibliography entry.
-    """
     joined = _joined_lookahead(lines, index, max_lines=3)
     return _looks_like_reference_start(joined)
 
 
 # ------------------------------------------------------------
-# PDF-wrap repair (FIX #1 + FIX #5)
+# PDF-wrap repair
 # ------------------------------------------------------------
 
 def _repair_single_segment(text: str) -> str:
-    """
-    Repair wrap artifacts inside a text segment that contains NO
-    internal `. Capital` boundary.
-    """
     value = clean_text(text or "")
     if not value:
         return ""
 
-    # 1. Numeric DOI wrap:
-    #    "10.18196/jmh.v30i2.186 28" -> "10.18196/jmh.v30i2.18628"
     numeric_doi_wrap = re.compile(
         r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]*\d)\s+(\d{1,6})(?=(?:[.,;)]|\s|$))",
         re.I,
@@ -1146,16 +1156,11 @@ def _repair_single_segment(text: str) -> str:
         previous = value
         value = numeric_doi_wrap.sub(r"\1\2", value)
 
-    # 2. DOI broken at a period-space boundary inside the path:
-    #    "10.37394/232015.2022. 18.19" -> "10.37394/232015.2022.18.19"
     value = re.sub(
         r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.)\s+(\d+(?:\.\d+)*)(?=[\s.,;)]|$)",
         r"\1\2", value, flags=re.I,
     )
 
-    # 3. URL wrap at a slash or hyphen — but never for DOIs.
-    #    Require the continuation to begin with lowercase or digit so
-    #    that a fresh capitalised author name is never glued to a URL.
     value = re.sub(
         r"((?:https?://|www\.)(?![^\s]*doi\.org/)[^\s]*[/-])\s+"
         r"([a-z0-9][A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)",
@@ -1163,10 +1168,8 @@ def _repair_single_segment(text: str) -> str:
         value,
     )
 
-    # 4. Hyphenated word split across a PDF line break.
     value = re.sub(r"(\w+)-\s+([a-z]\w*)", r"\1-\2", value)
 
-    # 5. Duplicated DOI prefixes.
     value = re.sub(
         r"https?://(?:dx\.)?doi\.org/\s*https?://(?:dx\.)?doi\.org/",
         "https://doi.org/",
@@ -1177,29 +1180,17 @@ def _repair_single_segment(text: str) -> str:
 
 
 def _repair_bibliography_pdf_breaks(text: str) -> str:
-    """
-    Repair PDF line-wrap artifacts inside a SINGLE reference.
-
-    Never joins across a sentence boundary. A boundary is any
-    `. ` / `? ` / `! ` followed by an uppercase letter — that is
-    always either a new sentence or a new reference, and is preserved.
-    """
     value = clean_text(text or "")
     if not value:
         return ""
 
-    # Split at safe boundaries: `.?!/` followed by whitespace and a
-    # capital letter. Repair each piece independently, preserve the
-    # boundary.
     boundary_re = re.compile(r"(?<=[.?!])\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])")
     parts = boundary_re.split(value)
-
     repaired = [_repair_single_segment(p) for p in parts]
     return clean_text(" ".join(p for p in repaired if p))
 
 
 def _probable_bibliography_start(text: str) -> bool:
-    """Permissive validator used after geometry says a line is at the first-line margin."""
     s = clean_text(text or "")
     if not s or _URL_OR_DOI_RE.match(s):
         return False
@@ -1224,17 +1215,7 @@ def _probable_bibliography_start(text: str) -> bool:
     return _looks_like_reference_start(s)
 
 
-# ------------------------------------------------------------
-# Column margin detection (FIX #4)
-# ------------------------------------------------------------
-
-def _column_start_margins(lines, cluster_tolerance=3.0):
-    """
-    Infer first-line x margin for each column.
-
-    If the two virtual columns share the same x0 range, the page is
-    treated as single-column and a unified margin is returned.
-    """
+def _column_start_margins(lines, cluster_tolerance=5.0):
     by_col = {"LEFT": [], "RIGHT": []}
     for line in lines:
         by_col.setdefault(line.get("column", "LEFT"), []).append(
@@ -1286,20 +1267,21 @@ def _column_start_margins(lines, cluster_tolerance=3.0):
 
 
 # ------------------------------------------------------------
-# Top-level splitter (FIX #2 + FIX #3)
+# Top-level splitter
 # ------------------------------------------------------------
 
 def split_references_from_lines(lines):
     """
     Split bibliography into entries.
 
-    Geometry mode: hanging-indent reset is the primary boundary signal.
-    Textual author detection only *confirms* a boundary that geometry
-    has already proposed, and only when the previous visual line
-    ended with `.`, `?`, or `!`.
+    Geometry mode: hanging-indent reset is the primary boundary
+    signal. Textual author detection confirms the boundary. `prev_ends`
+    is intentionally NOT required here — many real bibliographies end
+    an entry with a URL or DOI fragment that does not terminate with
+    sentence punctuation.
 
-    Heuristic mode (plain strings, no geometry): reference-start
-    signatures drive segmentation.
+    Heuristic mode: reference-start signatures drive segmentation,
+    with a `prev_ends` safety check.
     """
     if not lines:
         return []
@@ -1392,14 +1374,6 @@ def split_references_from_lines(lines):
             or _probable_bibliography_start(text)
         )
 
-        # Require the previous reference to look finished before
-        # accepting any boundary.
-        prev_ends = (
-            bool(current)
-            and bool(re.search(r"[.?!]\s*$", current[-1]))
-        )
-
-        # Column transition rescue is only valid when real columns exist.
         column_changed = (
             not single_column_page
             and current
@@ -1412,7 +1386,6 @@ def split_references_from_lines(lines):
             and at_start_margin
             and not url_or_doi
             and content_start
-            and prev_ends
         )
 
         if column_changed and at_start_margin and not url_or_doi and content_start:
@@ -1429,8 +1402,6 @@ def split_references_from_lines(lines):
     if current:
         refs.append(_repair_bibliography_pdf_breaks(" ".join(current)))
 
-    # No final _split_glued_line pass: geometry already produced clean
-    # entries, and re-splitting would undo them.
     return [clean_text(r) for r in refs if clean_text(r)]
 
 
@@ -1766,7 +1737,7 @@ def add_markdown_to_paragraph(paragraph, text, make_red=False):
 
 
 # ============================================================
-# DOCX REPORT — mirrors APA layout
+# DOCX REPORT
 # ============================================================
 
 def create_complete_chicago_report(
@@ -1778,16 +1749,6 @@ def create_complete_chicago_report(
     composition_rows=None,
     manuscript_year=None,
 ):
-    """
-    Build the Chicago diagnostic report with the SAME structure as
-    build_apa_report_docx():
-
-      1. Title + subtitle + meta
-      2. Section 1 — Summary (metrics table + source-type table)
-      3. Section 2 — Footnotes  (Original / Corrected / Note / Status)
-      4. Section 3 — Bibliography (Original / Corrected / Comment / Status)
-         with a horizontal rule between entries
-    """
     doc = Document()
     _docx_set_default_font(doc, "Times New Roman", 11)
 
@@ -2346,6 +2307,9 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
     bibliography_result = extract_bibliography_lines(uploaded_file)
     if bibliography_result.get("found"):
         references = split_references_from_lines(bibliography_result["lines"])
+        st.write(f"### DEBUG — {len(references)} references extracted")
+        for i, r in enumerate(references, 1):
+            st.caption(f"**{i}.** [{len(r)} chars] {r[:160]}")
         references = [clean_text(r) for r in references if clean_text(r)]
     else:
         references = []
