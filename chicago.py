@@ -1038,8 +1038,7 @@ def extract_bibliography_block(uploaded_file):
                     continue
                 if ln["y1"] > page_height * 0.94:
                     continue
-                if ln["y0"] < page_height * 0.06:
-                    continue
+                # NO top-6% filter
                 if _is_running_banner_line(ln["text"], page_number):
                     continue
                 lines.append(ln["text"])
@@ -1048,8 +1047,7 @@ def extract_bibliography_block(uploaded_file):
         for ln in page_lines:
             if ln["y1"] > page_height * 0.94:
                 continue
-            if ln["y0"] < page_height * 0.06:
-                continue
+            # NO top-6% filter
             if _is_running_banner_line(ln["text"], page_number):
                 continue
             lines.append(ln["text"])
