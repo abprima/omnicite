@@ -2629,53 +2629,6 @@ def render():
     with right:
         st.dataframe(composition_df, use_container_width=True, hide_index=True)
 
-    show_fn = st.toggle("Footnote Comparison", value=False,
-                        key=f"chicago_show_fn_{selected_key}")
-    if show_fn:
-        fn_rows = []
-        for note in checked_notes:
-            raw = str(note.get("ai_status", "MANUAL_CHECK")).upper().strip()
-            disp = ("MATCH" if raw == "OK"
-                    else "REVISED" if raw == "REVISED"
-                    else "MANUAL CHECK")
-            fn_rows.append({
-                "No.": note.get("number", ""),
-                "Original Footnote": clean_text(note.get("text", "")),
-                "Corrected AI Version": (
-                    clean_text(note.get("ai_revised_footnote_markdown", ""))
-                    or clean_text(note.get("text", ""))
-                ),
-                "Status": disp,
-            })
-        if fn_rows:
-            st.dataframe(pd.DataFrame(fn_rows), use_container_width=True,
-                         hide_index=True, height=230)
-        else:
-            st.info("No footnotes available for comparison.")
-
-    show_bib = st.toggle("Bibliography Comparison", value=False,
-                         key=f"chicago_show_bib_{selected_key}")
-    if show_bib:
-        if corrected_rows:
-            df = pd.DataFrame(corrected_rows)
-            preferred = [
-                "No.", "Source Type", "Publication Year",
-                "Original Version", "Corrected Version", "Status",
-                "Footnote in Bibliography", "Bibliography Missing from Footnotes",
-                "Duplicate DOI", "Incomplete Author List", "Placeholders",
-                "DOI Checked", "DOI Suspicious", "OpenAlex Title", "DOI Issues",
-            ]
-            existing = [c for c in preferred if c in df.columns]
-            rest = [c for c in df.columns if c not in existing]
-            df = df[existing + rest]
-            st.caption(
-                f"Showing {len(df)} of "
-                f"{len(batch.get('references', []))} extracted entries."
-            )
-            st.dataframe(df, use_container_width=True, hide_index=True, height=280)
-        else:
-            st.info("No bibliography entries available.")
-
     report_docx = batch.get("report_docx")
     if report_docx:
         safe_name = re.sub(r"[^\w\-]+", "_", batch.get("filename", "manuscript"))
