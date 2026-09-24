@@ -1287,23 +1287,24 @@ def _flow_lines_into_stream(lines):
 
 def _split_stream_on_text_boundaries(stream):
     """
-    Split the bibliography stream on every `. Capital` boundary where
-    the right fragment begins a new reference.
-
-    Asymmetric by design:
-      * STRONG right signal (inverted name "Surname, Initial." or
-        "Surname, I." with a comma) → split unconditionally.
-      * WEAK right signal (single capitalized word, corporate author)
-        → require the left fragment to look like a reference ending.
+    Split the bibliography stream on every candidate boundary where
+    the right fragment begins with an author-name signal.
     """
     if not stream:
         return []
 
     candidates = []
-    for m in re.finditer(
-        r"(?<=[.?!])\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
-        stream,
-    ):
+    # Candidate boundary positions:
+    #   * after `.?!` + whitespace + capital
+    #   * after a URL/DOI + whitespace + capital
+    #   * after a page range/number + whitespace + capital
+    candidate_re = re.compile(
+        r"(?<=[.?!])\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])"
+        r"|(?<=https?://\S{2,})\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])"
+        r"|(?<=doi\.org/\S{2,})\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])"
+        r"|(?<=\d[-\u2013\u2014]\d{1,5})\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])"
+    )
+    for m in candidate_re.finditer(stream):
         candidates.append(m.start())
 
     boundaries = [0]
@@ -1316,11 +1317,8 @@ def _split_stream_on_text_boundaries(stream):
             continue
 
         # --- STRONG RIGHT SIGNAL ---
-        # A new reference begins with "<Capitalized word>, " or
-        # "<Capitalized word>. " where the word is NOT a
-        # continuation starter. This one rule handles both inverted
-        # ("Surname, Given") and non-inverted ("Surname. Title")
-        # author names, and rejects title/publisher/function words.
+        # "Capitalized word, " or "Capitalized word. " where the word
+        # is not a continuation starter.
         strong_right = False
         m = re.match(
             r"^([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+)"
@@ -1332,13 +1330,23 @@ def _split_stream_on_text_boundaries(stream):
             if not _CONTINUATION_STARTERS.match(candidate):
                 strong_right = True
 
+        # --- RESCUE: `<Capital>. <Capital> ... <year>` ---
+        # A single-name author followed by a title that contains a
+        # 4-digit year is a legitimate reference, even if the second
+        # word would otherwise look like a continuation starter.
+        if not strong_right:
+            if re.match(
+                r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,}\.\s+"
+                r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
+                right,
+            ) and re.search(r"\b(?:18|19|20)\d{2}\b", right):
+                strong_right = True
+
         if strong_right:
             boundaries.append(pos)
             continue
 
         # --- WEAK RIGHT SIGNAL ---
-        # Fall back to the full predicate, plus require the left side
-        # to look like a completed reference.
         if not _fragment_is_reference_start(right):
             continue
         if not _fragment_ends_reference(left):
@@ -1358,100 +1366,109 @@ def _split_stream_on_text_boundaries(stream):
     return pieces
 
 
-# ============================================================
-# Top-level splitter
-# ============================================================
+# ------------------------------------------------------------
+# Merge helpers
+# ------------------------------------------------------------
+
+_INVERTED_HEAD_RE = re.compile(
+    r"^([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+),\s+"
+    r"([A-Z\u00c0-\u00d6\u00d8-\u00dd](?:\.[A-Z\u00c0-\u00d6\u00d8-\u00dd])*\.?)$"
+)
+
+
+def _is_inverted_name_head(fragment):
+    """
+    True when `fragment` is a bare inverted-name head with no title
+    content — e.g. "Hasibuan, M." or "Siregar, S. N.".
+    """
+    s = (fragment or "").strip()
+    if not s:
+        return False
+    if len(s) > 30:
+        return False
+    return bool(_INVERTED_HEAD_RE.match(s))
+
+
+def _looks_like_name_continuation(fragment):
+    """
+    True when `fragment` begins with a capitalized given name or a
+    capital word followed by a comma — the continuation of a split
+    inverted name.
+    """
+    s = (fragment or "").lstrip()
+    if not s:
+        return False
+    return bool(re.match(
+        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+"
+        r"(?:\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+)*"
+        r",\s+",
+        s,
+    ))
 
 
 def split_references_from_lines(lines):
     """
     Split bibliography into individual references.
 
-    Text-first (DeepSeek-style) segmentation:
+    Text-first segmentation with a two-pass merge:
 
       1. Flow all visual lines into a single text stream.
-      2. Split on `. Capital` boundaries where the left side ends a
-         reference and the right side begins a new one.
+      2. Split on candidate boundaries where the right side begins
+         with an author-name signal.
       3. Repair PDF-induced wraps inside each reference.
-      4. Merge pathological fragments.
-
-    Geometry is not used to create boundaries. This handles single-
-    and two-column bibliographies identically because segmentation is
-    driven by the source text.
+      4. Forward-merge split inverted-name heads ("Hasibuan, M." +
+         "Fadly, and Iza ...").
+      5. Backward-merge remaining fragments that don't start a
+         reference.
     """
-    st.write("### [BUILD] segmentation-v3-strong-right")
-    st.write("### ================================================")
-    st.write("### [DEBUG] split_references_from_lines — entry")
-    st.write("### ================================================")
-
     if not lines:
-        st.write("### [DEBUG] input `lines` is empty — returning []")
         return []
-
-    st.write(f"### [DEBUG] input lines: {len(lines)}")
-
-    # Print first 5 input lines with their coordinates so we can spot
-    # whether the extraction is producing the expected order.
-    for i, ln in enumerate(lines[:5], start=1):
-        text = clean_text(ln.get("text", "")) if isinstance(ln, dict) else str(ln)
-        x0 = ln.get("x0", "?") if isinstance(ln, dict) else "?"
-        y0 = ln.get("y0", "?") if isinstance(ln, dict) else "?"
-        st.write(f"### [DEBUG] line {i}: x0={x0} y0={y0} :: {text[:120]}")
 
     stream = _flow_lines_into_stream(lines)
     if not stream:
-        st.write("### [DEBUG] `stream` is empty after flowing — returning []")
         return []
 
-    st.write(f"### [DEBUG] stream length: {len(stream)} chars")
-    st.write(f"### [DEBUG] stream first 400 chars: {stream[:400]}")
-    st.write(f"### [DEBUG] stream last 400 chars: {stream[-400:]}")
-
     raw_pieces = _split_stream_on_text_boundaries(stream)
-    st.write(f"### [DEBUG] raw pieces after text-boundary split: {len(raw_pieces)}")
-
-    # Print the first 10 raw pieces as they were found.
-    for i, piece in enumerate(raw_pieces[:10], start=1):
-        st.write(f"### [DEBUG] raw piece {i} [{len(piece)} chars]: {piece[:140]}")
-
     repaired = [_repair_bibliography_pdf_breaks(p) for p in raw_pieces]
-    st.write(f"### [DEBUG] pieces after repair: {len(repaired)}")
 
-    # Merge step with per-item logging so we can see which entries are
-    # being absorbed into their predecessors.
-    #
-    # The merge predicate is now tightened: a fragment is merged into
-    # the previous reference ONLY when it is short AND it does not
-    # itself look like the start of a new reference. This prevents
-    # short legitimate references from being swallowed.
-    merged = []
-    for idx, ref in enumerate(repaired, start=1):
-        ref = clean_text(ref)
+    # --- PASS 1: forward-merge split inverted-name heads ---
+    forward_merged = []
+    i = 0
+    while i < len(repaired):
+        ref = clean_text(repaired[i])
         if not ref:
-            st.write(f"### [DEBUG] item {idx}: skipped (empty after clean)")
+            i += 1
             continue
 
-        if len(ref) < 25 and merged and not _fragment_is_reference_start(ref):
-            st.write(
-                f"### [DEBUG] item {idx}: MERGED into previous "
-                f"(too short AND not a reference start, {len(ref)} chars): {ref[:80]}"
-            )
+        if (_is_inverted_name_head(ref)
+                and i + 1 < len(repaired)
+                and _looks_like_name_continuation(repaired[i + 1])):
+            nxt = clean_text(repaired[i + 1])
+            forward_merged.append(ref + " " + nxt)
+            i += 2
+            continue
+
+        forward_merged.append(ref)
+        i += 1
+
+    # --- PASS 2: backward-merge fragments that don't start a ref ---
+    merged = []
+    for ref in forward_merged:
+        ref = clean_text(ref)
+        if not ref:
+            continue
+
+        if (len(ref) < 25
+                and merged
+                and not _fragment_is_reference_start(ref)):
             merged[-1] = merged[-1] + " " + ref
             continue
 
         if merged and not _fragment_is_reference_start(ref):
-            st.write(
-                f"### [DEBUG] item {idx}: MERGED into previous "
-                f"(does not start a reference): {ref[:80]}"
-            )
             merged[-1] = merged[-1] + " " + ref
             continue
 
-        st.write(f"### [DEBUG] item {idx}: KEPT as new reference: {ref[:80]}")
         merged.append(ref)
-
-    st.write(f"### [DEBUG] references after merge: {len(merged)}")
-    st.write("### ================================================")
 
     return merged
 
