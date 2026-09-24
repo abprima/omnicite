@@ -29,7 +29,7 @@ from openalex_config import get_openalex_api_key
 
 
 # ============================================================
-# HEADINGS (APA-style constants, Chicago variants added)
+# HEADINGS
 # ============================================================
 
 NOTE_HEADINGS = {
@@ -91,7 +91,7 @@ def _is_plausible_note_heading(line: str) -> bool:
 
 
 # ============================================================
-# RUNNING HEADER / FOOTER STRIPPER  (copied from apa.py)
+# RUNNING HEADER / FOOTER STRIPPER
 # ============================================================
 
 REPEAT_THRESHOLD = 3
@@ -168,7 +168,6 @@ def clean_text(text):
 # ============================================================
 
 def _quality_of_reference_block(block: str, cap: int = 300) -> int:
-    """Count reference-shaped lines: (year) or DOI/URL or surname-led."""
     count = 0
     for line in block.splitlines()[:cap]:
         s = line.strip()
@@ -185,7 +184,6 @@ def _quality_of_reference_block(block: str, cap: int = 300) -> int:
 
 
 def slice_reference_section(text: str):
-    """Bottom-up heading anchor with a ≥5-reference quality gate."""
     lines = text.splitlines()
     candidates = [i for i, l in enumerate(lines) if _is_plausible_reference_heading(l)]
     if not candidates:
@@ -212,7 +210,6 @@ def slice_reference_section(text: str):
 
 
 def slice_body_section(text: str):
-    """Everything before the (first) reference heading."""
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if _is_plausible_reference_heading(line):
@@ -221,12 +218,6 @@ def slice_body_section(text: str):
 
 
 def slice_note_section(text: str):
-    """
-    Return the note section that appears *before* the bibliography.
-    Chicago Notes & Bibliography puts numbered notes either as page
-    footnotes (flattened by MarkItDown) or as an endnote block.
-    We anchor on any NOTE heading and stop at the reference heading.
-    """
     lines = text.splitlines()
     note_start = None
     for i, line in enumerate(lines):
@@ -247,25 +238,11 @@ def slice_note_section(text: str):
 # CHICAGO FOOTNOTE EXTRACTION (Markdown-based)
 # ============================================================
 
-# A note starts with "1.", "12." etc. at the beginning of a line.
 _NOTE_START_RE = re.compile(r"^\s*(\d{1,3})[.)]\s+(.*)$")
 
 
 def extract_chicago_footnotes(text: str):
-    """
-    Extract Chicago footnotes from the (already-cleaned) manuscript text.
-
-    Strategy:
-      1. If an endnote block ("Notes"/"Footnotes"/"Catatan") exists,
-         parse notes ONLY from there.
-      2. Otherwise, scan every line for a `^\\d+\\.` note start.
-         Consecutive lines that do NOT start a new note are continuations.
-
-    Returns a dict compatible with the old return contract so downstream
-    code (attach_page_numbers_to_footnotes, DOCX builder) keeps working.
-    """
     note_block, found_block = slice_note_section(text)
-
     source_text = note_block if found_block else text
 
     footnotes = []
@@ -282,9 +259,6 @@ def extract_chicago_footnotes(text: str):
             number = int(m.group(1))
             body = clean_text(m.group(2))
 
-            # In the endnote-block case we respect the numbering.
-            # In the body-scan case we only accept a note when it
-            # continues the expected sequence (or starts at 1).
             if expected is None and number == 1:
                 pass
             elif expected is not None and number == expected:
@@ -292,7 +266,6 @@ def extract_chicago_footnotes(text: str):
             elif found_block and number == 1 and not footnotes:
                 pass
             else:
-                # treat as prose containing "digit." mid-flow
                 if current is not None:
                     current["text"] += " " + line
                     current["line_count"] += 1
@@ -321,7 +294,6 @@ def extract_chicago_footnotes(text: str):
     if current is not None:
         footnotes.append(current)
 
-    # Drop empties and very short bodies
     footnotes = [
         n for n in footnotes
         if clean_text(n["text"]) and len(clean_text(n["text"])) >= 5
@@ -330,14 +302,13 @@ def extract_chicago_footnotes(text: str):
     return {
         "footnotes": footnotes,
         "count": len(footnotes),
-        "bibliography_page": None,   # kept for backward compatibility
+        "bibliography_page": None,
         "debug": [],
         "page_candidates": [],
     }
 
 
 def attach_page_numbers_to_footnotes(footnotes, page_candidates=None):
-    """No-op passthrough (MarkItDown has no page geometry)."""
     out = []
     for n in footnotes:
         item = dict(n)
@@ -351,76 +322,251 @@ def footnote_has_indonesian_author_conjunction(text):
 
 
 # ============================================================
-# BIBLIOGRAPHY REFERENCE SPLITTING
+# BIBLIOGRAPHY REFERENCE SPLITTING  (glued-line aware)
 # ============================================================
 
-_HANGING_START_RE = re.compile(
-    r"^\s*(?:"
-    r"[\u201c\"]"                                  # quoted title start
-    r"|[A-Z\u00c0-\u00d6\u00d8-\u00dd]"           # uppercase lead
-    r")"
+_URL_OR_DOI_RE = re.compile(
+    r"^(?:https?://|www\.|10\.\d{4,9}/|doi\s*:)", re.I
 )
+
+# Personal-author start: "Surname, A." or "Surname, Given"
+_AUTHOR_START_RE = re.compile(
+    r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd]"
+    r"[A-Za-z\u00c0-\u00ff'\u2019\-]+"
+    r",\s+[A-Z]"
+)
+
+# Corporate-author start: "Some Organization Name."
+_CORPORATE_START_RE = re.compile(
+    r"^[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6}\."
+)
+
+# Title-in-quotes start
+_QUOTED_START_RE = re.compile(r"^[\u201c\"]")
+
+# Numbered reference start: "1. "
+_NUMBERED_START_RE = re.compile(r"^\d{1,3}\.\s+[A-Z]")
+
+
+def _looks_like_reference_start(fragment: str) -> bool:
+    s = fragment.lstrip()
+    if not s:
+        return False
+    if _AUTHOR_START_RE.match(s):
+        return True
+    if _QUOTED_START_RE.match(s):
+        return True
+    if _NUMBERED_START_RE.match(s):
+        return True
+    # Corporate start — but reject if it's just a journal name wrap
+    m = _CORPORATE_START_RE.match(s)
+    if m:
+        # Reject if the "corporate name" is a common journal keyword
+        # (WSEAS Transactions on ..., Journal of ..., Review of ...)
+        first_two = " ".join(m.group(0).split()[:2]).rstrip(".")
+        if re.match(
+            r"^(?:WSEAS|Journal|Jurnal|Review|International|Proceedings|"
+            r"Transactions|Bulletin|Studies|Research)\b",
+            first_two, re.I,
+        ):
+            return False
+        return True
+    return False
+
+
+def _split_glued_line(text: str) -> list[str]:
+    """
+    Split one physical line that may contain multiple glued references.
+
+    Uses the author-start boundary `.<space><Surname>, <Initial>` plus
+    the corporate-author boundary `.<space>Some Name.` while never
+    splitting inside a URL or DOI.
+    """
+    if not text:
+        return []
+
+    # Fast path: single-reference line
+    if not re.search(r"\.\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd]", text):
+        return [text.strip()]
+
+    # Candidate boundaries: a sentence-ending period, whitespace, then
+    # a capital letter. We then verify the fragment after the boundary
+    # looks like a reference start.
+    candidates = []
+    for m in re.finditer(r"(?<=\.)\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])", text):
+        candidates.append(m.start())
+
+    if not candidates:
+        return [text.strip()]
+
+    boundaries = [0]
+    for pos in candidates:
+        after = text[pos:].lstrip()
+        # Do not split if the char just before the period is part of a URL
+        before = text[:pos]
+        if re.search(r"https?://[^\s]*$", before):
+            continue
+        # Do not split if the fragment after boundary is a URL continuation
+        if _URL_OR_DOI_RE.match(after):
+            continue
+        if _looks_like_reference_start(after):
+            boundaries.append(pos)
+    boundaries.append(len(text))
+
+    pieces = []
+    for i in range(len(boundaries) - 1):
+        start = boundaries[i]
+        end = boundaries[i + 1]
+        piece = text[start:end].strip()
+        if piece:
+            pieces.append(piece)
+
+    # Post-merge: if a piece does not actually begin a reference, glue
+    # it back to the previous one.
+    merged = []
+    for piece in pieces:
+        if not merged:
+            merged.append(piece)
+            continue
+        if _looks_like_reference_start(piece):
+            merged.append(piece)
+        else:
+            merged[-1] = merged[-1] + " " + piece
+    return merged
 
 
 def split_references_from_lines(lines):
     """
-    Split a reference-section block into individual references.
+    Split bibliography lines into individual references.
 
-    Chicago hanging-indent style means every reference begins at the
-    left margin. MarkItDown flattens indentation, so we approximate by
-    starting a new reference at a line that:
-      - begins with an author-like capital (or opening quote),
-      - is NOT a DOI/URL continuation,
-      - and whose predecessor line looks complete (ends with `.` or
-        a DOI/URL).
-    A blank line also forces a break.
+    Handles:
+      A. Two-column layout where lines carry a `column` key.
+      B. One-column layout where multiple references are glued on the
+         same physical line.
     """
     if not lines:
         return []
 
+    # ---- Normalise input ----
+    normalised = []
+    for item in lines:
+        if isinstance(item, dict):
+            normalised.append({
+                "text": item.get("text", ""),
+                "x0": float(item.get("x0", 0.0)),
+                "y0": float(item.get("y0", 0.0)),
+                "column": item.get("column", "LEFT"),
+            })
+        else:
+            text = str(item).strip()
+            if text:
+                normalised.append({
+                    "text": text, "x0": 0.0, "y0": 0.0, "column": "LEFT",
+                })
+
+    if not normalised:
+        return []
+
+    # ---- Pre-split glued lines ----
+    expanded = []
+    for record in normalised:
+        for piece in _split_glued_line(record["text"]):
+            new = dict(record)
+            new["text"] = piece
+            expanded.append(new)
+
+    # ---- Column-aware hanging-indent clustering ----
     references = []
     current = []
 
-    def _looks_like_continuation(prev: str, nxt: str) -> bool:
-        if re.match(r"^(https?://|10\.\d{4,9}/|doi\s*:)", nxt, re.I):
-            return True
-        if re.match(r"^(https?://|10\.\d{4,9}/|doi\s*:)", prev, re.I):
-            return False
-        if prev and not prev.rstrip().endswith((".", "?", "!")):
-            return True
-        return False
+    column_x_values = {"LEFT": [], "RIGHT": []}
+    for line in expanded:
+        column_x_values[line["column"]].append(round(line["x0"], 1))
 
-    prev_text = ""
-    for line in lines:
-        text = line.strip() if isinstance(line, str) else str(line).strip()
-        if not text:
-            # Blank line: force a boundary
-            if current:
-                references.append(" ".join(current))
-                current = []
-            prev_text = ""
-            continue
-
-        is_new = (
-            not current
-            or (
-                _HANGING_START_RE.match(text)
-                and not _looks_like_continuation(prev_text, text)
-            )
+    def cluster_x_positions(values, tolerance=2.5):
+        if not values:
+            return []
+        values = sorted(values)
+        clusters = []
+        for value in values:
+            matched = False
+            for cluster in clusters:
+                center = sum(cluster) / len(cluster)
+                if abs(value - center) <= tolerance:
+                    cluster.append(value)
+                    matched = True
+                    break
+            if not matched:
+                clusters.append([value])
+        return sorted(
+            [{"x": sum(c) / len(c), "count": len(c)} for c in clusters],
+            key=lambda c: c["x"],
         )
 
-        if is_new:
+    start_margin = {}
+    for column in ("LEFT", "RIGHT"):
+        clusters = cluster_x_positions(column_x_values[column])
+        if not clusters:
+            start_margin[column] = None
+            continue
+        meaningful = [c for c in clusters if c["count"] >= 2]
+        start_margin[column] = (
+            min(c["x"] for c in meaningful) if meaningful else clusters[0]["x"]
+        )
+
+    margin_tolerance = 4.0
+
+    for line in expanded:
+        text = line["text"].strip()
+        if not text:
+            continue
+
+        column = line["column"]
+        base_x = start_margin.get(column)
+
+        # Single-column degenerate case: rely on the reference-start rule.
+        if base_x is None:
+            if not current:
+                current = [text]
+            elif _looks_like_reference_start(text) and re.search(r"[.?!]\s*$", current[-1]):
+                references.append(" ".join(current))
+                current = [text]
+            else:
+                current.append(text)
+            continue
+
+        at_base_margin = abs(line["x0"] - base_x) <= margin_tolerance
+
+        # URL-start rule: only a continuation if the previous reference
+        # has NOT already ended with a sentence terminator.
+        if _URL_OR_DOI_RE.match(text):
+            if current and re.search(r"[.?!]\s*$", current[-1]):
+                at_base_margin = True
+            else:
+                at_base_margin = False
+
+        if re.fullmatch(r"\d+\.?", text):
+            at_base_margin = False
+
+        if at_base_margin:
             if current:
                 references.append(" ".join(current))
             current = [text]
         else:
-            current.append(text)
-        prev_text = text
+            if current:
+                current.append(text)
+            else:
+                current = [text]
 
     if current:
         references.append(" ".join(current))
 
-    return [clean_text(r) for r in references if clean_text(r)]
+    cleaned = []
+    for ref in references:
+        ref = clean_text(ref)
+        if ref:
+            cleaned.append(ref)
+    return cleaned
 
 
 # ============================================================
@@ -465,7 +611,7 @@ def build_local_chicago_reference_correction(reference):
 
 
 # ============================================================
-# DOI NORMALIZATION (unchanged from your original)
+# DOI NORMALIZATION
 # ============================================================
 
 def normalize_doi_from_text(text):
@@ -548,7 +694,7 @@ def get_duplicate_doi_reference_numbers(references):
 
 
 # ============================================================
-# OPENALEX DOI VERIFICATION (unchanged)
+# OPENALEX DOI VERIFICATION
 # ============================================================
 
 def _get_openalex_api_key():
@@ -823,7 +969,7 @@ def get_matched_bibliography_numbers(match_rows):
 
 
 # ============================================================
-# SOURCE TYPE + STATS (kept from original)
+# SOURCE TYPE + STATS
 # ============================================================
 
 def normalize_source_type(source_type):
@@ -973,7 +1119,7 @@ def build_bibliography_statistics(references, gpt_results, manuscript_year):
 
 
 # ============================================================
-# DOCX HELPERS + REPORT (largely unchanged, kept compact)
+# DOCX HELPERS + REPORT
 # ============================================================
 
 RED = RGBColor(0xC0, 0x00, 0x00)
@@ -1315,19 +1461,16 @@ def _get_openalex_api_key():
 # ============================================================
 
 def process_single_chicago_pdf(uf, batch, client, manuscript_year):
-    # Footnotes — prefer an endnote block; fall back to body scan
     fn_result = extract_chicago_footnotes(batch["cleaned_text"])
     footnotes = attach_page_numbers_to_footnotes(fn_result["footnotes"])
     for n in footnotes:
         n["has_dan_warning"] = footnote_has_indonesian_author_conjunction(n["text"])
 
-    # Bibliography — split the sliced reference section into individual refs
     ref_lines = batch["reference_text"].splitlines()
     references = split_references_from_lines(ref_lines)
 
     match_rows = match_footnotes_to_bibliography(footnotes, references)
 
-    # AI review
     combined = check_all_chicago_with_gpt(footnotes, references, client)
     ai_notes = combined.get("footnotes", [])
     ai_by_no = {int(x["number"]): x for x in ai_notes if x.get("number") is not None}
@@ -1458,14 +1601,9 @@ def process_single_chicago_pdf(uf, batch, client, manuscript_year):
 # RENDER — APA-style flow
 # ============================================================
 
-# ============================================================
-# RENDER — mirrors apa.py's upload → year → button flow exactly
-# ============================================================
-
 def render():
     st.title("OmniCite Auditor — Chicago Style")
 
-    # ---- API key resolution (same as apa.py) ----
     client = get_openai_client()
     if client is None:
         st.error(
@@ -1480,7 +1618,6 @@ def render():
             "OA key was not found — DOI verification will be skipped."
         )
 
-    # ---- Versioned uploader key (same pattern as apa.py) ----
     if "chicago_uploader_version" not in st.session_state:
         st.session_state["chicago_uploader_version"] = 0
 
@@ -1492,7 +1629,6 @@ def render():
         key=f"chicago_uploader_{st.session_state['chicago_uploader_version']}",
     )
 
-    # ---- HARD CAP (identical to apa.py) ----
     if uploaded_files and len(uploaded_files) > 10:
         st.error(
             f"Maximum 10 PDF files can be uploaded at a time. "
@@ -1504,11 +1640,9 @@ def render():
     if "chicago_batches" not in st.session_state:
         st.session_state["chicago_batches"] = {}
 
-    # ---- Nothing renders past this point until a PDF is uploaded ----
     if not uploaded_files:
         return
 
-    # ---- Year input: appears ONLY after upload, BEFORE the button ----
     current_year = datetime.now().year
     default_year = st.session_state.get("chicago_manuscript_year", current_year)
     manuscript_year = st.number_input(
@@ -1525,7 +1659,6 @@ def render():
     )
     st.session_state["chicago_manuscript_year"] = int(manuscript_year)
 
-    # ---- Build/prune file keys ----
     file_keys = []
     for idx, uf in enumerate(uploaded_files):
         key = f"{idx}::{uf.name}"
@@ -1536,7 +1669,6 @@ def render():
         if k not in active_keys:
             del st.session_state["chicago_batches"][k]
 
-    # ---- Extract & Review button (blue, primary, full width) ----
     if st.button(
         "Extract & Review",
         type="primary",
@@ -1567,13 +1699,11 @@ def render():
                 st.error(f"{uf.name} extraction failed: {exc}")
                 continue
 
-            # ---- HARD STOP: no valid reference section detected ----
             if not ref_found:
                 st.error(
                     f"{uf.name}: No valid 'Bibliography' or 'References' "
-                    f"section could be identified. The heading may be "
-                    f"missing, or the section contains too few reference "
-                    f"entries. This manuscript cannot be audited."
+                    f"section could be identified. This manuscript cannot "
+                    f"be audited."
                 )
                 continue
 
@@ -1610,14 +1740,12 @@ def render():
         overall.progress(100, text="All manuscripts processed.")
         overall.empty()
 
-    # ---- Gate: nothing shown until at least one batch has been processed ----
     any_done = any(
         b.get("ai_done") for b in st.session_state["chicago_batches"].values()
     )
     if not any_done:
         return
 
-    # ---- Selector (defensive lookup, same as apa.py) ----
     selector_options = [
         k for k, _ in file_keys
         if k in st.session_state["chicago_batches"]
@@ -1656,7 +1784,6 @@ def render():
         st.session_state.get("chicago_manuscript_year", current_year)
     )
 
-    # ---- Debug expanders (same style as apa.py) ----
     with st.expander("View bibliography section", expanded=False):
         st.text_area(
             "Bibliography slice",
@@ -1676,7 +1803,6 @@ def render():
             key=f"chicago_dbg_fn_{selected_key}",
         )
 
-    # ---- Dashboard ----
     checked_notes = batch.get("checked_notes", [])
     detail_rows = batch.get("detail_rows", [])
     recency_stats = batch.get("recency_stats") or {}
@@ -1754,7 +1880,6 @@ def render():
     with right:
         st.dataframe(composition_df, use_container_width=True, hide_index=True)
 
-    # ---- Footnote comparison ----
     show_fn = st.toggle(
         "Footnote Comparison",
         value=False,
@@ -1788,7 +1913,6 @@ def render():
         else:
             st.info("No footnotes available for comparison.")
 
-    # ---- Bibliography comparison ----
     show_bib = st.toggle(
         "Bibliography Comparison",
         value=False,
@@ -1822,7 +1946,6 @@ def render():
         else:
             st.info("No bibliography entries available.")
 
-    # ---- DOCX download ----
     report_docx = batch.get("report_docx")
     if report_docx:
         safe_name = re.sub(
@@ -1840,7 +1963,6 @@ def render():
             key=f"chicago_download_{selected_key}",
         )
 
-    # ---- Reset button (identical pattern to apa.py) ----
     st.markdown(
         """
         <style>
