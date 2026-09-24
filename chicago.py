@@ -1247,31 +1247,73 @@ def split_references_from_lines(lines):
     and two-column bibliographies identically because segmentation is
     driven by the source text.
     """
+    st.write("### ================================================")
+    st.write("### [DEBUG] split_references_from_lines — entry")
+    st.write("### ================================================")
+
     if not lines:
+        st.write("### [DEBUG] input `lines` is empty — returning []")
         return []
+
+    st.write(f"### [DEBUG] input lines: {len(lines)}")
+
+    # Print first 5 input lines with their coordinates so we can spot
+    # whether the extraction is producing the expected order.
+    for i, ln in enumerate(lines[:5], start=1):
+        text = clean_text(ln.get("text", "")) if isinstance(ln, dict) else str(ln)
+        x0 = ln.get("x0", "?") if isinstance(ln, dict) else "?"
+        y0 = ln.get("y0", "?") if isinstance(ln, dict) else "?"
+        st.write(f"### [DEBUG] line {i}: x0={x0} y0={y0} :: {text[:120]}")
 
     stream = _flow_lines_into_stream(lines)
     if not stream:
+        st.write("### [DEBUG] `stream` is empty after flowing — returning []")
         return []
 
-    raw_pieces = _split_stream_on_text_boundaries(stream)
-    repaired = [_repair_bibliography_pdf_breaks(p) for p in raw_pieces]
+    st.write(f"### [DEBUG] stream length: {len(stream)} chars")
+    st.write(f"### [DEBUG] stream first 400 chars: {stream[:400]}")
+    st.write(f"### [DEBUG] stream last 400 chars: {stream[-400:]}")
 
+    raw_pieces = _split_stream_on_text_boundaries(stream)
+    st.write(f"### [DEBUG] raw pieces after text-boundary split: {len(raw_pieces)}")
+
+    # Print the first 10 raw pieces as they were found.
+    for i, piece in enumerate(raw_pieces[:10], start=1):
+        st.write(f"### [DEBUG] raw piece {i} [{len(piece)} chars]: {piece[:140]}")
+
+    repaired = [_repair_bibliography_pdf_breaks(p) for p in raw_pieces]
+    st.write(f"### [DEBUG] pieces after repair: {len(repaired)}")
+
+    # Merge step with per-item logging so we can see which entries are
+    # being absorbed into their predecessors.
     merged = []
-    for ref in repaired:
+    for idx, ref in enumerate(repaired, start=1):
         ref = clean_text(ref)
         if not ref:
+            st.write(f"### [DEBUG] item {idx}: skipped (empty after clean)")
             continue
 
         if len(ref) < 40 and merged:
+            st.write(
+                f"### [DEBUG] item {idx}: MERGED into previous "
+                f"(too short, {len(ref)} chars): {ref[:80]}"
+            )
             merged[-1] = merged[-1] + " " + ref
             continue
 
         if merged and not _fragment_is_reference_start(ref):
+            st.write(
+                f"### [DEBUG] item {idx}: MERGED into previous "
+                f"(does not start a reference): {ref[:80]}"
+            )
             merged[-1] = merged[-1] + " " + ref
             continue
 
+        st.write(f"### [DEBUG] item {idx}: KEPT as new reference: {ref[:80]}")
         merged.append(ref)
+
+    st.write(f"### [DEBUG] references after merge: {len(merged)}")
+    st.write("### ================================================")
 
     return merged
 
