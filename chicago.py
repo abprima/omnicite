@@ -1,5 +1,5 @@
 # chicago.py
-# OmniCite Auditor — Chicago Notes & Bibliography Module (APA-flow adaptation)
+# OmniCite Auditor — Chicago Notes & Bibliography Module
 # Called from app.py via:  import chicago; chicago.render()
 
 import os
@@ -62,6 +62,25 @@ POST_REFERENCE_HEADINGS = {
     "persetujuan etik", "lampiran", "catatan penulis",
 }
 
+# Section headings that MUST survive running-header stripping even when
+# they appear many times in the PDF (running headers repeat the journal
+# name / section title).  This is what caused the "No valid Bibliography
+# section" false negative on the Demas manuscript.
+_NEVER_STRIP_HEADINGS = (
+    REFERENCE_HEADINGS
+    | NOTE_HEADINGS
+    | {
+        "abstract", "abstrak",
+        "introduction", "pendahuluan",
+        "conclusion", "kesimpulan",
+        "suggestion", "saran",
+        "result and discussion", "results and discussion",
+        "hasil dan pembahasan",
+        "method", "methods", "methodology",
+        "metode", "metodologi",
+    }
+)
+
 
 def _normalize_heading(line: str) -> str:
     cleaned = line.strip()
@@ -120,6 +139,13 @@ BOILERPLATE_RE = re.compile(
 
 
 def strip_running_headers_footers(text: str) -> str:
+    """
+    Remove running headers/footers.
+
+    Never removes a section heading (bibliography, references, notes,
+    abstract, ...) even when it repeats -- those are structural, not
+    boilerplate.
+    """
     lines = text.splitlines()
     counter = Counter()
     normalized = []
@@ -141,10 +167,19 @@ def strip_running_headers_footers(text: str) -> str:
         if not stripped:
             kept.append(raw)
             continue
+
         if BOILERPLATE_RE.match(stripped):
             continue
+
+        # Never strip a section heading.
+        heading_key = _normalize_heading(stripped)
+        if heading_key in _NEVER_STRIP_HEADINGS:
+            kept.append(raw)
+            continue
+
         if norm is not None and norm in repeated:
             continue
+
         kept.append(raw)
 
     return "\n".join(kept)
@@ -164,35 +199,91 @@ def clean_text(text):
 
 
 # ============================================================
-# SLICERS
+# REFERENCE-START DETECTION  (shared by gate + splitter)
 # ============================================================
 
-# A reference-start signature used for both the quality gate and the
-# glued-line splitter: "Surname, A." or "Surname, Given" preceded by a
-# sentence-ending period and whitespace.
+# A reference-start boundary used for both quality gate and splitter.
+# It matches: ". <Surname>, <Initial>" preceded by whitespace.
 _REF_START_INLINE_RE = re.compile(
     r"(?<=\.)\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd]"
     r"[A-Za-z\u00c0-\u00ff'\u2019\-]+,\s+[A-Z])"
 )
 
+# A URL or DOI that could start a continuation line.
+_URL_OR_DOI_RE = re.compile(
+    r"^(?:https?://|www\.|10\.\d{4,9}/|doi\s*:)", re.I
+)
+
+# Personal-author start: "Surname, A." or "Surname, Given"
+_AUTHOR_START_RE = re.compile(
+    r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd]"
+    r"[A-Za-z\u00c0-\u00ff'\u2019\-]+"
+    r",\s+[A-Z]"
+)
+
+# Corporate-author start: "Some Organization Name."
+_CORPORATE_START_RE = re.compile(
+    r"^[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6}\."
+)
+
+# Title-in-quotes start
+_QUOTED_START_RE = re.compile(r"^[\u201c\"]")
+
+# Numbered reference start: "1. "
+_NUMBERED_START_RE = re.compile(r"^\d{1,3}\.\s+[A-Z]")
+
+
+def _looks_like_reference_start(fragment: str) -> bool:
+    """
+    True if `fragment` begins a plausible new bibliography entry:
+      - Personal author: "Surname, A." / "Surname, Given"
+      - Corporate author: "Ministry of X."
+      - Quoted title:     "\"Title\""
+      - Numbered entry:   "1. Author"
+    """
+    s = fragment.lstrip()
+    if not s:
+        return False
+
+    if _AUTHOR_START_RE.match(s):
+        return True
+    if _QUOTED_START_RE.match(s):
+        return True
+    if _NUMBERED_START_RE.match(s):
+        return True
+
+    m = _CORPORATE_START_RE.match(s)
+    if m:
+        # Reject if the "corporate name" is really a journal-name wrap.
+        first_two = " ".join(m.group(0).split()[:2]).rstrip(".")
+        if re.match(
+            r"^(?:WSEAS|Journal|Jurnal|Review|International|Proceedings|"
+            r"Transactions|Bulletin|Studies|Research)\b",
+            first_two,
+            re.I,
+        ):
+            return False
+        return True
+
+    return False
+
+
+# ============================================================
+# REFERENCE SECTION GATE  (single-line aware)
+# ============================================================
 
 def _count_reference_signatures(text: str) -> int:
     """
-    Count how many *reference-shaped* fragments appear in `text`.
+    Count reference-shaped fragments inside `text`.
 
-    A fragment is reference-shaped if it either:
-      - contains a parenthetical year like (2022) or (2019a), OR
-      - starts with a DOI/URL, OR
-      - starts with a 'Surname, A.' author pattern.
-
-    This is used both for the section quality gate and for the
-    glued-line splitter so that a single physical line containing
-    multiple references is counted as multiple references.
+    A single physical line can carry several glued references (this is
+    common in MarkItDown output for two-column or flowing bibliographies).
+    We split on the reference-start boundary first, then count each
+    fragment that looks reference-shaped.
     """
     if not text:
         return 0
 
-    # Split on reference-start boundaries first.
     pieces = re.split(_REF_START_INLINE_RE, text)
     if len(pieces) <= 1:
         pieces = [text]
@@ -224,8 +315,15 @@ def _quality_of_reference_block(block: str, cap: int = 300) -> int:
 
 
 def slice_reference_section(text: str):
+    """
+    Bottom-up heading anchor with a quality gate.
+
+    Returns (block, ref_found, post_found).
+    """
     lines = text.splitlines()
-    candidates = [i for i, l in enumerate(lines) if _is_plausible_reference_heading(l)]
+    candidates = [
+        i for i, l in enumerate(lines) if _is_plausible_reference_heading(l)
+    ]
     if not candidates:
         return "", False, False
 
@@ -237,7 +335,10 @@ def slice_reference_section(text: str):
             if not stripped:
                 continue
             non_empty_seen += 1
-            if non_empty_seen >= 3 and _normalize_heading(stripped) in POST_REFERENCE_HEADINGS:
+            if (
+                non_empty_seen >= 3
+                and _normalize_heading(stripped) in POST_REFERENCE_HEADINGS
+            ):
                 post_index = j
                 break
 
@@ -362,76 +463,23 @@ def footnote_has_indonesian_author_conjunction(text):
 
 
 # ============================================================
-# BIBLIOGRAPHY REFERENCE SPLITTING  (glued-line aware)
+# BIBLIOGRAPHY REFERENCE SPLITTING
 # ============================================================
-
-_URL_OR_DOI_RE = re.compile(
-    r"^(?:https?://|www\.|10\.\d{4,9}/|doi\s*:)", re.I
-)
-
-# Personal-author start: "Surname, A." or "Surname, Given"
-_AUTHOR_START_RE = re.compile(
-    r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd]"
-    r"[A-Za-z\u00c0-\u00ff'\u2019\-]+"
-    r",\s+[A-Z]"
-)
-
-# Corporate-author start: "Some Organization Name."
-_CORPORATE_START_RE = re.compile(
-    r"^[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6}\."
-)
-
-# Title-in-quotes start
-_QUOTED_START_RE = re.compile(r"^[\u201c\"]")
-
-# Numbered reference start: "1. "
-_NUMBERED_START_RE = re.compile(r"^\d{1,3}\.\s+[A-Z]")
-
-
-def _looks_like_reference_start(fragment: str) -> bool:
-    s = fragment.lstrip()
-    if not s:
-        return False
-    if _AUTHOR_START_RE.match(s):
-        return True
-    if _QUOTED_START_RE.match(s):
-        return True
-    if _NUMBERED_START_RE.match(s):
-        return True
-    # Corporate start — but reject if it's just a journal name wrap
-    m = _CORPORATE_START_RE.match(s)
-    if m:
-        # Reject if the "corporate name" is a common journal keyword
-        # (WSEAS Transactions on ..., Journal of ..., Review of ...)
-        first_two = " ".join(m.group(0).split()[:2]).rstrip(".")
-        if re.match(
-            r"^(?:WSEAS|Journal|Jurnal|Review|International|Proceedings|"
-            r"Transactions|Bulletin|Studies|Research)\b",
-            first_two, re.I,
-        ):
-            return False
-        return True
-    return False
-
 
 def _split_glued_line(text: str) -> list[str]:
     """
     Split one physical line that may contain multiple glued references.
 
-    Uses the author-start boundary `.<space><Surname>, <Initial>` plus
-    the corporate-author boundary `.<space>Some Name.` while never
-    splitting inside a URL or DOI.
+    Never splits inside a URL or DOI.  Uses the same reference-start
+    helper as `_count_reference_signatures` so the two stay consistent.
     """
     if not text:
         return []
 
-    # Fast path: single-reference line
+    # Fast path: nothing that could be a boundary.
     if not re.search(r"\.\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd]", text):
         return [text.strip()]
 
-    # Candidate boundaries: a sentence-ending period, whitespace, then
-    # a capital letter. We then verify the fragment after the boundary
-    # looks like a reference start.
     candidates = []
     for m in re.finditer(r"(?<=\.)\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])", text):
         candidates.append(m.start())
@@ -441,12 +489,13 @@ def _split_glued_line(text: str) -> list[str]:
 
     boundaries = [0]
     for pos in candidates:
-        after = text[pos:].lstrip()
-        # Do not split if the char just before the period is part of a URL
         before = text[:pos]
+        after = text[pos:].lstrip()
+
+        # Do not split inside a URL.
         if re.search(r"https?://[^\s]*$", before):
             continue
-        # Do not split if the fragment after boundary is a URL continuation
+        # Do not split if the next fragment is a URL continuation.
         if _URL_OR_DOI_RE.match(after):
             continue
         if _looks_like_reference_start(after):
@@ -461,8 +510,7 @@ def _split_glued_line(text: str) -> list[str]:
         if piece:
             pieces.append(piece)
 
-    # Post-merge: if a piece does not actually begin a reference, glue
-    # it back to the previous one.
+    # Merge fragments that do not actually begin a reference.
     merged = []
     for piece in pieces:
         if not merged:
@@ -472,6 +520,7 @@ def _split_glued_line(text: str) -> list[str]:
             merged.append(piece)
         else:
             merged[-1] = merged[-1] + " " + piece
+
     return merged
 
 
@@ -487,7 +536,6 @@ def split_references_from_lines(lines):
     if not lines:
         return []
 
-    # ---- Normalise input ----
     normalised = []
     for item in lines:
         if isinstance(item, dict):
@@ -507,7 +555,7 @@ def split_references_from_lines(lines):
     if not normalised:
         return []
 
-    # ---- Pre-split glued lines ----
+    # Pre-split glued lines.
     expanded = []
     for record in normalised:
         for piece in _split_glued_line(record["text"]):
@@ -515,7 +563,6 @@ def split_references_from_lines(lines):
             new["text"] = piece
             expanded.append(new)
 
-    # ---- Column-aware hanging-indent clustering ----
     references = []
     current = []
 
@@ -564,7 +611,7 @@ def split_references_from_lines(lines):
         column = line["column"]
         base_x = start_margin.get(column)
 
-        # Single-column degenerate case: rely on the reference-start rule.
+        # Single-column degenerate case: rely on reference-start rule.
         if base_x is None:
             if not current:
                 current = [text]
@@ -577,8 +624,8 @@ def split_references_from_lines(lines):
 
         at_base_margin = abs(line["x0"] - base_x) <= margin_tolerance
 
-        # URL-start rule: only a continuation if the previous reference
-        # has NOT already ended with a sentence terminator.
+        # URL at start of a physical line: continuation only if the
+        # previous reference is not already terminated.
         if _URL_OR_DOI_RE.match(text):
             if current and re.search(r"[.?!]\s*$", current[-1]):
                 at_base_margin = True
@@ -631,7 +678,9 @@ def build_local_chicago_reference_correction(reference):
     if m:
         ref = ref[:m.end()] + "-???" + ref[m.end():]
         flags["missing_pp"] = True
-        notes.append(f"Single page number — expanded to range placeholder: {m.group(1)}-???")
+        notes.append(
+            f"Single page number — expanded to range placeholder: {m.group(1)}-???"
+        )
 
     if not re.search(r"10\.\d{4,9}/", ref) and not re.search(r"https?://", ref):
         ref = ref.rstrip(".").rstrip() + f". {PLACEHOLDER_DOI}"
@@ -831,9 +880,23 @@ def _is_same_work_from_reference(reference, openalex_title, openalex_authors):
 
 
 def _extract_chicago_title(reference):
+    """
+    Extract the article/book title from a Chicago-style reference.
+
+    Chicago uses single-quoted titles for articles and italicised titles
+    for books (which MarkItDown cannot preserve).  We try, in order:
+      1. Double-quoted title     "Title"
+      2. Single-quoted title     'Title'
+      3. The title slot between the year and the journal name.
+    """
     m = re.search(r"[\"\u201c](.+?)[\"\u201d]", reference)
     if m:
         return m.group(1).strip().rstrip(",")
+
+    m = re.search(r"['\u2018](.+?)['\u2019]", reference)
+    if m:
+        return m.group(1).strip().rstrip(",")
+
     parts = re.split(r"\.\s+", reference, maxsplit=3)
     if len(parts) >= 3:
         return parts[2].strip()
@@ -878,7 +941,9 @@ def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
         result["title_similarity"] = sim
         if sim < 0.55:
             result["suspicious"] = True
-            result["reasons"].append(f"DOI resolves to a different title (similarity {sim:.0%}).")
+            result["reasons"].append(
+                f"DOI resolves to a different title (similarity {sim:.0%})."
+            )
 
     ref_surnames = {s.lower() for s in (parsed_authors or []) if s}
     oa_surnames = {_surname_from_full_name(n) for n in meta.get("authors", []) if n}
@@ -892,11 +957,16 @@ def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
                 f"DOI author list does not match the manuscript "
                 f"(only {overlap:.0%} of DOI surnames found)."
             )
-        if _is_same_work_from_reference(reference, meta.get("title") or "", meta.get("authors") or []):
+        if _is_same_work_from_reference(
+            reference, meta.get("title") or "", meta.get("authors") or []
+        ):
             result["suspicious"] = False
             result["reasons"] = []
             result["rescued"] = True
-            result["rescue_note"] = "DOI is genuine — title and author confirmed in the manuscript reference (fuzzy match)."
+            result["rescue_note"] = (
+                "DOI is genuine — title and author confirmed in the "
+                "manuscript reference (fuzzy match)."
+            )
 
     return result
 
@@ -1095,11 +1165,16 @@ def build_bibliography_statistics(references, gpt_results, manuscript_year):
     for i, ref in enumerate(references, start=1):
         ai = result_by_no.get(i, {})
         original_reference = clean_text(ref)
-        corrected_reference = clean_text(ai.get("revised_bibliography_markdown", "")) or original_reference
+        corrected_reference = (
+            clean_text(ai.get("revised_bibliography_markdown", ""))
+            or original_reference
+        )
         local = build_local_chicago_reference_correction(corrected_reference)
         parsed_doi = normalize_doi_from_text(original_reference)
         parsed_authors = extract_authors_from_chicago_reference(original_reference)
-        verification = verify_reference_against_openalex(original_reference, parsed_doi, parsed_authors)
+        verification = verify_reference_against_openalex(
+            original_reference, parsed_doi, parsed_authors
+        )
 
         source_type = normalize_source_type(
             ai.get("source_type") or heuristic_source_type(original_reference)
@@ -1252,7 +1327,10 @@ def create_complete_chicago_report(
 
     for note in checked_notes:
         number = int(note["number"])
-        corrected = clean_text(note.get("ai_revised_footnote_markdown", "")) or clean_text(note.get("text", ""))
+        corrected = (
+            clean_text(note.get("ai_revised_footnote_markdown", ""))
+            or clean_text(note.get("text", ""))
+        )
         is_missing = number in missing_footnote_numbers
         has_dan = bool(note.get("has_dan_warning", False))
         p = doc.add_paragraph()
@@ -1278,7 +1356,11 @@ def create_complete_chicago_report(
         doi_susp = bool(row.get("DOI Suspicious", False))
 
         p_orig = doc.add_paragraph()
-        add_markdown_to_paragraph(p_orig, original, make_red=(doi_susp or is_uncited or truncated))
+        add_markdown_to_paragraph(
+            p_orig,
+            original,
+            make_red=(doi_susp or is_uncited or truncated),
+        )
 
         if is_uncited:
             r = p_orig.add_run("   \u2190 NOT CITED IN FOOTNOTES")
@@ -1438,7 +1520,9 @@ INPUT:
         )
         parsed = response.output_parsed
         if parsed is None:
-            raise ValueError("The system returned no structured combined Chicago result.")
+            raise ValueError(
+                "The system returned no structured combined Chicago result."
+            )
         return {
             "footnotes": [i.model_dump() for i in parsed.footnotes],
             "bibliography": [i.model_dump() for i in parsed.bibliography],
@@ -1476,6 +1560,16 @@ def extract_pdf_text(uploaded_file):
 
     reference_text, ref_found, post_found = slice_reference_section(cleaned)
     body_text, _ = slice_body_section(cleaned)
+
+    # --- Debug: log headings that survived stripping -------------------
+    heading_pattern = re.compile(
+        r"(?im)^\s*(?:#+\s*)?(bibliography|references|daftar pustaka)\s*$"
+    )
+    if not ref_found:
+        print(f"[chicago debug] full_text headings: {heading_pattern.findall(full_text)}")
+        print(f"[chicago debug] cleaned headings:   {heading_pattern.findall(cleaned)}")
+        print(f"[chicago debug] cleaned first 500 chars:\n{cleaned[:500]}")
+    # -------------------------------------------------------------------
 
     return full_text, cleaned, body_text, reference_text, ref_found, post_found
 
@@ -1525,9 +1619,11 @@ def process_single_chicago_pdf(uf, batch, client, manuscript_year):
         ck["ai_status"] = status
         ck["ai_revised_footnote_markdown"] = ai.get("revised_footnote_markdown", "")
         ck["ai_explanation"] = ai.get("explanation", "")
-        ck["decision"] = ("\u2713 OK" if status == "OK"
-                          else "\u26a0 REVISED" if status == "REVISED"
-                          else "\u26a0 MANUAL CHECK")
+        ck["decision"] = (
+            "\u2713 OK" if status == "OK"
+            else "\u26a0 REVISED" if status == "REVISED"
+            else "\u26a0 MANUAL CHECK"
+        )
         checked_notes.append(ck)
 
     bibliography_results = combined.get("bibliography", [])
@@ -1558,15 +1654,19 @@ def process_single_chicago_pdf(uf, batch, client, manuscript_year):
         if final_year is not None:
             row["Year"] = final_year
 
-        truncated = (bibliography_has_truncated_author_list(original_reference)
-                     or bibliography_has_truncated_author_list(row["GPT Revised"]))
+        truncated = (
+            bibliography_has_truncated_author_list(original_reference)
+            or bibliography_has_truncated_author_list(row["GPT Revised"])
+        )
         row["Truncated Authors"] = truncated
 
         cs = str(row.get("Chicago Status", "NOT CHECKED")).upper().strip()
-        display_status = ("MATCH" if cs == "OK"
-                          else "REVISED" if cs == "REVISED"
-                          else "MANUAL CHECK" if cs == "MANUAL_CHECK"
-                          else cs)
+        display_status = (
+            "MATCH" if cs == "OK"
+            else "REVISED" if cs == "REVISED"
+            else "MANUAL CHECK" if cs == "MANUAL_CHECK"
+            else cs
+        )
         withheld = bool(row.get("DOI Suspicious")) and not bool(row.get("DOI Rescued"))
 
         corrected_bibliography_rows.append({
@@ -1574,16 +1674,24 @@ def process_single_chicago_pdf(uf, batch, client, manuscript_year):
             "Source Type": row.get("Source Type", "Other"),
             "Publication Year": row["Year"] if row.get("Year") is not None else "\u2014",
             "Original Version": original_reference,
-            "Corrected Version": ("\u2014 WITHHELD (DOI mismatch) \u2014"
-                                  if withheld else row["GPT Revised"]),
-            "Placeholders": ", ".join(k for k, v in (row.get("Placeholders") or {}).items() if v) or "\u2014",
+            "Corrected Version": (
+                "\u2014 WITHHELD (DOI mismatch) \u2014"
+                if withheld else row["GPT Revised"]
+            ),
+            "Placeholders": ", ".join(
+                k for k, v in (row.get("Placeholders") or {}).items() if v
+            ) or "\u2014",
             "Status": display_status,
             "DOI Checked": "YES" if row.get("DOI Verified") else "NO",
             "DOI Suspicious": "\u26a0\ufe0f YES" if withheld else "\u2014",
             "OpenAlex Title": (row.get("OpenAlex Title") or "")[:60],
             "DOI Issues": row.get("DOI Verification Reasons", ""),
-            "Footnote in Bibliography": "\u2611 Checked" if cited_in_footnotes else "\u2610 Unchecked",
-            "Bibliography Missing from Footnotes": "No" if cited_in_footnotes else "Yes",
+            "Footnote in Bibliography": (
+                "\u2611 Checked" if cited_in_footnotes else "\u2610 Unchecked"
+            ),
+            "Bibliography Missing from Footnotes": (
+                "No" if cited_in_footnotes else "Yes"
+            ),
             "Duplicate DOI": "\u26a0 Yes" if duplicate_doi else "No",
             "Incomplete Author List": "\u26a0 Yes" if truncated else "No",
         })
@@ -1654,9 +1762,7 @@ def render():
 
     openalex_key = _get_openalex_api_key()
     if not openalex_key:
-        st.warning(
-            "OA key was not found — DOI verification will be skipped."
-        )
+        st.warning("OA key was not found — DOI verification will be skipped.")
 
     if "chicago_uploader_version" not in st.session_state:
         st.session_state["chicago_uploader_version"] = 0
