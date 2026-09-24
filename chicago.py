@@ -894,6 +894,104 @@ def extract_chicago_footnotes(uploaded_file):
 # BIBLIOGRAPHY EXTRACTION (PyMuPDF) + LLM SLICING
 # ============================================================
 
+def _heal_doi_wraps_in_block(block: str) -> str:
+    """
+    Heal mid-token spaces inside DOIs at the block level, before
+    the LLM sees them. Handles the common PDF wrap patterns:
+
+      "10.32722/account.v10i 1.5574" -> "10.32722/account.v10i1.5574"
+      "10.37394/232015.2022. 18.19"  -> "10.37394/232015.2022.18.19"
+      "10.25041/corruptio.v6i2 .4450"-> "10.25041/corruptio.v6i2.4450"
+      "10.22225/juinhum.4.2. 7834"   -> "10.22225/juinhum.4.2.7834"
+    """
+    if not block:
+        return ""
+
+    previous = None
+    while block != previous:
+        previous = block
+
+        # Case A: letter/digit at end of DOI path, space, digit starts
+        # continuation (handles "v10i 1.5574").
+        block = re.sub(
+            r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+[A-Za-z0-9])\s+"
+            r"(\d[\d.\-]*)",
+            r"\1\2",
+            block,
+        )
+
+        # Case B: period-space inside path, continuation is numeric.
+        block = re.sub(
+            r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.)\s+"
+            r"(\d[\d.\-]*)",
+            r"\1\2",
+            block,
+        )
+
+        # Case C: period-space where continuation begins with ".digit".
+        block = re.sub(
+            r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\s+"
+            r"(\.\d[\d.]*)",
+            r"\1\2",
+            block,
+        )
+
+        # Case D: sub-numbered DOI path like "4.2. 7834".
+        block = re.sub(
+            r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.\d+\.\d+\.)\s+"
+            r"(\d[\d.\-]*)",
+            r"\1\2",
+            block,
+        )
+
+    return block
+
+
+def _is_running_banner_line(line_text: str, page_number=None) -> bool:
+    """
+    Detect page-level running headers / footers that are NOT part of
+    the bibliography content. Observed patterns in real manuscripts:
+
+      "278 Yurispruden, Vol. 9, No. 2, June 2026, (257-279)."
+      "Darwance, et.al, Seeking a Legally Certain Framework ... 277"
+      "(257-279)."
+      "278"
+    """
+    s = (line_text or "").strip()
+    if not s:
+        return True
+
+    # Pattern A: starts with a page number, followed by a journal name
+    # and "Vol." / "No." within the first 160 chars.
+    if re.match(r"^\d{1,4}\s+\S", s) and re.search(
+        r"\b(?:Vol\.?|Volume|No\.?|Number)\s*\d+", s[:160], re.I
+    ):
+        return True
+
+    # Pattern B: contains an ellipsis followed by a page number at end.
+    if re.search(r"(?:\.\.\.|…)\s*\d{1,4}\s*$", s):
+        return True
+
+    # Pattern C: starts with "Author, et.al," and contains a year in
+    # the first 160 chars, and ends with a short page number.
+    if re.match(r"^[A-Z][A-Za-z'\-]+,\s*et\.?\s*al", s) and re.search(
+        r"\b(?:19|20)\d{2}\b", s[:160]
+    ) and re.search(r"\d{1,4}\s*$", s):
+        return True
+
+    # Pattern D: journal-name citation with no author.
+    if re.match(r"^[A-Z][A-Za-z]+\s*,\s*Vol\.?\s*\d+", s):
+        return True
+
+    # Pattern E: bare page range or bare page number.
+    if re.fullmatch(r"\(?\d{1,4}\s*[-\u2013\u2014]\s*\d{1,4}\)?\.?", s):
+        return True
+    if re.fullmatch(r"\d{1,4}", s):
+        return True
+
+    return False
+
+
 def extract_bibliography_block(uploaded_file):
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
@@ -940,11 +1038,19 @@ def extract_bibliography_block(uploaded_file):
                     continue
                 if ln["y1"] > page_height * 0.94:
                     continue
+                if ln["y0"] < page_height * 0.06:
+                    continue
+                if _is_running_banner_line(ln["text"], page_number):
+                    continue
                 lines.append(ln["text"])
             continue
 
         for ln in page_lines:
             if ln["y1"] > page_height * 0.94:
+                continue
+            if ln["y0"] < page_height * 0.06:
+                continue
+            if _is_running_banner_line(ln["text"], page_number):
                 continue
             lines.append(ln["text"])
 
@@ -953,6 +1059,7 @@ def extract_bibliography_block(uploaded_file):
 
     block = " ".join(lines)
     block = re.sub(r"\s+", " ", block).strip()
+    block = _heal_doi_wraps_in_block(block)
 
     return {
         "found": start_page is not None,
@@ -966,14 +1073,39 @@ class _BibliographySliceResult(BaseModel):
     references: list[str]
 
 
+def _strip_leading_markers(references):
+    """
+    Strip a leading "N." or "N)" from each reference when what
+    follows looks like an author surname (capitalized word + comma).
+    Preserves numbers that are genuine content.
+    """
+    if not references:
+        return references
+
+    out = []
+    for ref in references:
+        ref = clean_text(ref)
+        if not ref:
+            continue
+        m = re.match(r"^(\d{1,4})[.)]\s+(.+)$", ref)
+        if m:
+            remainder = m.group(2).lstrip()
+            if re.match(
+                r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd]"
+                r"[A-Za-z\u00c0-\u00ff'\u2019\-]+,",
+                remainder,
+            ):
+                ref = remainder
+        out.append(ref)
+    return out
+
+
 def _deduplicate_references(references):
     """
     Collapse truly duplicate references — same DOI — keeping the longest.
 
     Two references are considered the same source only if they share
     an identical DOI. References without a DOI are never deduplicated.
-    This prevents false positives on different articles that happen
-    to share the same journal / volume / page range / DOI suffix.
     """
     if not references:
         return references
@@ -992,7 +1124,6 @@ def _deduplicate_references(references):
             continue
 
         if doi in doi_to_index:
-            # Duplicate DOI — keep the longer (more complete) entry.
             i = doi_to_index[doi]
             if len(ref) > len(keep[i]):
                 keep[i] = ref
@@ -1015,11 +1146,13 @@ def slice_bibliography_with_llm(block: str, client) -> list[str]:
         "and mid-word URL breaks may exist.\n\n"
         "Slice this text into individual bibliography references.\n\n"
         "Rules:\n"
-        "1. Each reference begins with an author's surname, a corporate "
-        "author, or a numbered marker (e.g. '1.').\n"
+        "1. Each reference begins with an author's surname or a "
+        "corporate author. Some entries may also carry a numbered "
+        "marker at the start (e.g. '1.', '7.', '682.', '63.').\n"
         "2. Return the references in the SAME order as they appear.\n"
         "3. Do NOT modify, fix, reorder, or normalize the text inside "
-        "any reference. Preserve it character-for-character.\n"
+        "any reference. Preserve it character-for-character, EXCEPT "
+        "for the leading marker removal described in rule 9.\n"
         "4. Do NOT add, remove, or merge references.\n"
         "5. Author surnames can be glued to the previous reference "
         "when the PDF dropped a line break. Split them correctly. "
@@ -1034,7 +1167,26 @@ def slice_bibliography_with_llm(block: str, client) -> list[str]:
         "7. Book titles that follow an author's name with a period "
         "(e.g. 'Syafliansah. Metode Penelitian Hukum.') are part of "
         "that reference — do NOT split after the author's name.\n"
-        "8. Do not invent DOIs, URLs, or any other content.\n\n"
+        "8. Do not invent DOIs, URLs, or any other content.\n"
+        "9. REMOVE any leading numbered marker from the returned "
+        "reference text. Each returned reference must begin with the "
+        "author's surname or a quoted title, NOT a number. Examples:\n"
+        "     '1. Amini, Fitria. ...' -> 'Amini, Fitria. ...'\n"
+        "     '7. Afriyanto, Renaldy, ...' -> 'Afriyanto, Renaldy, ...'\n"
+        "     '682. Hartono, ...' -> 'Hartono, ...'\n"
+        "     '63. Tuwan, Frederick ...' -> 'Tuwan, Frederick ...'\n"
+        "   Exception: do NOT remove numbers that are part of the "
+        "reference content itself (e.g. '1945 Constitution', "
+        "'3 Ways to Cite').\n"
+        "10. The PDF may include running headers or footers that are "
+        "NOT bibliography entries. IGNORE them — do not include them "
+        "in any reference. Lines to ignore look like:\n"
+        "     '278 Yurispruden, Vol. 9, No. 2, June 2026, (257-279).'\n"
+        "     'Darwance, et.al, Seeking a Legally Certain Framework "
+        "for the use of Intellectual Property Rights … 277'\n"
+        "     '(257-279).'\n"
+        "     '278'\n"
+        "   These are page-level artifacts, not references.\n\n"
         "Return JSON: {\"references\": [\"...\", \"...\", ...]}.\n\n"
         "BIBLIOGRAPHY TEXT:\n"
         f"{block}"
@@ -1050,6 +1202,7 @@ def slice_bibliography_with_llm(block: str, client) -> list[str]:
         if parsed is None or not parsed.references:
             return []
         cleaned = [clean_text(r) for r in parsed.references if clean_text(r)]
+        cleaned = _strip_leading_markers(cleaned)
         cleaned = _deduplicate_references(cleaned)
         return cleaned
     except Exception as exc:
