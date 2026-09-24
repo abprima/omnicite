@@ -167,19 +167,59 @@ def clean_text(text):
 # SLICERS
 # ============================================================
 
+# A reference-start signature used for both the quality gate and the
+# glued-line splitter: "Surname, A." or "Surname, Given" preceded by a
+# sentence-ending period and whitespace.
+_REF_START_INLINE_RE = re.compile(
+    r"(?<=\.)\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd]"
+    r"[A-Za-z\u00c0-\u00ff'\u2019\-]+,\s+[A-Z])"
+)
+
+
+def _count_reference_signatures(text: str) -> int:
+    """
+    Count how many *reference-shaped* fragments appear in `text`.
+
+    A fragment is reference-shaped if it either:
+      - contains a parenthetical year like (2022) or (2019a), OR
+      - starts with a DOI/URL, OR
+      - starts with a 'Surname, A.' author pattern.
+
+    This is used both for the section quality gate and for the
+    glued-line splitter so that a single physical line containing
+    multiple references is counted as multiple references.
+    """
+    if not text:
+        return 0
+
+    # Split on reference-start boundaries first.
+    pieces = re.split(_REF_START_INLINE_RE, text)
+    if len(pieces) <= 1:
+        pieces = [text]
+
+    count = 0
+    for piece in pieces:
+        p = piece.strip()
+        if not p or len(p) < 15:
+            continue
+        if re.match(r"^\s*(Table|Figure|Fig\.|Tab\.)\s+\d+", p, re.I):
+            continue
+        if re.search(r"\((?:19|20)\d{2}[a-z]?\)", p):
+            count += 1
+            continue
+        if re.match(r"^(https?://|10\.\d{4,9}/)", p):
+            count += 1
+            continue
+        if _looks_like_reference_start(p):
+            count += 1
+    return count
+
+
 def _quality_of_reference_block(block: str, cap: int = 300) -> int:
+    """Count reference-shaped entries in the first `cap` lines."""
     count = 0
     for line in block.splitlines()[:cap]:
-        s = line.strip()
-        if not s or len(s) < 15:
-            continue
-        if re.match(r"^\s*(Table|Figure|Fig\.|Tab\.)\s+\d+", s, re.I):
-            continue
-        if re.search(r"\((?:19|20)\d{2}[a-z]?\)", s):
-            count += 1
-            continue
-        if re.match(r"^(https?://|10\.\d{4,9}/)", s):
-            count += 1
+        count += _count_reference_signatures(line)
     return count
 
 
