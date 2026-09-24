@@ -11,7 +11,10 @@ import fitz          # PyMuPDF — REQUIRED for two-column + footnote geometry
 import pandas as pd
 import streamlit as st
 from docx import Document
-from docx.shared import Pt, RGBColor
+from docx.shared import Pt, RGBColor, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 from io import BytesIO
 from openai import OpenAI
 from pydantic import BaseModel
@@ -40,7 +43,7 @@ def get_openai_client():
 
 
 # ============================================================
-# OPENALEX DOI VERIFICATION  (unchanged)
+# OPENALEX DOI VERIFICATION
 # ============================================================
 
 def _get_openalex_api_key():
@@ -155,11 +158,9 @@ def _extract_chicago_title(reference):
     m = re.search(r"[\"\u201c](.+?)[\"\u201d]", reference)
     if m:
         return m.group(1).strip().rstrip(",")
-
     m = re.search(r"['\u2018](.+?)['\u2019]", reference)
     if m:
         return m.group(1).strip().rstrip(",")
-
     parts = re.split(r"\.\s+", reference, maxsplit=3)
     if len(parts) >= 3:
         return parts[2].strip()
@@ -265,7 +266,7 @@ def bibliography_has_truncated_author_list(text):
 
 
 # ============================================================
-# DOI TEXT NORMALIZATION  (unchanged)
+# DOI TEXT NORMALIZATION
 # ============================================================
 
 def normalize_doi_from_text(text):
@@ -412,7 +413,7 @@ def clean_pdf_text(text):
 
 
 # ============================================================
-# FOOTNOTE EXTRACTION — PyMuPDF geometry (unchanged from original)
+# FOOTNOTE EXTRACTION — PyMuPDF geometry
 # ============================================================
 
 def extract_page_lines(page):
@@ -863,7 +864,7 @@ def extract_chicago_footnotes(uploaded_file):
 
 
 # ============================================================
-# BIBLIOGRAPHY EXTRACTION — PyMuPDF column-aware (unchanged)
+# BIBLIOGRAPHY EXTRACTION — PyMuPDF column-aware
 # ============================================================
 
 def looks_like_running_header_footer(text, y0, y1, page_height):
@@ -1018,7 +1019,7 @@ def extract_bibliography_lines(uploaded_file):
 
 
 # ============================================================
-# REFERENCE SPLITTING — glued-line aware, geometry-preserving
+# REFERENCE SPLITTING — geometry mode vs heuristic mode
 # ============================================================
 
 _URL_OR_DOI_RE = re.compile(r"^(?:https?://|www\.|10\.\d{4,9}/|doi\s*:)", re.I)
@@ -1104,14 +1105,28 @@ def split_references_from_lines(lines):
     """
     Split bibliography lines into individual references.
 
-    Handles:
-      A. Two-column layout — lines carry `column` and `x0` from PyMuPDF.
-      B. Glued lines — pre-split on `.<space>Surname, I` boundary.
+    Two operating modes:
+
+      (A) GEOMETRY MODE — lines are dicts from PyMuPDF with real x0 and
+          column. Use hanging-indent clustering: a line whose x0 equals
+          the column's left margin starts a new reference; a line
+          further right continues the previous one. URL-start lines are
+          ALWAYS treated as continuations, never as new references.
+
+      (B) HEURISTIC MODE — lines are plain strings (MarkItDown or
+          plain-text input with no geometry). Use the reference-start
+          signature `.<space>Surname, Initial` to find boundaries.
     """
     if not lines:
         return []
 
-    # Normalise — accept PyMuPDF dicts OR plain strings.
+    # Detect mode: geometry only if every line is a dict with real x0.
+    has_geometry = all(
+        isinstance(x, dict) and x.get("x0", 0.0) > 0.0
+        for x in lines
+    )
+
+    # --- Normalise input -------------------------------------------------
     normalised = []
     for item in lines:
         if isinstance(item, dict):
@@ -1127,20 +1142,54 @@ def split_references_from_lines(lines):
                 normalised.append({
                     "text": text, "x0": 0.0, "y0": 0.0, "column": "LEFT",
                 })
+
     if not normalised:
         return []
 
-    # Pre-split glued lines.
-    expanded = []
-    for record in normalised:
-        for piece in _split_glued_line(record["text"]):
-            new = dict(record)
-            new["text"] = piece
-            expanded.append(new)
+    # ================================================================
+    # HEURISTIC MODE — no geometry available.
+    # ================================================================
+    if not has_geometry:
+        expanded = []
+        for record in normalised:
+            for piece in _split_glued_line(record["text"]):
+                new = dict(record)
+                new["text"] = piece
+                expanded.append(new)
 
-    # Column-aware hanging-indent clustering.
-    references = []
-    current = []
+        references = []
+        current = []
+        for line in expanded:
+            text = line["text"].strip()
+            if not text:
+                continue
+            if not current:
+                current = [text]
+                continue
+            prev_ends_sentence = bool(re.search(r"[.?!]\s*$", current[-1]))
+            starts_new = (
+                prev_ends_sentence
+                and _looks_like_reference_start(text)
+                and not _URL_OR_DOI_RE.match(text)
+            )
+            if starts_new:
+                references.append(" ".join(current))
+                current = [text]
+            else:
+                current.append(text)
+        if current:
+            references.append(" ".join(current))
+        return [clean_text(r) for r in references if clean_text(r)]
+
+    # ================================================================
+    # GEOMETRY MODE — real x0 + column from PyMuPDF.
+    #
+    # We do NOT pre-split glued lines here: PyMuPDF has already split
+    # every visual line, and the hanging-indent rule is the correct
+    # boundary signal. Pre-splitting would give every fragment the
+    # same x0 as its parent, corrupting column assignment.
+    # ================================================================
+    expanded = normalised
 
     column_x_values = {"LEFT": [], "RIGHT": []}
     for line in expanded:
@@ -1179,35 +1228,37 @@ def split_references_from_lines(lines):
 
     margin_tolerance = 4.0
 
+    references = []
+    current = []
+
     for line in expanded:
         text = line["text"].strip()
         if not text:
             continue
+
         column = line["column"]
         base_x = start_margin.get(column)
 
-        # Single-column degenerate case — use reference-start rule.
+        # If we have no margin for this column, fall back to the
+        # reference-start heuristic on the current line.
         if base_x is None:
             if not current:
                 current = [text]
-            elif _looks_like_reference_start(text) and re.search(r"[.?!]\s*$", current[-1]):
-                references.append(" ".join(current))
-                current = [text]
             else:
-                current.append(text)
+                prev_ends = bool(re.search(r"[.?!]\s*$", current[-1]))
+                if prev_ends and _looks_like_reference_start(text):
+                    references.append(" ".join(current))
+                    current = [text]
+                else:
+                    current.append(text)
             continue
 
+        # GEOMETRY-BASED DECISION — the ONLY boundary signal here.
         at_base_margin = abs(line["x0"] - base_x) <= margin_tolerance
 
-        # URL at start of physical line: only a continuation if the
-        # previous reference is NOT yet terminated.
+        # URLs and DOIs never start a new reference in geometry mode;
+        # they are always wraps of the preceding entry.
         if _URL_OR_DOI_RE.match(text):
-            if current and re.search(r"[.?!]\s*$", current[-1]):
-                at_base_margin = True
-            else:
-                at_base_margin = False
-
-        if re.fullmatch(r"\d+\.?", text):
             at_base_margin = False
 
         if at_base_margin:
@@ -1472,8 +1523,53 @@ def build_bibliography_statistics(references, gpt_results, manuscript_year):
 
 
 # ============================================================
-# DOCX HELPERS + REPORT
+# DOCX HELPERS
 # ============================================================
+
+RED = RGBColor(0xC0, 0x00, 0x00)
+
+
+def _set_run_font(run, size_pt=11, bold=False, italic=False, color=None):
+    run.font.size = Pt(size_pt)
+    run.font.bold = bold
+    run.font.italic = italic
+    if color is not None:
+        run.font.color.rgb = color
+
+
+def _add_run(paragraph, text, size_pt=11, bold=False, italic=False, red=False):
+    r = paragraph.add_run(text)
+    _set_run_font(
+        r, size_pt=size_pt, bold=bold, italic=italic,
+        color=RED if red else None,
+    )
+    return r
+
+
+def _add_red_italic_run(paragraph, text, size_pt=11):
+    _add_run(paragraph, text, size_pt=size_pt, bold=True, italic=True, red=True)
+
+
+def _docx_set_default_font(document, font_name="Times New Roman", size_pt=11):
+    style = document.styles["Normal"]
+    style.font.name = font_name
+    style.font.size = Pt(size_pt)
+
+
+def _add_divider(doc):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(2)
+    p.paragraph_format.space_after = Pt(6)
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "BFBFBF")
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
 
 _PLACEHOLDER_RE = re.compile(
     r"(author \?{3}|author \d+(?:, author \d+)+|vol\. \?{3}|no\. \?{3}"
@@ -1512,114 +1608,403 @@ def add_markdown_to_paragraph(paragraph, text, make_red=False):
         _add_markdown_runs(paragraph, tail, make_red=make_red)
 
 
+# ============================================================
+# DOCX REPORT — mirrors APA layout
+# ============================================================
+
 def create_complete_chicago_report(
-    checked_notes, bibliography_detail, match_rows=None,
-    recency_stats=None, pdf_filename=None,
+    checked_notes,
+    bibliography_detail,
+    match_rows=None,
+    recency_stats=None,
+    pdf_filename=None,
+    composition_rows=None,
+    manuscript_year=None,
 ):
+    """
+    Build the Chicago diagnostic report with the SAME structure as
+    build_apa_report_docx():
+
+      1. Title + subtitle + meta
+      2. Section 1 — Summary (metrics table + source-type table)
+      3. Section 2 — Footnotes  (Original / Corrected / Note / Status)
+      4. Section 3 — Bibliography (Original / Corrected / Comment / Status)
+         with a horizontal rule between entries
+    """
     doc = Document()
-    normal_style = doc.styles["Normal"]
-    normal_style.font.name = "Times New Roman"
-    normal_style.font.size = Pt(12)
+    _docx_set_default_font(doc, "Times New Roman", 11)
 
     match_rows = match_rows or []
+    recency_stats = recency_stats or {}
+    composition_rows = composition_rows or []
+    manuscript_year = manuscript_year or datetime.now().year
+
+    # ---- Header -------------------------------------------------------
+    title = doc.add_heading(level=0)
+    tr = title.add_run(pdf_filename or "manuscript.pdf")
+    _set_run_font(tr, size_pt=18, bold=True)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    subtitle = doc.add_paragraph()
+    sr = subtitle.add_run(
+        "Chicago Notes & Bibliography — Citation & Reference Diagnostic Report"
+    )
+    _set_run_font(sr, size_pt=11, italic=True)
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = doc.add_paragraph()
+    mr = meta.add_run(
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Engine: OmniCite-Chicago-v1"
+    )
+    _set_run_font(mr, size_pt=9, italic=True)
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph()
+
+    # ---- Compute summary values ---------------------------------------
+    total_refs = int(recency_stats.get("total", len(bibliography_detail)))
+    total_footnotes = len(checked_notes)
+
     missing_footnote_numbers = {
-        int(row["Footnote"]) for row in match_rows if not row.get("Matched", False)
+        int(row["Footnote"])
+        for row in match_rows
+        if not row.get("Matched", False)
     }
+    footnotes_missing_from_bib = len(missing_footnote_numbers)
 
-    if pdf_filename:
-        doc.add_heading(Path(pdf_filename).stem, level=0)
+    matched_bib_numbers = get_matched_bibliography_numbers(match_rows)
+    bib_missing_from_footnotes = max(0, total_refs - len(matched_bib_numbers))
 
-    doc.add_heading("Footnotes", level=1)
+    doi_checked = sum(1 for r in bibliography_detail if r.get("DOI Verified"))
+    doi_suspicious = sum(1 for r in bibliography_detail if r.get("DOI Suspicious"))
+    doi_suspicious_pct = (doi_suspicious / total_refs * 100) if total_refs else 0.0
 
-    for note in checked_notes:
-        number = int(note["number"])
-        corrected = clean_text(note.get("ai_revised_footnote_markdown", ""))
-        if not corrected:
-            corrected = clean_text(note.get("text", ""))
-        is_missing = number in missing_footnote_numbers
-        has_dan_warning = bool(note.get("has_dan_warning", False))
+    recent_pct = recency_stats.get("recent_pct_all", 0.0)
+    cutoff = recency_stats.get("cutoff", manuscript_year - 9)
 
-        paragraph = doc.add_paragraph()
-        number_run = paragraph.add_run(f"{number}. ")
-        if is_missing:
-            number_run.font.color.rgb = RGBColor(255, 0, 0)
-        if has_dan_warning:
-            number_run.bold = True
+    # ---- Section 1 — Summary ------------------------------------------
+    h1 = doc.add_heading(level=1)
+    hr = h1.add_run("1. Summary")
+    _set_run_font(hr, size_pt=14, bold=True)
 
-        add_markdown_to_paragraph(paragraph, corrected, make_red=is_missing)
-        if has_dan_warning:
-            for r in paragraph.runs:
-                r.bold = True
+    summary_rows = [
+        ("Manuscript publication year", str(manuscript_year), False),
+        ("Total bibliography entries", str(total_refs), False),
+        ("Total footnotes", str(total_footnotes), False),
+        ("Footnotes missing from bibliography",
+         str(footnotes_missing_from_bib), footnotes_missing_from_bib > 0),
+        ("Bibliography entries not cited in footnotes",
+         str(bib_missing_from_footnotes), bib_missing_from_footnotes > 0),
+        ("DOI checked (OpenAlex)", str(doi_checked), False),
+        ("DOI suspicious (possible fabricated references)",
+         f"{doi_suspicious} ({doi_suspicious_pct:.1f}%)", doi_suspicious > 0),
+        (f"% references within last 10 years "
+         f"({cutoff}-{manuscript_year})",
+         f"{recent_pct:.1f}%", False),
+    ]
+
+    summary_table = doc.add_table(rows=1, cols=2)
+    summary_table.style = "Light Grid Accent 1"
+    for cell, text in zip(summary_table.rows[0].cells, ["Metric", "Value"]):
+        cell.text = ""
+        _set_run_font(cell.paragraphs[0].add_run(text), size_pt=10, bold=True)
+
+    for label, value, warn in summary_rows:
+        cells = summary_table.add_row().cells
+        cells[0].text = ""
+        cells[1].text = ""
+        _set_run_font(
+            cells[0].paragraphs[0].add_run(label),
+            size_pt=10, bold=warn, color=RED if warn else None,
+        )
+        _set_run_font(
+            cells[1].paragraphs[0].add_run(value),
+            size_pt=10, bold=warn, color=RED if warn else None,
+        )
+
+    # ---- 1.1 Source type distribution ---------------------------------
+    h11 = doc.add_heading(level=2)
+    hr11 = h11.add_run("1.1 Source Type Distribution")
+    _set_run_font(hr11, size_pt=12, bold=True)
+
+    source_lookup = {r.get("Source Type", "Other"): r for r in composition_rows}
+    source_order = [
+        "Journal Article", "Book", "Book Chapter", "Conference",
+        "Government / Legal", "Report", "News / Newspaper", "Website",
+        "Thesis", "Dissertation", "Magazine", "Dataset", "Other",
+    ]
+
+    src_table = doc.add_table(rows=1, cols=3)
+    src_table.style = "Light Grid Accent 1"
+    for cell, text in zip(src_table.rows[0].cells,
+                          ["Source Type", "Count", "Percentage"]):
+        cell.text = ""
+        _set_run_font(cell.paragraphs[0].add_run(text), size_pt=10, bold=True)
+
+    for stype in source_order:
+        r = source_lookup.get(stype)
+        cnt = r.get("Count", 0) if r else 0
+        pct = r.get("Percentage", 0.0) if r else 0.0
+        cells = src_table.add_row().cells
+        for cell, val in zip(cells, [stype, str(cnt), f"{pct:.1f}%"]):
+            cell.text = ""
+            _set_run_font(cell.paragraphs[0].add_run(val), size_pt=10)
+
+    cells = src_table.add_row().cells
+    for cell, val in zip(cells, ["Total", str(total_refs), "100.0%"]):
+        cell.text = ""
+        _set_run_font(cell.paragraphs[0].add_run(val), size_pt=10, bold=True)
 
     doc.add_page_break()
-    doc.add_heading("Bibliography", level=1)
 
-    for row in bibliography_detail:
-        original = clean_text(row.get("Reference", ""))
-        corrected = clean_text(row.get("GPT Revised", "")) or original
-        is_matched = bool(row.get("Matched in Footnotes", False))
-        is_uncited = not is_matched
-        truncated_authors = bool(row.get("Truncated Authors", False))
-        doi_suspicious = bool(row.get("DOI Suspicious", False))
+    # ---- Section 2 — Footnotes ----------------------------------------
+    h2 = doc.add_heading(level=1)
+    hr2 = h2.add_run("2. Footnotes")
+    _set_run_font(hr2, size_pt=14, bold=True)
 
-        p_orig = doc.add_paragraph()
-        add_markdown_to_paragraph(
-            p_orig, original,
-            make_red=(doi_suspicious or is_uncited or truncated_authors),
-        )
-        if is_uncited:
-            r = p_orig.add_run("   ← NOT CITED IN FOOTNOTES")
-            r.bold = True
-            r.italic = True
-            r.font.color.rgb = RGBColor(255, 0, 0)
+    caption = doc.add_paragraph()
+    cr = caption.add_run(
+        "Format: footnote number — original footnote — corrected footnote"
+    )
+    _set_run_font(cr, size_pt=9, italic=True)
 
-        if doi_suspicious:
-            p_withheld = doc.add_paragraph()
-            add_markdown_to_paragraph(
-                p_withheld,
-                "Corrected version withheld — the DOI does not match the "
-                "claimed title/authors. Manual verification required.",
-                make_red=True,
+    if not checked_notes:
+        p = doc.add_paragraph()
+        _set_run_font(p.add_run("No footnotes were detected."), italic=True)
+    else:
+        for note in checked_notes:
+            number = int(note["number"])
+            original = clean_text(note.get("text", ""))
+            revised_raw = clean_text(note.get("ai_revised_footnote_markdown", ""))
+            revised = revised_raw or original
+
+            raw_status = str(note.get("ai_status", "MANUAL_CHECK")).upper().strip()
+            display_status = (
+                "MATCH" if raw_status == "OK"
+                else "REVISED" if raw_status == "REVISED"
+                else "MANUAL CHECK"
             )
-            for r in p_withheld.runs:
-                r.bold = True
 
-            reasons = row.get("DOI Verification Reasons", "")
-            if reasons:
-                p_reason = doc.add_paragraph()
-                r = p_reason.add_run(f"⚠ Possible fabricated reference: {reasons}")
-                r.italic = True
-                r.bold = True
-                r.font.color.rgb = RGBColor(255, 0, 0)
+            is_missing = number in missing_footnote_numbers
+            has_dan = bool(note.get("has_dan_warning", False))
+
+            head = doc.add_paragraph()
+            head.paragraph_format.space_before = Pt(4)
+            head.paragraph_format.space_after = Pt(2)
+            hrun = head.add_run(f"{number}.")
+            _set_run_font(hrun, size_pt=11, bold=True)
+
+            pages = note.get("pages") or []
+            if pages:
+                pr = head.add_run(f"  (p. {', '.join(map(str, pages))})")
+                _set_run_font(pr, size_pt=9, italic=True)
+
+            if is_missing:
+                _add_red_italic_run(head, "  [NOT MATCHED TO BIBLIOGRAPHY]")
+            if has_dan:
+                _add_red_italic_run(head, "  [\"dan\" BETWEEN AUTHORS]")
+
+            p_orig = doc.add_paragraph()
+            p_orig.paragraph_format.left_indent = Inches(0.25)
+            p_orig.paragraph_format.space_after = Pt(2)
+            _add_run(p_orig, "Original:  ", bold=True, size_pt=11)
+            if is_missing or has_dan:
+                _add_run(p_orig, original, size_pt=11, red=True)
+            else:
+                _add_run(p_orig, original, size_pt=11)
+
+            p_corr = doc.add_paragraph()
+            p_corr.paragraph_format.left_indent = Inches(0.25)
+            p_corr.paragraph_format.space_after = Pt(2)
+            _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
+
+            if not revised_raw:
+                _add_run(p_corr, "— no change —", size_pt=11, italic=True)
+            else:
+                add_markdown_to_paragraph(p_corr, revised)
+
+            note_text = note.get("ai_explanation", "")
+            if note_text:
+                np = doc.add_paragraph()
+                np.paragraph_format.left_indent = Inches(0.25)
+                np.paragraph_format.space_after = Pt(2)
+                _add_run(np, f"Note: {note_text}", size_pt=10, italic=True)
+
+            p_status = doc.add_paragraph()
+            p_status.paragraph_format.left_indent = Inches(0.25)
+            p_status.paragraph_format.space_after = Pt(4)
+            _add_run(p_status, "Status: ", bold=True, size_pt=11)
+            _add_run(
+                p_status, display_status, size_pt=11, bold=True,
+                red=(display_status != "MATCH"),
+            )
+
+            _add_divider(doc)
+
+    doc.add_page_break()
+
+    # ---- Section 3 — Bibliography -------------------------------------
+    h3 = doc.add_heading(level=1)
+    hr3 = h3.add_run("3. Bibliography (Chicago Notes & Bibliography)")
+    _set_run_font(hr3, size_pt=14, bold=True)
+
+    caption = doc.add_paragraph()
+    cr2 = caption.add_run(
+        "Format: original reference — corrected reference — comment — status"
+    )
+    _set_run_font(cr2, size_pt=9, italic=True)
+
+    if not bibliography_detail:
+        p = doc.add_paragraph()
+        _set_run_font(p.add_run("No bibliography entries were detected."), italic=True)
+    else:
+        for row in bibliography_detail:
+            reference_no = int(row.get("No.", 0))
+            original = clean_text(row.get("Reference", ""))
+            corrected = clean_text(row.get("GPT Revised", "")) or original
+
+            is_uncited = reference_no not in matched_bib_numbers
+            truncated_authors = bool(row.get("Truncated Authors", False))
+            doi_suspicious = bool(row.get("DOI Suspicious", False))
+            duplicate_doi = bool(row.get("Duplicate DOI", False))
+
+            chicago_status = str(row.get("Chicago Status", "NOT CHECKED")).upper().strip()
+            display_status = (
+                "MATCH" if chicago_status == "OK"
+                else "REVISED" if chicago_status == "REVISED"
+                else "MANUAL CHECK" if chicago_status == "MANUAL_CHECK"
+                else chicago_status
+            )
+            withheld = doi_suspicious and not bool(row.get("DOI Rescued", False))
+
+            head = doc.add_paragraph()
+            head.paragraph_format.space_before = Pt(6)
+            head.paragraph_format.space_after = Pt(2)
+            hrun = head.add_run(f"{reference_no}.")
+            _set_run_font(hrun, size_pt=11, bold=True)
+
+            if is_uncited:
+                _add_red_italic_run(head, "  [NOT CITED IN FOOTNOTES]")
+            if duplicate_doi:
+                _add_red_italic_run(head, "  [DUPLICATE DOI]")
+            if truncated_authors:
+                _add_red_italic_run(head, "  [INCOMPLETE AUTHOR LIST]")
+            if withheld:
+                _add_red_italic_run(head, "  [DOI MISMATCH — WITHHELD]")
+
+            p_type = doc.add_paragraph()
+            p_type.paragraph_format.left_indent = Inches(0.25)
+            p_type.paragraph_format.space_after = Pt(2)
+            _add_run(p_type, "Source Type: ", bold=True, size_pt=11)
+            _add_run(p_type, row.get("Source Type", "Other"), size_pt=11)
+
+            p_orig = doc.add_paragraph()
+            p_orig.paragraph_format.left_indent = Inches(0.25)
+            p_orig.paragraph_format.space_after = Pt(2)
+            p_orig.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            _add_run(p_orig, "Original: ", bold=True, size_pt=11)
+            _add_run(
+                p_orig, original, size_pt=11,
+                red=(is_uncited or doi_suspicious or truncated_authors),
+            )
+
+            if withheld:
+                p_corr = doc.add_paragraph()
+                p_corr.paragraph_format.left_indent = Inches(0.25)
+                p_corr.paragraph_format.space_after = Pt(2)
+                _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
+                _add_run(
+                    p_corr,
+                    "— withheld (DOI mismatch) —",
+                    size_pt=11, italic=True, red=True,
+                )
+            else:
+                p_corr = doc.add_paragraph()
+                p_corr.paragraph_format.left_indent = Inches(0.25)
+                p_corr.paragraph_format.space_after = Pt(2)
+                p_corr.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
+                add_markdown_to_paragraph(p_corr, corrected)
+
+            p_comment = doc.add_paragraph()
+            p_comment.paragraph_format.left_indent = Inches(0.25)
+            p_comment.paragraph_format.space_after = Pt(2)
+            _add_run(p_comment, "Comment: ", bold=True, size_pt=11)
+
+            comment = str(row.get("Explanation", "")).strip()
+            if not comment:
+                if doi_suspicious and not row.get("DOI Rescued", False):
+                    comment = (
+                        "DOI does not resolve in OpenAlex to the claimed "
+                        "title/authors. Corrected version withheld."
+                    )
+                elif row.get("DOI Rescued", False):
+                    comment = (
+                        "DOI verified — title and author matched "
+                        "(fuzzy match). No change needed."
+                    )
+                elif display_status == "MATCH":
+                    comment = "Reference is consistent with Chicago style."
+                elif display_status == "REVISED":
+                    comment = "Reference was revised according to Chicago style."
+                else:
+                    comment = "Manual verification is recommended."
+
+            _add_run(
+                p_comment, comment, size_pt=10, italic=True,
+                red=(display_status in {"MANUAL CHECK", "NOT CHECKED"} or doi_suspicious),
+            )
 
             if row.get("OpenAlex Title"):
                 p_oa = doc.add_paragraph()
+                p_oa.paragraph_format.left_indent = Inches(0.25)
+                p_oa.paragraph_format.space_after = Pt(2)
                 r = p_oa.add_run(f'  OpenAlex says: "{row["OpenAlex Title"]}"')
                 r.italic = True
+                r.font.size = Pt(10)
+
             if row.get("OpenAlex Authors"):
                 p_oa2 = doc.add_paragraph()
-                r = p_oa2.add_run(f"  Authors: {row['OpenAlex Authors']}")
+                p_oa2.paragraph_format.left_indent = Inches(0.25)
+                p_oa2.paragraph_format.space_after = Pt(2)
+                r = p_oa2.add_run(f"  OpenAlex authors: {row['OpenAlex Authors']}")
                 r.italic = True
-        else:
-            p_corr = doc.add_paragraph()
-            add_markdown_to_paragraph(p_corr, "Corrected: " + corrected)
+                r.font.size = Pt(10)
 
-            note = row.get("Correction Note", "")
-            if note:
-                p_note = doc.add_paragraph()
-                r = p_note.add_run(f"Fix applied: {note}")
+            if row.get("DOI Verification Reasons"):
+                p_reason = doc.add_paragraph()
+                p_reason.paragraph_format.left_indent = Inches(0.25)
+                p_reason.paragraph_format.space_after = Pt(2)
+                r = p_reason.add_run(f"  ⚠ {row['DOI Verification Reasons']}")
                 r.italic = True
+                r.bold = True
+                r.font.color.rgb = RED
+                r.font.size = Pt(10)
 
             active_ph = [k for k, v in (row.get("Placeholders") or {}).items() if v]
             if active_ph:
                 p_ph = doc.add_paragraph()
+                p_ph.paragraph_format.left_indent = Inches(0.25)
+                p_ph.paragraph_format.space_after = Pt(2)
                 r = p_ph.add_run(
                     "Placeholder used — fill in before submission: "
                     + ", ".join(active_ph)
                 )
                 r.italic = True
                 r.bold = True
-                r.font.color.rgb = RGBColor(255, 0, 0)
+                r.font.color.rgb = RED
+                r.font.size = Pt(10)
+
+            p_status = doc.add_paragraph()
+            p_status.paragraph_format.left_indent = Inches(0.25)
+            p_status.paragraph_format.space_after = Pt(4)
+            _add_run(p_status, "Status: ", bold=True, size_pt=11)
+            _add_run(
+                p_status, display_status, size_pt=11, bold=True,
+                red=(display_status != "MATCH"),
+            )
+
+            _add_divider(doc)
 
     buffer = BytesIO()
     doc.save(buffer)
@@ -1793,7 +2178,6 @@ INPUT:
 # ============================================================
 
 def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
-    # Footnotes via PyMuPDF geometry.
     fn_result = extract_chicago_footnotes(uploaded_file)
     footnotes = attach_page_numbers_to_footnotes(
         fn_result.get("footnotes", []),
@@ -1802,7 +2186,6 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
     for n in footnotes:
         n["has_dan_warning"] = footnote_has_indonesian_author_conjunction(n["text"])
 
-    # Bibliography via PyMuPDF column-aware extraction.
     bibliography_result = extract_bibliography_lines(uploaded_file)
     if bibliography_result.get("found"):
         references = split_references_from_lines(bibliography_result["lines"])
@@ -1812,7 +2195,6 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
 
     match_rows = match_footnotes_to_bibliography(footnotes, references)
 
-    # GPT review.
     combined = check_all_chicago_with_gpt(footnotes, references, client)
     ai_notes = combined.get("footnotes", [])
     ai_by_no = {int(x["number"]): x for x in ai_notes if x.get("number") is not None}
@@ -1937,6 +2319,8 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
         match_rows=match_rows,
         recency_stats=recency_stats,
         pdf_filename=batch["filename"],
+        composition_rows=composition_rows,
+        manuscript_year=int(manuscript_year),
     )
 
     batch.update({
@@ -2043,8 +2427,6 @@ def render():
                 text=f"[{i}/{n}] Extracting {uf.name}...",
             )
             try:
-                # PyMuPDF-based extraction: bibliography slice + body text
-                # for the debug expander.
                 uf.seek(0)
                 pdf_bytes = uf.read()
                 uf.seek(0)
@@ -2052,8 +2434,6 @@ def render():
                 bib_result = extract_bibliography_lines(uf)
                 uf.seek(0)
 
-                # Reference text for the debug expander (joined from
-                # column-ordered PyMuPDF lines).
                 if bib_result.get("found") and bib_result.get("lines"):
                     reference_text = "\n".join(
                         line["text"] for line in bib_result["lines"]
@@ -2061,7 +2441,6 @@ def render():
                 else:
                     reference_text = ""
 
-                # Full text (naive — for the debug expander).
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                 full_pages = [page.get_text("text") for page in doc]
                 if bib_result.get("found") and bib_result.get("start_page"):
