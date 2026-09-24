@@ -1868,13 +1868,13 @@ def create_complete_chicago_report(
             if not comment:
                 if doi_status == "mismatch":
                     comment = (
-                        "DOI resolves in databse to a different work "
+                        "DOI resolves in database to a different work "
                         "(mismatched title/authors) — possible fake DOI. "
                         "Corrected version withheld."
                     )
                 elif doi_status == "not_found":
                     comment = (
-                        "DOI not found in OpenAlex — could not verify."
+                        "DOI not found — could not verify."
                     )
                 elif display_status == "MATCH":
                     comment = "Reference is consistent with Chicago style."
