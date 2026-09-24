@@ -864,634 +864,160 @@ def extract_chicago_footnotes(uploaded_file):
 
 
 # ============================================================
-# BIBLIOGRAPHY EXTRACTION — PyMuPDF, reading order only
+# BIBLIOGRAPHY EXTRACTION (PyMuPDF) + LLM SLICING
+# ============================================================
+# We no longer classify references with regex. PyMuPDF grabs the raw
+# bibliography block, and the model slices it. This is what
+# DeepSeek/Claude/GPT do — they understand author names; regex
+# never can.
 # ============================================================
 
-def is_bibliography_heading(text):
-    normalized = re.sub(r"\s+", " ", text).strip().lower()
-    return normalized in {"bibliography", "references", "daftar pustaka"}
 
+def extract_bibliography_block(uploaded_file):
+    """
+    Return the raw text of the bibliography section as ONE string
+    in reading order, plus metadata for display.
 
-def extract_pdf_lines(page):
-    data = page.get_text("dict")
-    lines = []
-    for block in data.get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        for line in block.get("lines", []):
-            spans = line.get("spans", [])
-            if not spans:
-                continue
-            text = "".join(span.get("text", "") for span in spans)
-            text = re.sub(r"\s+", " ", text).strip()
-            if not text:
-                continue
-            x0, y0, x1, y1 = line["bbox"]
-            lines.append({
-                "text": text,
-                "x0": float(x0), "y0": float(y0),
-                "x1": float(x1), "y1": float(y1),
-            })
-    return lines
+    Strategy:
+      1. Walk pages until we find a line whose text is exactly
+         "bibliography" / "references" / "daftar pustaka"
+         (case-insensitive).
+      2. From that line onward (skipping the heading itself),
+         collect every text line in page order.
+      3. Join with single spaces so PDF line wraps are healed at
+         the token level.
 
-
-def line_is_header_footer(line, page_height):
-    text = re.sub(r"\s+", " ", line["text"]).strip()
-    y0, y1 = line["y0"], line["y1"]
-    in_header_zone = y0 < page_height * 0.12
-    in_footer_zone = y1 > page_height * 0.93
-    if re.fullmatch(r"\d{1,4}", text):
-        if in_header_zone or in_footer_zone:
-            return True
-    if in_header_zone:
-        if re.search(r"\bvol\.?\s*\d+", text, re.I):
-            return True
-        if re.search(r"\bvolume\s+\d+", text, re.I):
-            return True
-        if re.search(r"\bno\.?\s*\d+", text, re.I) and re.search(r"\b(19|20)\d{2}\b", text):
-            return True
-        if re.search(r"\s\d{2,4}\s*$", text):
-            return True
-        if "…" in text or "..." in text:
-            return True
-        if re.search(r"\b(journal|jurnal)\b", text, re.I) and re.search(r"\b(vol|volume|no|number)\b", text, re.I):
-            return True
-    if in_footer_zone:
-        if re.match(r"^(https?://|www\.)", text, re.I):
-            return True
-        if re.search(r"\b(issn|e-issn|p-issn)\b", text, re.I):
-            return True
-    return False
-
-
-def extract_bibliography_lines(uploaded_file):
+    No regex classification. No margin/column detection. Just the
+    raw text between the heading and the end of the document.
+    """
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    bibliography_found = False
+    headings = {"bibliography", "references", "daftar pustaka"}
     start_page = None
-    ordered_lines = []
-    first_page_number = None
+    lines = []
 
     for page_number, page in enumerate(doc, start=1):
         page_height = page.rect.height
-        all_lines = extract_pdf_lines(page)
+        page_text_dict = page.get_text("dict")
 
-        if not bibliography_found:
-            heading_line = None
-            for line in all_lines:
-                if is_bibliography_heading(line["text"]):
-                    heading_line = line
-                    break
-            if heading_line is None:
+        # Collect visual lines in reading order.
+        page_lines = []
+        for block in page_text_dict.get("blocks", []):
+            if block.get("type") != 0:
                 continue
-            bibliography_found = True
-            start_page = page_number
-            first_page_number = page_number
-            heading_y0 = heading_line["y0"]
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                text = "".join(span.get("text", "") for span in spans)
+                text = re.sub(r"\s+", " ", text).strip()
+                if not text:
+                    continue
+                x0, y0, x1, y1 = line["bbox"]
+                page_lines.append({
+                    "text": text,
+                    "y0": float(y0),
+                    "y1": float(y1),
+                })
 
-            for line in all_lines:
-                if line["y0"] <= heading_y0:
+        # If we haven't found the heading yet, look for it.
+        if start_page is None:
+            heading_y0 = None
+            for ln in page_lines:
+                if ln["text"].lower() in headings:
+                    heading_y0 = ln["y0"]
+                    break
+            if heading_y0 is None:
+                continue
+            start_page = page_number
+            # Collect only lines BELOW the heading on this page.
+            for ln in page_lines:
+                if ln["y0"] <= heading_y0:
                     continue
-                if is_bibliography_heading(line["text"]):
+                if ln["y1"] > page_height * 0.94:
                     continue
-                if line_is_header_footer(line, page_height):
-                    continue
-                if line["y1"] > page_height * 0.94:
-                    continue
-                # Skip obvious body-text fragments on the heading page.
-                stripped = line["text"].lstrip()
-                if re.match(r"^\d+\s*\(", stripped):
-                    continue
-                line["page"] = page_number
-                ordered_lines.append(line)
+                lines.append(ln["text"])
             continue
 
-        # Subsequent pages: collect everything that isn't a header/footer.
-        for line in all_lines:
-            if is_bibliography_heading(line["text"]):
+        # Subsequent pages: collect everything except headers/footers.
+        for ln in page_lines:
+            if ln["y1"] > page_height * 0.94:
                 continue
-            if line_is_header_footer(line, page_height):
-                continue
-            if line["y1"] > page_height * 0.94:
-                continue
-            line["page"] = page_number
-            ordered_lines.append(line)
+            lines.append(ln["text"])
 
     doc.close()
     uploaded_file.seek(0)
 
+    block = " ".join(lines)
+    block = re.sub(r"\s+", " ", block).strip()
+
     return {
-        "found": bibliography_found,
+        "found": start_page is not None,
         "start_page": start_page,
-        "start_column": None,
-        "lines": ordered_lines,
+        "block": block,
+        "line_count": len(lines),
     }
 
 
-# ============================================================
-# PDF-WRAP REPAIR
-# ============================================================
-# The wrap-repair helpers are used by the text-first splitter to heal
-# mid-token breaks in DOIs, URLs, and hyphenated words. They are
-# applied per-segment, after boundary detection, so they never bridge
-# two references.
-# ============================================================
+class _BibliographySliceResult(BaseModel):
+    references: list[str]
 
 
-def _repair_single_segment(text: str) -> str:
+def slice_bibliography_with_llm(block: str, client) -> list[str]:
     """
-    Repair wrap artifacts inside a segment that contains no internal
-    `. Capital` boundary.
+    Ask the model to slice the bibliography block into individual
+    references. Preserve the text exactly; only insert boundaries.
     """
-    value = clean_text(text or "")
-    if not value:
-        return ""
-
-    # 1. Numeric DOI wrap:
-    #    "10.18196/jmh.v30i2.186 28" -> "10.18196/jmh.v30i2.18628"
-    numeric_doi_wrap = re.compile(
-        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]*\d)\s+(\d{1,6})(?=(?:[.,;)]|\s|$))",
-        re.I,
-    )
-    previous = None
-    while value != previous:
-        previous = value
-        value = numeric_doi_wrap.sub(r"\1\2", value)
-
-    # 2. DOI broken at a period-space boundary inside the path:
-    #    "10.37394/232015.2022. 18.19" -> "10.37394/232015.2022.18.19"
-    value = re.sub(
-        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.)\s+(\d+(?:\.\d+)*)(?=[\s.,;)]|$)",
-        r"\1\2", value, flags=re.I,
-    )
-
-    # 2b. DOI broken by a space mid-path (not preceded by a period):
-    #     "10.25041/corruptio.v6i2 .4450" -> "10.25041/corruptio.v6i2.4450"
-    value = re.sub(
-        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\s+(\.\d[\d.]*)",
-        r"\1\2", value, flags=re.I,
-    )
-
-    # 3. URL wrap at a slash or hyphen — never for DOIs.
-    #    Continuation must begin with a lowercase letter or a digit.
-    value = re.sub(
-        r"((?:https?://|www\.)(?![^\s]*doi\.org/)[^\s]*[/-])\s+"
-        r"([a-z0-9][A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)",
-        r"\1\2",
-        value,
-    )
-
-    # 3b. URL wrap where the continuation starts with a capital letter
-    #     but the preceding token is a slash-only path fragment.
-    #     Only fires when the URL is already inside a path (contains a
-    #     slash after the host). This handles cases like
-    #     "https://en.mkri.id/news/details/2026-03- 04/Active_..."
-    value = re.sub(
-        r"((?:https?://|www\.)[^\s]*?/)\s+([A-Z0-9][A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)",
-        r"\1\2",
-        value,
-    )
-
-    # 4. Hyphenated word split across a line break, but only when the
-    #    left token is a real word (has a vowel) so we don't glue
-    #    "Pasca- 2024" (which should stay as one token) incorrectly.
-    value = re.sub(r"(\w+)-\s+([a-z]\w*)", r"\1-\2", value)
-
-    # 5. Duplicated DOI prefixes.
-    value = re.sub(
-        r"https?://(?:dx\.)?doi\.org/\s*https?://(?:dx\.)?doi\.org/",
-        "https://doi.org/",
-        value, flags=re.I,
-    )
-
-    return clean_text(value)
-
-
-def _repair_bibliography_pdf_breaks(text: str) -> str:
-    """
-    Repair wrap artifacts inside a single reference.
-
-    Never joins across a sentence boundary. Splits at `. Capital`
-    boundaries first, repairs each segment, then rejoins.
-    """
-    value = clean_text(text or "")
-    if not value:
-        return ""
-
-    boundary_re = re.compile(r"(?<=[.?!])\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])")
-    parts = boundary_re.split(value)
-    repaired = [_repair_single_segment(p) for p in parts]
-    return clean_text(" ".join(p for p in repaired if p))
-
-
-# ============================================================
-# DEEPSEEK-STYLE REFERENCE SEGMENTATION
-# ============================================================
-# Text-first. The bibliography is read as one continuous stream and
-# split on `. Capital` boundaries where:
-#   * the LEFT fragment ends a reference
-#   * the RIGHT fragment begins a new reference
-# Geometry (x0, column) is not used.
-# ============================================================
-
-
-# ------------------------------------------------------------
-# Continuation starters: words that should NEVER begin a new
-# reference. If the right fragment starts with one of these, it
-# is a continuation of the previous reference, not a new one.
-# ------------------------------------------------------------
-_CONTINUATION_STARTERS = re.compile(
-    r"^(?:"
-    # --- Indonesian function words & common title words ---
-    r"dan|atau|dengan|dari|di|ke|pada|untuk|dalam|oleh|yang|ini|itu|"
-    r"sebagai|adalah|merupakan|tentang|terhadap|melalui|secara|"
-    r"juga|serta|namun|tetapi|karena|sehingga|agar|jika|bila|"
-    r"metode|metodologi|penelitian|pendekatan|analisis|kajian|studi|"
-    r"hasil|pembahasan|kesimpulan|pendahuluan|latar|tinjauan|"
-    r"vol|volume|no|nomor|hlm|halaman|pp|page|edisi|edition|"
-    r"accessed|diakses|retrieved|available|tersedia|"
-    # --- English function words ---
-    r"and|or|with|from|in|on|at|to|for|of|by|the|a|an|this|that|"
-    r"these|those|as|is|are|was|were|be|been|being|"
-    # --- Journal / publisher name fragments ---
-    r"journal|jurnal|review|international|proceedings|"
-    r"transactions|bulletin|studies|research|"
-    r"university|universitas|press|penerbit|publishing|"
-    r"springer|routledge|palgrave|wiley|sage|taylor|francis|"
-    r"oxford|cambridge|harvard|yale|mit|"
-    # --- Locators / protocols ---
-    r"http|https|www|doi"
-    r")\b",
-    re.I,
-)
-
-
-def _fragment_is_reference_start(fragment):
-    """
-    Text predicate: does `fragment` begin a new reference?
-
-    A new reference almost always begins with an author's surname,
-    which is:
-      * a capitalized token (or inverted "Surname, Initial")
-      * NOT a function word / title word / publisher word
-      * followed by a comma, a period, or another capitalized token
-
-    The check is intentionally asymmetric: we trust a strong
-    author-name signal on the RIGHT much more than terminal
-    punctuation on the LEFT, because PDF extraction frequently
-    drops the final period at a column break.
-    """
-    s = (fragment or "").lstrip()
-    if not s:
-        return False
-
-    # --- Reject obvious continuations FIRST. ---
-    # If the fragment begins with a function word / title word /
-    # publisher word, it cannot be the start of a new reference.
-    first_word_match = re.match(r"^([A-Za-z\u00c0-\u00ff'\u2019\-]+)", s)
-    if first_word_match:
-        first_word = first_word_match.group(1)
-        if _CONTINUATION_STARTERS.match(first_word):
-            return False
-
-    # --- Inverted personal name: "Surname, Initial." ---
-    if re.match(
-        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s+[A-Z]",
-        s,
-    ):
-        return True
-
-    # --- Non-inverted single-name author: "Syafliansah. Metode ..." ---
-    # Require the name to be followed by a period AND a capitalized
-    # word that is NOT a continuation starter.
-    m = re.match(
-        r"^([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,})\.\s+"
-        r"([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]*)",
-        s,
-    )
-    if m:
-        surname = m.group(1)
-        next_word = m.group(2)
-        # The word after the surname must NOT be a function word.
-        # e.g. "Syafliansah. Metode ..." -> "Metode" is a continuation
-        #      starter, so this is NOT a new reference.
-        if not _CONTINUATION_STARTERS.match(next_word):
-            return True
-
-    # --- Numbered entries ---
-    if re.match(r"^\d{1,3}\.\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd]", s):
-        return True
-
-    # --- Quoted titles ---
-    if s[:1] in ('"', "\u201c"):
-        return True
-
-    # --- Corporate author. ---
-    # Still useful, but require the head to look like an organization
-    # and be at least three tokens long, and reject journal-name wraps.
-    m = re.match(
-        r"^([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6})\.\s+"
-        r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
-        s,
-    )
-    if m:
-        head = m.group(1)
-        first_two = " ".join(head.split()[:2])
-        if re.match(
-            r"^(?:WSEAS|Journal|Jurnal|Review|International|Proceedings|"
-            r"Transactions|Bulletin|Studies|Research|The|In|On|For|"
-            r"Metode|Metodologi|Penelitian|Pendekatan)\b",
-            first_two,
-            re.I,
-        ):
-            return False
-        # Require at least 3 tokens for a corporate author to be
-        # considered a valid reference start.
-        if len(head.split()) >= 3:
-            return True
-
-    return False
-
-
-def _fragment_ends_reference(fragment):
-    """
-    Text predicate: does `fragment` look like the end of a reference?
-
-    Loosened compared to a strict terminal-punctuation check: a
-    reference can end with a page number, a bare year, a closing
-    bracket, a DOI/URL, or simply be long enough that the next
-    capitalized token is almost certainly a new author.
-
-    The real discriminator is the RIGHT fragment. Missing terminal
-    punctuation on the LEFT is weak evidence against a boundary.
-    """
-    s = (fragment or "").rstrip()
-    if not s:
-        return False
-
-    # --- Terminal punctuation ---
-    if s[-1:] in ".?!)]\u201d":
-        return True
-
-    # --- URL or DOI at end ---
-    if re.search(r"(?:https?://\S+|10\.\d{4,9}/\S+)$", s, re.I):
-        return True
-
-    # --- Page range at end: "123-145" or "123–145" ---
-    if re.search(r"\b\d+\s*[-\u2013\u2014]\s*\d+[.,;)]?$", s):
-        return True
-
-    # --- Bare year at end: "... 2023" ---
-    if re.search(r"\b(?:18|19|20)\d{2}[a-z]?$", s, re.I):
-        return True
-
-    # --- Ends with a digit (page number, volume, issue) ---
-    if re.search(r"\d$", s):
-        return True
-
-    # --- Long enough that a new capitalized token is almost
-    #     certainly a new reference, not a title continuation. ---
-    if len(s) >= 60:
-        return True
-
-    return False
-
-
-def _flow_lines_into_stream(lines):
-    """
-    Convert the bibliography lines into one continuous text stream,
-    preserving page boundaries as sentinel tokens.
-    """
-    if not lines:
-        return ""
-
-    parts = []
-    last_page = None
-
-    for line in lines:
-        text = clean_text(line.get("text", ""))
-        if not text:
-            continue
-
-        page = line.get("page")
-        if page is not None and page != last_page:
-            parts.append(f"<<<PAGE:{page}>>>")
-            last_page = page
-
-        parts.append(text)
-
-    return " ".join(parts)
-
-
-def _split_stream_on_text_boundaries(stream):
-    """
-    Split the bibliography stream on every candidate boundary where
-    the right fragment begins with an author-name signal.
-    """
-    if not stream:
+    if not block or not client:
         return []
 
-    # Candidate boundary patterns. Each alternative ends with a
-    # captured position `match.end()` that is the start of the
-    # right fragment (after the whitespace run).
-    #
-    # We use capturing alternations rather than look-behind because
-    # Python's `re` module does not support variable-width look-behind
-    # (needed for `\S{2,}`).
-    candidates = []
+    prompt = (
+        "You are given the raw text of a bibliography from a "
+        "Chicago-style academic manuscript. It was extracted from "
+        "a PDF, so line wraps have been replaced with single spaces "
+        "and mid-word URL breaks may exist.\n\n"
+        "Slice this text into individual bibliography references.\n\n"
+        "Rules:\n"
+        "1. Each reference begins with an author's surname, a corporate "
+        "author, or a numbered marker (e.g. '1.').\n"
+        "2. Return the references in the SAME order as they appear.\n"
+        "3. Do NOT modify, fix, reorder, or normalize the text inside "
+        "any reference. Preserve it character-for-character.\n"
+        "4. Do NOT add, remove, or merge references.\n"
+        "5. Author surnames can be glued to the previous reference "
+        "when the PDF dropped a line break. Split them correctly. "
+        "Examples of correct splits:\n"
+        "   '...mrj.v4i4.865. Kartika, Mimi. ...' -> two references\n"
+        "   '...jpp.v14i2.720. Sulaeman, Eman Achmad, ...' -> two\n"
+        "   '...jcasc.v10i3.2661. Syafliansah. Metode ...' -> two\n"
+        "   '...jq.v4i4.9630. Warsyim, Yusuf. ...' -> two\n"
+        "6. Place names and publisher names (e.g. 'Jakarta: Pustaka "
+        "Masyarakat Setara') are part of the previous reference — "
+        "do NOT split there.\n"
+        "7. Book titles that follow an author's name with a period "
+        "(e.g. 'Syafliansah. Metode Penelitian Hukum.') are part of "
+        "that reference — do NOT split after the author's name.\n"
+        "8. Do not invent DOIs, URLs, or any other content.\n\n"
+        "Return JSON: {\"references\": [\"...\", \"...\", ...]}.\n\n"
+        "BIBLIOGRAPHY TEXT:\n"
+        f"{block}"
+    )
 
-    # 1. After `.?!` + whitespace, before a capital.
-    for m in re.finditer(
-        r"[.?!]\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
-        stream,
-    ):
-        candidates.append(m.end())
-
-    # 2. After a URL (http/https/www + non-space chars) + whitespace,
-    #    before a capital.
-    for m in re.finditer(
-        r"(?:https?://|www\.)\S+\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
-        stream,
-    ):
-        candidates.append(m.end())
-
-    # 3. After a DOI (10.NNNN/...) + whitespace, before a capital.
-    for m in re.finditer(
-        r"10\.\d{4,9}/\S+\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
-        stream,
-    ):
-        candidates.append(m.end())
-
-    # 4. After a page range/number + whitespace, before a capital.
-    for m in re.finditer(
-        r"\d[-\u2013\u2014]\d{1,5}\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])",
-        stream,
-    ):
-        candidates.append(m.end())
-
-    candidates = sorted(set(candidates))
-
-    boundaries = [0]
-    for pos in candidates:
-        left = stream[boundaries[-1]:pos].strip()
-        right = stream[pos:].strip()
-
-        # Never split inside a URL or DOI.
-        if re.search(r"(?:https?://\S*|10\.\d{4,9}/\S*)$", left):
-            continue
-
-        # --- STRONG RIGHT SIGNAL ---
-        strong_right = False
-        m = re.match(
-            r"^([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+)"
-            r"([.,])\s+",
-            right,
+    try:
+        response = client.responses.parse(
+            model="gpt-4o-mini",
+            input=prompt,
+            text_format=_BibliographySliceResult,
         )
-        if m:
-            candidate = m.group(1)
-            if not _CONTINUATION_STARTERS.match(candidate):
-                strong_right = True
-
-        # --- RESCUE: `<Capital>. <Capital> ... <year>` ---
-        if not strong_right:
-            if re.match(
-                r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]{2,}\.\s+"
-                r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
-                right,
-            ) and re.search(r"\b(?:18|19|20)\d{2}\b", right):
-                strong_right = True
-
-        if strong_right:
-            boundaries.append(pos)
-            continue
-
-        # --- WEAK RIGHT SIGNAL ---
-        if not _fragment_is_reference_start(right):
-            continue
-        if not _fragment_ends_reference(left):
-            continue
-
-        boundaries.append(pos)
-
-    boundaries.append(len(stream))
-
-    pieces = []
-    for i in range(len(boundaries) - 1):
-        chunk = stream[boundaries[i]:boundaries[i + 1]].strip()
-        chunk = re.sub(r"<<<PAGE:\d+>>>", "", chunk).strip()
-        if chunk:
-            pieces.append(chunk)
-
-    return pieces
-
-
-# ------------------------------------------------------------
-# Merge helpers
-# ------------------------------------------------------------
-
-_INVERTED_HEAD_RE = re.compile(
-    r"^([A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+),\s+"
-    r"([A-Z\u00c0-\u00d6\u00d8-\u00dd](?:\.[A-Z\u00c0-\u00d6\u00d8-\u00dd])*\.?)$"
-)
-
-
-def _is_inverted_name_head(fragment):
-    """
-    True when `fragment` is a bare inverted-name head with no title
-    content — e.g. "Hasibuan, M." or "Siregar, S. N.".
-    """
-    s = (fragment or "").strip()
-    if not s:
-        return False
-    if len(s) > 30:
-        return False
-    return bool(_INVERTED_HEAD_RE.match(s))
-
-
-def _looks_like_name_continuation(fragment):
-    """
-    True when `fragment` begins with a capitalized given name or a
-    capital word followed by a comma — the continuation of a split
-    inverted name.
-    """
-    s = (fragment or "").lstrip()
-    if not s:
-        return False
-    return bool(re.match(
-        r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+"
-        r"(?:\s+[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+)*"
-        r",\s+",
-        s,
-    ))
-
-
-def split_references_from_lines(lines):
-    """
-    Split bibliography into individual references.
-
-    Text-first segmentation with a two-pass merge:
-
-      1. Flow all visual lines into a single text stream.
-      2. Split on candidate boundaries where the right side begins
-         with an author-name signal.
-      3. Repair PDF-induced wraps inside each reference.
-      4. Forward-merge split inverted-name heads ("Hasibuan, M." +
-         "Fadly, and Iza ...").
-      5. Backward-merge remaining fragments that don't start a
-         reference.
-    """
-    if not lines:
+        parsed = response.output_parsed
+        if parsed is None or not parsed.references:
+            return []
+        return [clean_text(r) for r in parsed.references if clean_text(r)]
+    except Exception as exc:
+        st.error(f"Bibliography slicing failed: {exc}")
         return []
-
-    stream = _flow_lines_into_stream(lines)
-    if not stream:
-        return []
-
-    raw_pieces = _split_stream_on_text_boundaries(stream)
-    repaired = [_repair_bibliography_pdf_breaks(p) for p in raw_pieces]
-
-    # --- PASS 1: forward-merge split inverted-name heads ---
-    forward_merged = []
-    i = 0
-    while i < len(repaired):
-        ref = clean_text(repaired[i])
-        if not ref:
-            i += 1
-            continue
-
-        if (_is_inverted_name_head(ref)
-                and i + 1 < len(repaired)
-                and _looks_like_name_continuation(repaired[i + 1])):
-            nxt = clean_text(repaired[i + 1])
-            forward_merged.append(ref + " " + nxt)
-            i += 2
-            continue
-
-        forward_merged.append(ref)
-        i += 1
-
-    # --- PASS 2: backward-merge fragments that don't start a ref ---
-    merged = []
-    for ref in forward_merged:
-        ref = clean_text(ref)
-        if not ref:
-            continue
-
-        if (len(ref) < 25
-                and merged
-                and not _fragment_is_reference_start(ref)):
-            merged[-1] = merged[-1] + " " + ref
-            continue
-
-        if merged and not _fragment_is_reference_start(ref):
-            merged[-1] = merged[-1] + " " + ref
-            continue
-
-        merged.append(ref)
-
-    return merged
 
 
 # ============================================================
@@ -2387,12 +1913,17 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
     for n in footnotes:
         n["has_dan_warning"] = footnote_has_indonesian_author_conjunction(n["text"])
 
-    bibliography_result = extract_bibliography_lines(uploaded_file)
-    if bibliography_result.get("found"):
-        references = split_references_from_lines(bibliography_result["lines"])
-        references = [clean_text(r) for r in references if clean_text(r)]
-    else:
+    # --- Bibliography: PyMuPDF block, then LLM slice ---
+    bib_block_result = extract_bibliography_block(uploaded_file)
+    if not bib_block_result.get("found"):
         references = []
+    else:
+        references = slice_bibliography_with_llm(
+            bib_block_result["block"], client
+        )
+
+    batch["bibliography_raw_block"] = bib_block_result.get("block", "")
+    batch["references_raw_slice"] = list(references)
 
     match_rows = match_footnotes_to_bibliography(footnotes, references)
 
@@ -2632,20 +2163,18 @@ def render():
                 pdf_bytes = uf.read()
                 uf.seek(0)
 
-                bib_result = extract_bibliography_lines(uf)
+                bib_block = extract_bibliography_block(uf)
                 uf.seek(0)
 
-                if bib_result.get("found") and bib_result.get("lines"):
-                    reference_text = "\n".join(
-                        line["text"] for line in bib_result["lines"]
-                    )
+                if bib_block.get("found") and bib_block.get("block"):
+                    reference_text = bib_block["block"]
                 else:
                     reference_text = ""
 
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                 full_pages = [page.get_text("text") for page in doc]
-                if bib_result.get("found") and bib_result.get("start_page"):
-                    body_pages = full_pages[: bib_result["start_page"] - 1]
+                if bib_block.get("found") and bib_block.get("start_page"):
+                    body_pages = full_pages[: bib_block["start_page"] - 1]
                 else:
                     body_pages = full_pages
                 body_text = "\n".join(body_pages)
@@ -2654,7 +2183,7 @@ def render():
                 uf.seek(0)
 
                 ref_found = bool(
-                    bib_result.get("found") and len(bib_result.get("lines", [])) > 0
+                    bib_block.get("found") and bib_block.get("block")
                 )
             except Exception as exc:
                 st.error(f"{uf.name} extraction failed: {exc}")
@@ -2745,14 +2274,32 @@ def render():
         st.session_state.get("chicago_manuscript_year", current_year)
     )
 
-    with st.expander("View bibliography section", expanded=False):
+    # --- Raw bibliography block expander ---
+    raw_block = batch.get("bibliography_raw_block", "")
+    with st.expander(
+        f"Bibliography — raw block ({len(raw_block)} chars)",
+        expanded=False,
+    ):
         st.text_area(
-            "Bibliography slice",
-            batch["reference_text"],
+            "Raw block (PyMuPDF extraction)",
+            raw_block,
             height=300,
-            key=f"chicago_dbg_ref_{selected_key}",
+            key=f"chicago_dbg_rawblock_{selected_key}",
         )
 
+    # --- Sliced references expander ---
+    sliced = batch.get("references_raw_slice", [])
+    with st.expander(
+        f"Bibliography — sliced references ({len(sliced)} entries)",
+        expanded=False,
+    ):
+        if sliced:
+            for i, ref in enumerate(sliced, start=1):
+                st.markdown(f"**{i}.** {ref}")
+        else:
+            st.info("No references were sliced from the bibliography block.")
+
+    # --- Footnotes expander ---
     with st.expander("View extracted footnotes", expanded=False):
         st.text_area(
             "Footnotes",
