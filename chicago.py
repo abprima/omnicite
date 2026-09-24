@@ -26,6 +26,24 @@ from openalex_config import get_openalex_api_key
 
 
 # ============================================================
+# DEV MODE
+# ============================================================
+# When True:
+#   * OpenAI is NOT called.
+#   * OpenAlex is NOT called.
+#   * DOCX is NOT generated.
+#   * The UI shows only:
+#       - the extracted footnotes (Markdown)
+#       - the segmented references (Markdown)
+#       - a per-reference char-count debug list
+#
+# Use this while tuning the extractor. Set to False for production.
+# ============================================================
+
+DEV_MODE = True
+
+
+# ============================================================
 # OPENAI CLIENT
 # ============================================================
 
@@ -183,6 +201,8 @@ def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
         "author_overlap": None, "suspicious": False, "reasons": [],
         "crossref_title": None, "crossref_authors": [],
     }
+    if DEV_MODE:
+        return result
     if not parsed_doi:
         return result
     meta = _fetch_openalex_metadata(parsed_doi)
@@ -943,16 +963,7 @@ def get_line_column(line, page_width):
     return "LEFT" if center < midpoint else "RIGHT"
 
 
-# ------------------------------------------------------------
-# FIX: page-level single-column detection
-# ------------------------------------------------------------
-
 def detect_single_column_page(all_lines):
-    """
-    Return True if the page looks single-column:
-    at least 75% of the non-empty lines start within 30 pt of the
-    leftmost x0 on the page.
-    """
     xs = [l["x0"] for l in all_lines if l.get("text", "").strip()]
     if not xs:
         return True
@@ -1001,7 +1012,6 @@ def extract_bibliography_lines(uploaded_file):
                 continue
             lines.append(line)
 
-        # FIX: collapse LEFT/RIGHT to LEFT for single-column pages.
         single_column_page = detect_single_column_page(all_lines)
 
         left, right = [], []
@@ -1138,10 +1148,6 @@ def _starts_new_reference_at(lines, index):
     return _looks_like_reference_start(joined)
 
 
-# ------------------------------------------------------------
-# PDF-wrap repair
-# ------------------------------------------------------------
-
 def _repair_single_segment(text: str) -> str:
     value = clean_text(text or "")
     if not value:
@@ -1267,22 +1273,16 @@ def _column_start_margins(lines, cluster_tolerance=5.0):
 
 
 # ------------------------------------------------------------
-# Top-level splitter
+# Top-level splitter — FIXED
+# ------------------------------------------------------------
+# The critical change: `_split_glued_line` now runs as a
+# PRE-PASS in geometry mode, before the margin-based segmentation.
+# PyMuPDF occasionally returns two logical references on the same
+# visual line (two-column wrap). Splitting them before geometry
+# analysis lets the geometry loop see each reference's own start.
 # ------------------------------------------------------------
 
 def split_references_from_lines(lines):
-    """
-    Split bibliography into entries.
-
-    Geometry mode: hanging-indent reset is the primary boundary
-    signal. Textual author detection confirms the boundary. `prev_ends`
-    is intentionally NOT required here — many real bibliographies end
-    an entry with a URL or DOI fragment that does not terminate with
-    sentence punctuation.
-
-    Heuristic mode: reference-start signatures drive segmentation,
-    with a `prev_ends` safety check.
-    """
     if not lines:
         return []
 
@@ -1350,8 +1350,16 @@ def split_references_from_lines(lines):
         return [clean_text(r) for r in refs if clean_text(r)]
 
     # ================================================================
-    # GEOMETRY MODE
+    # GEOMETRY MODE — FIX: pre-split glued lines BEFORE geometry.
     # ================================================================
+    expanded = []
+    for record in normalised:
+        for piece in _split_glued_line(record["text"]):
+            new = dict(record)
+            new["text"] = piece
+            expanded.append(new)
+    normalised = expanded
+
     margins = _column_start_margins(normalised)
     single_column_page = bool(margins.get("_unified"))
     margin_tolerance = 7.0
@@ -1757,7 +1765,6 @@ def create_complete_chicago_report(
     composition_rows = composition_rows or []
     manuscript_year = manuscript_year or datetime.now().year
 
-    # ---- Header -------------------------------------------------------
     title = doc.add_heading(level=0)
     tr = title.add_run(pdf_filename or "manuscript.pdf")
     _set_run_font(tr, size_pt=18, bold=True)
@@ -1779,7 +1786,6 @@ def create_complete_chicago_report(
 
     doc.add_paragraph()
 
-    # ---- Compute summary values ---------------------------------------
     total_refs = int(recency_stats.get("total", len(bibliography_detail)))
     total_footnotes = len(checked_notes)
 
@@ -1800,7 +1806,6 @@ def create_complete_chicago_report(
     recent_pct = recency_stats.get("recent_pct_all", 0.0)
     cutoff = recency_stats.get("cutoff", manuscript_year - 9)
 
-    # ---- Section 1 — Summary ------------------------------------------
     h1 = doc.add_heading(level=1)
     hr = h1.add_run("1. Summary")
     _set_run_font(hr, size_pt=14, bold=True)
@@ -1840,7 +1845,6 @@ def create_complete_chicago_report(
             size_pt=10, bold=warn, color=RED if warn else None,
         )
 
-    # ---- 1.1 Source type distribution ---------------------------------
     h11 = doc.add_heading(level=2)
     hr11 = h11.add_run("1.1 Source Type Distribution")
     _set_run_font(hr11, size_pt=12, bold=True)
@@ -1875,7 +1879,6 @@ def create_complete_chicago_report(
 
     doc.add_page_break()
 
-    # ---- Section 2 — Footnotes ----------------------------------------
     h2 = doc.add_heading(level=1)
     hr2 = h2.add_run("2. Footnotes")
     _set_run_font(hr2, size_pt=14, bold=True)
@@ -1961,7 +1964,6 @@ def create_complete_chicago_report(
 
     doc.add_page_break()
 
-    # ---- Section 3 — Bibliography -------------------------------------
     h3 = doc.add_heading(level=1)
     hr3 = h3.add_run("3. Bibliography (Chicago Notes & Bibliography)")
     _set_run_font(hr3, size_pt=14, bold=True)
@@ -2199,6 +2201,23 @@ class CombinedChicagoResult(BaseModel):
 
 
 def check_all_chicago_with_gpt(footnotes, references, client):
+    if DEV_MODE or client is None:
+        return {
+            "footnotes": [
+                {"number": int(note["number"]), "status": "OK",
+                 "revised_footnote_markdown": "",
+                 "explanation": "DEV_MODE — no AI review."}
+                for note in footnotes
+            ],
+            "bibliography": [
+                {"number": i, "source_type": heuristic_source_type(ref),
+                 "year": extract_reference_year(ref), "status": "OK",
+                 "revised_bibliography_markdown": "",
+                 "explanation": "DEV_MODE — no AI review."}
+                for i, ref in enumerate(references, start=1)
+            ],
+        }
+
     footnote_payload = [
         {
             "number": int(note["number"]),
@@ -2292,7 +2311,7 @@ INPUT:
 
 
 # ============================================================
-# PIPELINE — one PDF (PyMuPDF extraction + GPT review)
+# PIPELINE — one PDF
 # ============================================================
 
 def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
@@ -2307,12 +2326,21 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
     bibliography_result = extract_bibliography_lines(uploaded_file)
     if bibliography_result.get("found"):
         references = split_references_from_lines(bibliography_result["lines"])
-        st.write(f"### DEBUG — {len(references)} references extracted")
-        for i, r in enumerate(references, 1):
-            st.caption(f"**{i}.** [{len(r)} chars] {r[:160]}")
         references = [clean_text(r) for r in references if clean_text(r)]
     else:
         references = []
+
+    # ============================================================
+    # DEV_MODE: store partial results and stop.
+    # ============================================================
+    if DEV_MODE:
+        batch.update({
+            "footnotes": footnotes,
+            "references": references,
+            "ai_done": True,
+            "dev_mode": True,
+        })
+        return
 
     match_rows = match_footnotes_to_bibliography(footnotes, references)
 
@@ -2461,23 +2489,33 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
 
 
 # ============================================================
-# RENDER — APA-style upload → year → button → selector flow
+# RENDER — upload → year → button → selector → DEV or PROD panel
 # ============================================================
 
 def render():
-    st.title("OmniCite Auditor — Chicago Style")
+    st.title("OmniCite Auditor — Chicago Style" +
+             (" (DEV MODE)" if DEV_MODE else ""))
 
     client = get_openai_client()
-    if client is None:
-        st.error(
-            "OPENAI_API_KEY was not found. "
-            "Add it to .streamlit/secrets.toml or your environment variables."
-        )
-        st.stop()
 
-    openalex_key = _get_openalex_api_key()
-    if not openalex_key:
-        st.warning("OA key was not found — DOI verification will be skipped.")
+    if DEV_MODE:
+        st.info(
+            "**DEV MODE is ON.** OpenAI, OpenAlex, and DOCX generation "
+            "are disabled. Only extraction + segmentation run. "
+            "Set `DEV_MODE = False` at the top of `chicago.py` to "
+            "re-enable the full pipeline."
+        )
+    else:
+        if client is None:
+            st.error(
+                "OPENAI_API_KEY was not found. "
+                "Add it to .streamlit/secrets.toml or your environment variables."
+            )
+            st.stop()
+
+        openalex_key = _get_openalex_api_key()
+        if not openalex_key:
+            st.warning("OA key was not found — DOI verification will be skipped.")
 
     if "chicago_uploader_version" not in st.session_state:
         st.session_state["chicago_uploader_version"] = 0
@@ -2665,6 +2703,91 @@ def render():
         st.session_state.get("chicago_manuscript_year", current_year)
     )
 
+    # ============================================================
+    # DEV_MODE PANEL — show only extraction + segmentation
+    # ============================================================
+    if batch.get("dev_mode") or DEV_MODE:
+        footnotes = batch.get("footnotes", [])
+        references = batch.get("references", [])
+
+        col1, col2 = st.columns(2)
+        col1.metric("Footnotes extracted", len(footnotes))
+        col2.metric("References extracted", len(references))
+
+        st.subheader("1. Footnotes — Markdown")
+        st.caption("One footnote per numbered item. Blank line between notes.")
+        if footnotes:
+            md = "\n\n".join(
+                f"{int(n['number'])}. {clean_text(n['text'])}"
+                + (
+                    f"  _(p. {', '.join(map(str, n.get('pages', [])))})_"
+                    if n.get("pages") else ""
+                )
+                for n in footnotes
+            )
+            st.code(md, language="markdown")
+        else:
+            st.info("No footnotes detected.")
+
+        st.subheader("2. References — Markdown")
+        st.caption(
+            "One reference per line. Blank line (double enter) between "
+            "references."
+        )
+        if references:
+            md = "\n\n".join(
+                f"**[{i}]**  {clean_text(r)}"
+                for i, r in enumerate(references, start=1)
+            )
+            st.code(md, language="markdown")
+
+            st.subheader("3. Per-reference char counts (debug)")
+            st.caption(
+                "Use this to spot glued references: entries with unusually "
+                "high char counts likely contain more than one reference."
+            )
+            for i, r in enumerate(references, start=1):
+                st.caption(f"**{i}.** [{len(r)} chars] {r[:200]}")
+        else:
+            st.info("No references detected.")
+
+        st.subheader("4. Bibliography slice (raw extraction)")
+        with st.expander("Show raw extracted lines", expanded=False):
+            st.text_area(
+                "Raw bibliography lines",
+                batch.get("reference_text", ""),
+                height=400,
+                key=f"chicago_dev_raw_{selected_key}",
+            )
+
+        if st.button(
+            "🔄 Start Fresh — Clear All Uploads & Results",
+            use_container_width=True,
+            key="dev_reset_btn",
+        ):
+            for k in list(st.session_state.keys()):
+                if k == "chicago_batches" or k.startswith("chicago_batches"):
+                    del st.session_state[k]
+                if k.startswith("chicago_dbg_"):
+                    del st.session_state[k]
+                if k.startswith("chicago_dev_"):
+                    del st.session_state[k]
+                if k == "chicago_selected_pdf_key":
+                    del st.session_state[k]
+
+            st.session_state["chicago_batches"] = {}
+            st.session_state["chicago_uploader_version"] = (
+                st.session_state.get("chicago_uploader_version", 0) + 1
+            )
+            st.session_state["chicago_manuscript_year"] = datetime.now().year
+
+            st.rerun()
+
+        return
+
+    # ============================================================
+    # PRODUCTION PANEL — full pipeline (unchanged)
+    # ============================================================
     with st.expander("View bibliography section", expanded=False):
         st.text_area(
             "Bibliography slice",
