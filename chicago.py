@@ -1379,6 +1379,7 @@ def split_references_from_lines(lines):
     and two-column bibliographies identically because segmentation is
     driven by the source text.
     """
+    st.write("### [BUILD] segmentation-v3-strong-right")
     st.write("### ================================================")
     st.write("### [DEBUG] split_references_from_lines — entry")
     st.write("### ================================================")
