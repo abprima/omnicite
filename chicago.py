@@ -866,14 +866,6 @@ def extract_chicago_footnotes(uploaded_file):
 # ============================================================
 # BIBLIOGRAPHY EXTRACTION — PyMuPDF, reading order only
 # ============================================================
-# Notes:
-#   The splitter is text-first (DeepSeek-style). It does NOT need
-#   column classification, margin detection, or hanging-indent
-#   clustering. All it needs is a flat list of visual lines in the
-#   natural reading order. PyMuPDF already returns blocks in the
-#   order the PDF authoring tool wrote them, so a simple
-#   page-by-page y-sorted flatten is sufficient.
-# ============================================================
 
 def is_bibliography_heading(text):
     normalized = re.sub(r"\s+", " ", text).strip().lower()
@@ -934,12 +926,12 @@ def line_is_header_footer(line, page_height):
 
 def extract_bibliography_lines(uploaded_file):
     """
-    Return every bibliography line in the natural reading order as a
-    flat list of dicts.
+    Return every bibliography line in reading order.
 
-    Because the splitter is text-first, we do NOT classify LEFT/RIGHT
-    columns and we do NOT compute margins. PyMuPDF's block order
-    already reflects reading order for well-formed PDFs.
+    Because the splitter is text-first (DeepSeek-style), we do not
+    classify LEFT/RIGHT columns and we do not compute margins.
+    PyMuPDF's block order already reflects reading order for
+    well-formed PDFs.
     """
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
@@ -986,19 +978,116 @@ def extract_bibliography_lines(uploaded_file):
 
 
 # ============================================================
+# PDF-WRAP REPAIR
+# ============================================================
+# The wrap-repair helpers are used by the text-first splitter to heal
+# mid-token breaks in DOIs, URLs, and hyphenated words. They are
+# applied per-segment, after boundary detection, so they never bridge
+# two references.
+# ============================================================
+
+
+def _repair_single_segment(text: str) -> str:
+    """
+    Repair wrap artifacts inside a segment that contains no internal
+    `. Capital` boundary.
+    """
+    value = clean_text(text or "")
+    if not value:
+        return ""
+
+    # 1. Numeric DOI wrap:
+    #    "10.18196/jmh.v30i2.186 28" -> "10.18196/jmh.v30i2.18628"
+    numeric_doi_wrap = re.compile(
+        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]*\d)\s+(\d{1,6})(?=(?:[.,;)]|\s|$))",
+        re.I,
+    )
+    previous = None
+    while value != previous:
+        previous = value
+        value = numeric_doi_wrap.sub(r"\1\2", value)
+
+    # 2. DOI broken at a period-space boundary inside the path:
+    #    "10.37394/232015.2022. 18.19" -> "10.37394/232015.2022.18.19"
+    value = re.sub(
+        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.)\s+(\d+(?:\.\d+)*)(?=[\s.,;)]|$)",
+        r"\1\2", value, flags=re.I,
+    )
+
+    # 2b. DOI broken by a space mid-path (not preceded by a period):
+    #     "10.25041/corruptio.v6i2 .4450" -> "10.25041/corruptio.v6i2.4450"
+    value = re.sub(
+        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\s+(\.\d[\d.]*)",
+        r"\1\2", value, flags=re.I,
+    )
+
+    # 3. URL wrap at a slash or hyphen — never for DOIs.
+    #    Continuation must begin with a lowercase letter or a digit.
+    value = re.sub(
+        r"((?:https?://|www\.)(?![^\s]*doi\.org/)[^\s]*[/-])\s+"
+        r"([a-z0-9][A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)",
+        r"\1\2",
+        value,
+    )
+
+    # 3b. URL wrap where the continuation starts with a capital letter
+    #     but the preceding token is a slash-only path fragment.
+    #     Only fires when the URL is already inside a path (contains a
+    #     slash after the host). This handles cases like
+    #     "https://en.mkri.id/news/details/2026-03- 04/Active_..."
+    value = re.sub(
+        r"((?:https?://|www\.)[^\s]*?/)\s+([A-Z0-9][A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)",
+        r"\1\2",
+        value,
+    )
+
+    # 4. Hyphenated word split across a line break, but only when the
+    #    left token is a real word (has a vowel) so we don't glue
+    #    "Pasca- 2024" (which should stay as one token) incorrectly.
+    value = re.sub(r"(\w+)-\s+([a-z]\w*)", r"\1-\2", value)
+
+    # 5. Duplicated DOI prefixes.
+    value = re.sub(
+        r"https?://(?:dx\.)?doi\.org/\s*https?://(?:dx\.)?doi\.org/",
+        "https://doi.org/",
+        value, flags=re.I,
+    )
+
+    return clean_text(value)
+
+
+def _repair_bibliography_pdf_breaks(text: str) -> str:
+    """
+    Repair wrap artifacts inside a single reference.
+
+    Never joins across a sentence boundary. Splits at `. Capital`
+    boundaries first, repairs each segment, then rejoins.
+    """
+    value = clean_text(text or "")
+    if not value:
+        return ""
+
+    boundary_re = re.compile(r"(?<=[.?!])\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])")
+    parts = boundary_re.split(value)
+    repaired = [_repair_single_segment(p) for p in parts]
+    return clean_text(" ".join(p for p in repaired if p))
+
+
+# ============================================================
 # DEEPSEEK-STYLE REFERENCE SEGMENTATION
 # ============================================================
-# Text-first. Boundaries are found by reading the bibliography as
-# one continuous stream and identifying ". Capital" positions where
-# the left side ends a reference and the right side begins a new one.
-# Geometry (x0, column) is NOT used.
+# Text-first. The bibliography is read as one continuous stream and
+# split on ". Capital" boundaries where:
+#   * the LEFT fragment ends a reference
+#   * the RIGHT fragment begins a new reference
+# Geometry (x0, column) is not used.
 # ============================================================
 
 
 def _flow_lines_into_stream(lines):
     """
-    Convert a list of PyMuPDF line dicts into one continuous text
-    stream, preserving page boundaries as a sentinel token.
+    Convert the bibliography lines into one continuous text stream,
+    preserving page boundaries as sentinel tokens.
     """
     if not lines:
         return ""
@@ -1023,13 +1112,13 @@ def _flow_lines_into_stream(lines):
 
 def _fragment_is_reference_start(fragment):
     """
-    Text-level predicate: does `fragment` begin a new reference?
+    Text predicate: does `fragment` begin a new reference?
     """
     s = (fragment or "").lstrip()
     if not s:
         return False
 
-    # Inverted personal name: "Surname, I."
+    # Inverted personal name: "Surname, Initial."
     if re.match(
         r"^[A-Z\u00c0-\u00d6\u00d8-\u00dd][A-Za-z\u00c0-\u00ff'\u2019\-]+,\s+[A-Z]",
         s,
@@ -1052,7 +1141,7 @@ def _fragment_is_reference_start(fragment):
     if s[:1] in ('"', "\u201c"):
         return True
 
-    # Corporate author (reject journal-name wraps)
+    # Corporate author (reject journal-name wraps).
     m = re.match(
         r"^([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,6})\.\s+"
         r"[A-Z\u00c0-\u00d6\u00d8-\u00dd]",
@@ -1075,8 +1164,7 @@ def _fragment_is_reference_start(fragment):
 
 def _fragment_ends_reference(fragment):
     """
-    Text-level predicate: does `fragment` look like the *end* of a
-    reference?
+    Text predicate: does `fragment` look like the end of a reference?
     """
     s = (fragment or "").rstrip()
     if not s:
@@ -1096,8 +1184,9 @@ def _fragment_ends_reference(fragment):
 
 def _split_stream_on_text_boundaries(stream):
     """
-    Split the bibliography stream on every ". Capital" boundary that
-    follows a plausible reference closure.
+    Split the bibliography stream on every `. Capital` boundary where
+    the left fragment ends a reference and the right fragment begins a
+    new one.
     """
     if not stream:
         return []
@@ -1114,8 +1203,10 @@ def _split_stream_on_text_boundaries(stream):
         left = stream[boundaries[-1]:pos].strip()
         right = stream[pos:].strip()
 
+        # Never split inside a URL.
         if re.search(r"https?://[^\s]*$", left):
             continue
+
         if not _fragment_is_reference_start(right):
             continue
         if not _fragment_ends_reference(left):
@@ -1136,59 +1227,6 @@ def _split_stream_on_text_boundaries(stream):
 
 
 # ============================================================
-# PDF-wrap repair (unchanged)
-# ============================================================
-
-
-def _repair_single_segment(text: str) -> str:
-    value = clean_text(text or "")
-    if not value:
-        return ""
-
-    numeric_doi_wrap = re.compile(
-        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]*\d)\s+(\d{1,6})(?=(?:[.,;)]|\s|$))",
-        re.I,
-    )
-    previous = None
-    while value != previous:
-        previous = value
-        value = numeric_doi_wrap.sub(r"\1\2", value)
-
-    value = re.sub(
-        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.)\s+(\d+(?:\.\d+)*)(?=[\s.,;)]|$)",
-        r"\1\2", value, flags=re.I,
-    )
-
-    value = re.sub(
-        r"((?:https?://|www\.)(?![^\s]*doi\.org/)[^\s]*[/-])\s+"
-        r"([a-z0-9][A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)",
-        r"\1\2",
-        value,
-    )
-
-    value = re.sub(r"(\w+)-\s+([a-z]\w*)", r"\1-\2", value)
-
-    value = re.sub(
-        r"https?://(?:dx\.)?doi\.org/\s*https?://(?:dx\.)?doi\.org/",
-        "https://doi.org/",
-        value, flags=re.I,
-    )
-
-    return clean_text(value)
-
-
-def _repair_bibliography_pdf_breaks(text: str) -> str:
-    value = clean_text(text or "")
-    if not value:
-        return ""
-
-    boundary_re = re.compile(r"(?<=[.?!])\s+(?=[A-Z\u00c0-\u00d6\u00d8-\u00dd])")
-    parts = boundary_re.split(value)
-    repaired = [_repair_single_segment(p) for p in parts]
-    return clean_text(" ".join(p for p in repaired if p))
-
-
-# ============================================================
 # Top-level splitter
 # ============================================================
 
@@ -1200,14 +1238,14 @@ def split_references_from_lines(lines):
     Text-first (DeepSeek-style) segmentation:
 
       1. Flow all visual lines into a single text stream.
-      2. Split on ". Capital" boundaries where the left side ends a
+      2. Split on `. Capital` boundaries where the left side ends a
          reference and the right side begins a new one.
       3. Repair PDF-induced wraps inside each reference.
       4. Merge pathological fragments.
 
-    Geometry (x0, column) is NOT used to create boundaries. This
-    handles single-column and two-column bibliographies identically,
-    because segmentation is driven by the source text.
+    Geometry is not used to create boundaries. This handles single-
+    and two-column bibliographies identically because segmentation is
+    driven by the source text.
     """
     if not lines:
         return []
