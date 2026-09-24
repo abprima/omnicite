@@ -1122,24 +1122,44 @@ def _starts_new_reference_at(lines, index):
 
 
 def _repair_bibliography_pdf_breaks(text: str) -> str:
-    """Repair conservative PDF wrapping artifacts after one entry is segmented."""
+    """Repair PDF wrapping artifacts *without swallowing the next reference*.
+
+    Important: never concatenate an arbitrary alphabetic token after a DOI.
+    A previous version could turn:
+        ...10.18196/jmh.v30i2.18628. Firmantoro, Kiki...
+    into:
+        ...10.18196/jmh.v30i2.18628.Firmantoro...
+    which hid the bibliography boundary.
+    """
     value = clean_text(text or "")
     if not value:
         return ""
 
-    # Remove spaces that PyMuPDF may insert inside DOI tokens at a visual wrap.
-    # Keep this conservative: only join when the left side is already inside a DOI.
-    doi_pat = re.compile(r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\s+([A-Za-z0-9][A-Za-z0-9._;()/:\-]*)", re.I)
+    # Repair only very high-confidence DOI numeric wraps, e.g.
+    #   10.18196/jmh.v30i2.186 28  ->  10.18196/jmh.v30i2.18628
+    # Do NOT join alphabetic words: they may be the next author's surname.
+    numeric_doi_wrap = re.compile(
+        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]*\d)\s+(\d{1,6})(?=(?:[.,;)]|\s|$))",
+        re.I,
+    )
     previous = None
     while value != previous:
         previous = value
-        value = doi_pat.sub(lambda m: m.group(1) + m.group(2), value)
+        value = numeric_doi_wrap.sub(r"\1\2", value)
 
-    # Common URL wraps: slash/hyphen followed by an artificial space.
+    # Repair whitespace immediately after DOI punctuation only when it is still
+    # clearly part of a numeric DOI suffix. Never consume a capitalised surname.
+    value = re.sub(
+        r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+[._/-])\s+(\d+)",
+        r"\1\2", value, flags=re.I,
+    )
+
+    # Common URL wraps. These are limited to an explicit slash or hyphen so a
+    # following author name cannot be absorbed into the URL.
     value = re.sub(r"(https?://\S+/)\s+(?=[A-Za-z0-9])", r"\1", value, flags=re.I)
     value = re.sub(r"(https?://\S+-)\s+(?=[A-Za-z0-9])", r"\1", value, flags=re.I)
 
-    # Canonicalise accidental duplicate DOI prefixes without changing the DOI itself.
+    # Canonicalise duplicate DOI prefixes only.
     value = re.sub(
         r"https?://(?:dx\.)?doi\.org/\s*https?://(?:dx\.)?doi\.org/",
         "https://doi.org/", value, flags=re.I,
@@ -1326,11 +1346,15 @@ def split_references_from_lines(lines):
     # author starts. This is intentionally after geometry segmentation.
     final_refs = []
     for ref in refs:
-        pieces = _split_glued_line(ref)
-        if len(pieces) > 1:
-            final_refs.extend(_repair_bibliography_pdf_breaks(p) for p in pieces if clean_text(p))
-        elif ref:
-            final_refs.append(ref)
+        repaired = _repair_bibliography_pdf_breaks(ref)
+        pieces = _split_glued_line(repaired)
+        for piece in pieces:
+            piece = clean_text(piece)
+            if not piece:
+                continue
+            # One more pass catches chains such as DOI. Author ... DOI. Author.
+            subpieces = _split_glued_line(piece)
+            final_refs.extend(clean_text(x) for x in subpieces if clean_text(x))
 
     return [clean_text(r) for r in final_refs if clean_text(r)]
 
