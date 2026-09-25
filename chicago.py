@@ -199,6 +199,7 @@ def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
         "reasons": [],
         "crossref_title": None,
         "crossref_authors": [],
+        "openalex_metadata": {},
     }
     if not parsed_doi:
         return result
@@ -219,6 +220,19 @@ def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
     result["checked"] = True
     result["crossref_title"] = meta.get("title")
     result["crossref_authors"] = meta.get("authors", [])
+
+    # Store the full metadata so downstream layers can display it
+    # (used for the "OpenAlex says:" line on mismatch entries).
+    result["openalex_metadata"] = {
+        "title":   meta.get("title", ""),
+        "authors": meta.get("authors", []),
+        "journal": meta.get("journal", ""),
+        "year":    meta.get("year"),
+        "volume":  meta.get("volume", ""),
+        "issue":   meta.get("issue", ""),
+        "pages":   meta.get("pages", ""),
+        "doi":     meta.get("doi", ""),
+    }
 
     mismatch_reasons = []
 
@@ -262,25 +276,55 @@ def verify_reference_against_openalex(reference, parsed_doi, parsed_authors):
 
 
 def extract_authors_from_chicago_reference(reference):
+    """
+    Extract the surnames of ALL authors from a Chicago-style
+    reference, not just the first.
+
+    Examples:
+      "Harman, Jennifer J., Mandy L. Matthewson, and Amy J. L. Baker. 'Title'..."
+        -> ["Harman", "Matthewson", "Baker"]
+      "Anggono, Bayu Dwi, and Rofi Wahanisa. 'Title'..."
+        -> ["Anggono", "Wahanisa"]
+      "Syafliansah. Metode Penelitian Hukum..."
+        -> ["Syafliansah"]
+      "Akbar, Satria Mandala. 'Integritas...'"
+        -> ["Akbar"]
+    """
     text = clean_text(reference)
-    text = re.sub(r"^\s*\d+[\.\)]?\s*", "", text)
-    m = re.match(r"^([A-ZÀ-ÖØ-Ý][^.,]+)", text)
-    if not m:
-        return []
-    block = m.group(1)
-    parts = re.split(r"\s+(?:and|dan|&)\s+", block, flags=re.I)
+    # Strip leading numbered marker
+    text = re.sub(r"^\s*\d{1,4}[.)]\s*", "", text)
+
+    # Cut at the first opening quote (title start). Everything before
+    # it is the author block.
+    cut_pos = len(text)
+    for m in re.finditer(r"[\u2018\u201c'\"]", text):
+        cut_pos = m.start()
+        break
+
+    author_region = text[:cut_pos]
+
+    # Replace "and" with a comma so we can split uniformly.
+    author_region = re.sub(r"\s+and\s+", ", ", author_region, flags=re.I)
+    # Replace "&" with comma.
+    author_region = author_region.replace("&", ",")
+
+    tokens = [t.strip() for t in author_region.split(",") if t.strip()]
+
     surnames = []
-    for p in parts:
-        p = p.strip()
-        if not p:
+    for i, token in enumerate(tokens):
+        words = token.split()
+        if not words:
             continue
-        if "," in p:
-            surnames.append(p.split(",")[0].strip())
-        else:
-            tokens = p.split()
-            if tokens:
-                surnames.append(tokens[-1])
-    return surnames
+        last = words[-1]
+        if len(last) <= 2 and last.endswith("."):
+            continue
+        if re.fullmatch(r"[A-Z]\.", last):
+            continue
+        if all(re.fullmatch(r"[A-Z]\.?", w) for w in words):
+            continue
+        surnames.append(last)
+
+    return [s.rstrip(".").strip() for s in surnames]
 
 
 def bibliography_has_truncated_author_list(text):
@@ -290,6 +334,95 @@ def bibliography_has_truncated_author_list(text):
         r"\bdkk\.?\b", r"\bdan\s+lain(?:nya)?\b", r"\bcs\.?\b",
     ]
     return any(re.search(p, text, flags=re.I) for p in patterns)
+
+
+# ============================================================
+# CHICAGO FORMATTER FROM METADATA
+# ============================================================
+# Best-effort Chicago-style reconstruction from an OpenAlex metadata
+# dict. Used for the "OpenAlex says:" line on DOI-mismatch entries so
+# the reviewer can see what OpenAlex believes the reference should be.
+# ============================================================
+
+def _format_chicago_from_metadata(metadata):
+    """
+    Build a Chicago Notes & Bibliography reference from an OpenAlex
+    metadata dict. Used only for the manual-review line on
+    DOI-mismatch entries.
+
+    Returns "" if there is not enough metadata to build a reference.
+    """
+    if not metadata:
+        return ""
+
+    authors = metadata.get("authors") or []
+    title = (metadata.get("title") or "").strip()
+    journal = (metadata.get("journal") or "").strip()
+    year = metadata.get("year")
+    volume = str(metadata.get("volume") or "").strip()
+    issue = str(metadata.get("issue") or "").strip()
+    pages = (metadata.get("pages") or "").strip()
+    doi = (metadata.get("doi") or "").strip()
+
+    if not authors and not title:
+        return ""
+
+    def _invert_first(full_name):
+        parts = full_name.strip().split()
+        if len(parts) < 2:
+            return full_name.strip()
+        surname = parts[-1]
+        given = " ".join(parts[:-1])
+        return f"{surname}, {given}"
+
+    def _natural(full_name):
+        return full_name.strip()
+
+    formatted_authors = []
+    if len(authors) == 1:
+        formatted_authors.append(_invert_first(authors[0]))
+    elif len(authors) > 1:
+        formatted_authors.append(_invert_first(authors[0]))
+        for a in authors[1:-1]:
+            formatted_authors.append(_natural(a))
+        formatted_authors.append(_natural(authors[-1]))
+
+    if len(formatted_authors) == 1:
+        author_str = formatted_authors[0]
+    elif len(formatted_authors) == 2:
+        author_str = f"{formatted_authors[0]}, and {formatted_authors[1]}"
+    else:
+        author_str = ", ".join(formatted_authors[:-1]) + ", and " + formatted_authors[-1]
+
+    parts = []
+    if author_str:
+        parts.append(author_str.rstrip(".") + ".")
+
+    if title:
+        if journal:
+            parts.append(f'"{title.rstrip(".")}."')
+        else:
+            parts.append(f"*{title.rstrip('.')}*.")
+
+    if journal:
+        container = f"*{journal}*"
+        if volume:
+            container += f" {volume}"
+            if issue:
+                container += f", no. {issue}"
+        if year:
+            container += f" ({year})"
+        if pages:
+            pages_norm = re.sub(r"\s*[-–—]\s*", "–", pages)
+            container += f": {pages_norm}"
+        parts.append(container + ".")
+    elif year:
+        parts.append(f"({year}).")
+
+    if doi:
+        parts.append(f"https://doi.org/{doi}.")
+
+    return clean_text(" ".join(parts))
 
 
 # ============================================================
@@ -897,12 +1030,7 @@ def extract_chicago_footnotes(uploaded_file):
 def _heal_doi_wraps_in_block(block: str) -> str:
     """
     Heal mid-token spaces inside DOIs at the block level, before
-    the LLM sees them. Handles the common PDF wrap patterns:
-
-      "10.32722/account.v10i 1.5574" -> "10.32722/account.v10i1.5574"
-      "10.37394/232015.2022. 18.19"  -> "10.37394/232015.2022.18.19"
-      "10.25041/corruptio.v6i2 .4450"-> "10.25041/corruptio.v6i2.4450"
-      "10.22225/juinhum.4.2. 7834"   -> "10.22225/juinhum.4.2.7834"
+    the LLM sees them. Handles the common PDF wrap patterns.
     """
     if not block:
         return ""
@@ -911,32 +1039,24 @@ def _heal_doi_wraps_in_block(block: str) -> str:
     while block != previous:
         previous = block
 
-        # Case A: letter/digit at end of DOI path, space, digit starts
-        # continuation (handles "v10i 1.5574").
         block = re.sub(
             r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+[A-Za-z0-9])\s+"
             r"(\d[\d.\-]*)",
             r"\1\2",
             block,
         )
-
-        # Case B: period-space inside path, continuation is numeric.
         block = re.sub(
             r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.)\s+"
             r"(\d[\d.\-]*)",
             r"\1\2",
             block,
         )
-
-        # Case C: period-space where continuation begins with ".digit".
         block = re.sub(
             r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\s+"
             r"(\.\d[\d.]*)",
             r"\1\2",
             block,
         )
-
-        # Case D: sub-numbered DOI path like "4.2. 7834".
         block = re.sub(
             r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\.\d+\.\d+\.)\s+"
             r"(\d[\d.\-]*)",
@@ -950,40 +1070,28 @@ def _heal_doi_wraps_in_block(block: str) -> str:
 def _is_running_banner_line(line_text: str, page_number=None) -> bool:
     """
     Detect page-level running headers / footers that are NOT part of
-    the bibliography content. Observed patterns in real manuscripts:
-
-      "278 Yurispruden, Vol. 9, No. 2, June 2026, (257-279)."
-      "Darwance, et.al, Seeking a Legally Certain Framework ... 277"
-      "(257-279)."
-      "278"
+    the bibliography content.
     """
     s = (line_text or "").strip()
     if not s:
         return True
 
-    # Pattern A: starts with a page number, followed by a journal name
-    # and "Vol." / "No." within the first 160 chars.
     if re.match(r"^\d{1,4}\s+\S", s) and re.search(
         r"\b(?:Vol\.?|Volume|No\.?|Number)\s*\d+", s[:160], re.I
     ):
         return True
 
-    # Pattern B: contains an ellipsis followed by a page number at end.
     if re.search(r"(?:\.\.\.|…)\s*\d{1,4}\s*$", s):
         return True
 
-    # Pattern C: starts with "Author, et.al," and contains a year in
-    # the first 160 chars, and ends with a short page number.
     if re.match(r"^[A-Z][A-Za-z'\-]+,\s*et\.?\s*al", s) and re.search(
         r"\b(?:19|20)\d{2}\b", s[:160]
     ) and re.search(r"\d{1,4}\s*$", s):
         return True
 
-    # Pattern D: journal-name citation with no author.
     if re.match(r"^[A-Z][A-Za-z]+\s*,\s*Vol\.?\s*\d+", s):
         return True
 
-    # Pattern E: bare page range or bare page number.
     if re.fullmatch(r"\(?\d{1,4}\s*[-\u2013\u2014]\s*\d{1,4}\)?\.?", s):
         return True
     if re.fullmatch(r"\d{1,4}", s):
@@ -995,12 +1103,8 @@ def _is_running_banner_line(line_text: str, page_number=None) -> bool:
 def extract_bibliography_block(uploaded_file):
     """
     Return the raw text of the bibliography section as ONE string.
-
-    We use page.get_text("text") instead of page.get_text("dict")
-    because the dict-mode extractor silently drops spans that use
-    certain fonts or encodings. Confirmed on the Demas PDF: dict
-    mode misses two entries (Firdaus and Firmantoro) that text mode
-    captures correctly.
+    Uses page.get_text("text") — the dict-mode extractor silently
+    drops spans that use certain fonts or encodings.
     """
     uploaded_file.seek(0)
     pdf_bytes = uploaded_file.read()
@@ -1064,7 +1168,6 @@ def _strip_leading_markers(references):
     """
     Strip a leading "N." or "N)" from each reference when what
     follows looks like an author surname (capitalized word + comma).
-    Preserves numbers that are genuine content.
     """
     if not references:
         return references
@@ -1090,9 +1193,6 @@ def _strip_leading_markers(references):
 def _deduplicate_references(references):
     """
     Collapse truly duplicate references — same DOI — keeping the longest.
-
-    Two references are considered the same source only if they share
-    an identical DOI. References without a DOI are never deduplicated.
     """
     if not references:
         return references
@@ -1432,6 +1532,7 @@ def build_bibliography_statistics(references, gpt_results, manuscript_year):
             "DOI Verification Reasons": " | ".join(verification["reasons"]),
             "Title Similarity": verification.get("title_similarity"),
             "Author Overlap": verification.get("author_overlap"),
+            "OpenAlex Metadata": verification.get("openalex_metadata", {}),
         })
 
     counts = Counter(row["Source Type"] for row in detail_rows)
@@ -1629,8 +1730,8 @@ def create_complete_chicago_report(
          str(footnotes_missing_from_bib), footnotes_missing_from_bib > 0),
         ("Bibliography entries not cited in footnotes",
          str(bib_missing_from_footnotes), bib_missing_from_footnotes > 0),
-        ("DOI resolved in OpenAlex", str(doi_checked), False),
-        ("DOI not found in OpenAlex", str(doi_not_found), False),
+        ("DOI resolved", str(doi_checked), False),
+        ("DOI not found", str(doi_not_found), False),
         ("DOI mismatch — possible fake DOI",
          f"{doi_mismatch} ({doi_suspicious_pct:.1f}%)", doi_mismatch > 0),
         (f"% references within last 10 years "
@@ -1822,8 +1923,10 @@ def create_complete_chicago_report(
                 _add_red_italic_run(head, "  [DUPLICATE DOI]")
             if truncated_authors:
                 _add_red_italic_run(head, "  [INCOMPLETE AUTHOR LIST]")
-            if withheld:
+            if doi_status == "mismatch":
                 _add_red_italic_run(head, "  [DOI MISMATCH — WITHHELD]")
+            elif doi_status == "not_found":
+                _add_red_italic_run(head, "  [DOI NOT FOUND — WITHHELD]")
 
             p_type = doc.add_paragraph()
             p_type.paragraph_format.left_indent = Inches(0.25)
@@ -1846,9 +1949,13 @@ def create_complete_chicago_report(
                 p_corr.paragraph_format.left_indent = Inches(0.25)
                 p_corr.paragraph_format.space_after = Pt(2)
                 _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
+                withheld_label = (
+                    "— withheld (DOI mismatch) —"
+                    if doi_status == "mismatch"
+                    else "— withheld (DOI not found) —"
+                )
                 _add_run(
-                    p_corr,
-                    "— withheld (DOI mismatch) —",
+                    p_corr, withheld_label,
                     size_pt=11, italic=True, red=True,
                 )
             else:
@@ -1858,6 +1965,29 @@ def create_complete_chicago_report(
                 p_corr.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
                 _add_run(p_corr, "Corrected: ", bold=True, size_pt=11)
                 add_markdown_to_paragraph(p_corr, corrected)
+
+            # --------------------------------------------------
+            # "OpenAlex says:" line — only for DOI mismatch entries.
+            # Shows what OpenAlex believes the reference should be so
+            # the reviewer can decide whether to accept the DOI's
+            # version manually. Red italic to signal "review me".
+            # --------------------------------------------------
+            if doi_status == "mismatch":
+                oa_meta = row.get("OpenAlex Metadata") or {}
+                oa_reference = _format_chicago_from_metadata(oa_meta)
+                if oa_reference:
+                    p_oa = doc.add_paragraph()
+                    p_oa.paragraph_format.left_indent = Inches(0.25)
+                    p_oa.paragraph_format.space_after = Pt(2)
+                    p_oa.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                    _add_run(
+                        p_oa, "OpenAlex says: ", bold=True, size_pt=11,
+                        red=True,
+                    )
+                    _add_run(
+                        p_oa, oa_reference,
+                        size_pt=11, italic=True, red=True,
+                    )
 
             p_comment = doc.add_paragraph()
             p_comment.paragraph_format.left_indent = Inches(0.25)
@@ -1874,7 +2004,8 @@ def create_complete_chicago_report(
                     )
                 elif doi_status == "not_found":
                     comment = (
-                        "DOI not found — could not verify."
+                        "DOI not found in database — corrected version "
+                        "withheld pending manual verification."
                     )
                 elif display_status == "MATCH":
                     comment = "Reference is consistent with Chicago style."
@@ -1903,7 +2034,7 @@ def create_complete_chicago_report(
                 p_reason.paragraph_format.left_indent = Inches(0.25)
                 p_reason.paragraph_format.space_after = Pt(2)
                 r = p_reason.add_run(
-                    "  DOI not found in database — could not verify."
+                    "  DOI not found — could not verify."
                 )
                 r.italic = True
                 r.font.size = Pt(10)
@@ -2108,15 +2239,7 @@ Rules for using `metadata`:
    Treat every field it contains as authoritative for THIS paper.
 
    a. If the reference disagrees with a metadata field, CORRECT the
-      reference so it matches the metadata. Examples:
-        - reference journal name "Yurispruden" vs metadata journal
-          "Yurispruden: Jurnal Hukum" -> use the metadata value.
-        - reference year "2023" vs metadata year "2024" -> use the
-          metadata value.
-        - reference vol "7" vs metadata vol "8" -> use the metadata
-          value.
-        - reference pages "270-300" vs metadata pages "272-296"
-          -> use the metadata value.
+      reference so it matches the metadata.
 
    b. If the metadata field is EMPTY or MISSING, do NOT change that
       part of the reference. Never invent a journal name, volume,
@@ -2127,12 +2250,7 @@ Rules for using `metadata`:
 
    d. Do NOT rewrite the entry from scratch. Reuse the reference's
       own wording and punctuation except where a metadata correction
-      is required. In particular:
-        - Keep the reference's quotation style around titles.
-        - Keep the reference's italics marking for container titles.
-        - Keep the reference's author separator style ("and" / "dan").
-        - Keep the reference's own choice of en-dash vs hyphen in
-          page ranges, EXCEPT where metadata supplies a new range.
+      is required.
 
    e. Author names:
         - If the metadata author list differs from the reference
@@ -2144,10 +2262,9 @@ Rules for using `metadata`:
 3. If metadata fields CONTRADICT what the reference says AND the
    metadata itself is internally consistent, always trust metadata.
 
-4. Never copy the metadata's raw formatting (e.g., ALL CAPS titles,
-   or straight quotes). Convert it to proper Chicago BIBLIOGRAPHY
-   style before using it. The metadata is a source of FACTS, not a
-   source of FORMAT.
+4. Never copy the metadata's raw formatting (ALL CAPS, straight
+   quotes). Convert it to proper Chicago BIBLIOGRAPHY style before
+   using it. The metadata is a source of FACTS, not a source of FORMAT.
 
 5. Never report the metadata object back to the caller. The response
    only contains the corrected reference text.
@@ -2281,7 +2398,7 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
         row["Truncated Authors"] = truncated_authors
 
         chicago_status = str(row.get("Chicago Status", "NOT CHECKED")).upper().strip()
-        display_status = (
+        llm_status = (
             "MATCH" if chicago_status == "OK"
             else "REVISED" if chicago_status == "REVISED"
             else "MANUAL CHECK" if chicago_status == "MANUAL_CHECK"
@@ -2289,7 +2406,19 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
         )
 
         doi_status = row.get("DOI Status", "not_checked")
-        withheld = (doi_status == "mismatch")
+
+        if doi_status in ("mismatch", "not_found"):
+            display_status = "MANUAL CHECK"
+            withheld = True
+        else:
+            display_status = llm_status
+            withheld = False
+
+        # Build the "OpenAlex says:" line for mismatch entries.
+        openalex_reference = ""
+        if doi_status == "mismatch":
+            oa_meta = row.get("OpenAlex Metadata") or {}
+            openalex_reference = _format_chicago_from_metadata(oa_meta)
 
         corrected_bibliography_rows.append({
             "No.": reference_no,
@@ -2297,15 +2426,18 @@ def process_single_chicago_pdf(uploaded_file, batch, client, manuscript_year):
             "Publication Year": row["Year"] if row.get("Year") is not None else "—",
             "Original Version": original_reference,
             "Corrected Version": (
-                "— WITHHELD (DOI mismatch) —" if withheld else row["GPT Revised"]
+                "— WITHHELD (DOI mismatch) —" if doi_status == "mismatch"
+                else "— WITHHELD (DOI not found) —" if doi_status == "not_found"
+                else row["GPT Revised"]
             ),
+            "OpenAlex Reference": openalex_reference,
             "Placeholders": ", ".join(
                 k for k, v in (row.get("Placeholders") or {}).items() if v
             ) or "—",
             "Status": display_status,
             "DOI Status": {
                 "not_checked": "— not checked",
-                "not_found":   "⚠ not found in OpenAlex",
+                "not_found":   "⚠ not found",
                 "verified":    "☑ verified",
                 "mismatch":    "⚠ mismatch — possible fake DOI",
             }.get(doi_status, "— not checked"),
@@ -2643,8 +2775,8 @@ def render():
          "Value": str(len(batch.get("missing_rows", [])))},
         {"Metric": "Bibliography Missing from Footnotes",
          "Value": str(total_refs - len(get_matched_bibliography_numbers(match_rows)))},
-        {"Metric": "DOI resolved in OpenAlex", "Value": str(doi_checked)},
-        {"Metric": "DOI not found in OpenAlex", "Value": str(doi_not_found)},
+        {"Metric": "DOI resolved", "Value": str(doi_checked)},
+        {"Metric": "DOI not found", "Value": str(doi_not_found)},
         {"Metric": "DOI mismatch — possible fake DOI",
          "Value": f"{doi_mismatch} ({doi_suspicious_pct:.1f}%)"},
     ])
