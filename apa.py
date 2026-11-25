@@ -80,6 +80,7 @@ REPEAT_THRESHOLD = 3
 MAX_BOILERPLATE_LEN = 120
 
 BOILERPLATE_PATTERNS = [
+    r"^\d+\s*\|\s*El-Aswaq.*$",
     r"^is licensed under a .*$",
     r"^creative commons.*$",
     r"^cc[- ]by.*$",
@@ -140,44 +141,28 @@ def strip_running_headers_footers(text: str) -> str:
 # APA reference-line heuristics (used for section-quality gating)
 # ------------------------------------------------------------
 
-_APA_YEAR_IN_LINE_RE = re.compile(r"\((?:19|20)\d{2}[a-z]?\)")
+_APA_YEAR_IN_LINE_RE = re.compile(
+    r"\(\s*(?:(?:18|19|20)\d{2}[a-z]?|n\.\s*d\.)\s*\)", re.I
+)
+_NON_APA_YEAR_RE = re.compile(
+    r"^(?:\[\d+\]\s*|\d+[.)]\s*)?"
+    r"[\wÀ-ÖØ-öø-ÿ—–.,'’&\-\s]{1,180}?"
+    r"\b((?:18|19|20)\d{2})[a-z]?\s*[.,:]", re.I
+)
 
 
 def _looks_like_apa_reference(line: str) -> bool:
-    """
-    Heuristic: does this line look like an APA reference entry?
-
-    Accepts lines that:
-      - Contain a parenthetical year, e.g. (2020) or (2019a), OR
-      - Are continuation lines (start with a DOI or URL), OR
-      - Start with an author-like token followed by a year.
-
-    Rejects lines that look like table captions, figure legends,
-    or section headings.
-    """
+    """Detect author-date reference starts, not APA compliance."""
     s = line.strip()
-    if not s or len(s) < 15:
+    if len(s) < 15:
         return False
-
-    # Reject table/figure captions
-    if re.match(r"^\s*(Table|Figure|Fig\.|Tab\.)\s+\d+", s, re.I):
+    if re.match(r"^(Table|Figure|Fig\.|Tab\.)\s+\d+", s, re.I):
         return False
-
-    # Reject standalone numbered section headings like "1.2 Methods"
-    if re.match(r"^\s*\d+(?:\.\d+)+\s+[A-Z][a-z]", s):
+    if re.match(r"^\d+(?:\.\d+)+\s+[A-Z][a-z]", s):
         return False
-
-    # Accept DOI-only or URL-only continuation lines
-    if re.match(r"^https?://", s):
-        return True
-    if re.match(r"^10\.\d{4,9}/", s):
-        return True
-
-    # Accept if there's a parenthetical year somewhere
-    if _APA_YEAR_IN_LINE_RE.search(s):
-        return True
-
-    return False
+    if re.match(r"^(?:https?://|10\.\d{4,9}/)", s, re.I):
+        return False
+    return bool(_APA_YEAR_IN_LINE_RE.search(s) or _NON_APA_YEAR_RE.search(s))
 
 
 def _reference_section_quality(text_block: str, cap: int = 300) -> int:
@@ -812,7 +797,8 @@ def parse_reference(reference):
 
 
 def extract_reference_year(reference):
-    m = re.search(r"\(((?:19|20)\d{2})(?:[a-z])?\)", reference, re.I)
+    m = re.search(r"\(\s*((?:18|19|20)\d{2})[a-z]?\s*\)", reference, re.I)
+    m = m or _NON_APA_YEAR_RE.search(reference)
     return int(m.group(1)) if m else None
 
 
@@ -930,9 +916,13 @@ def _surname_from_full_name(name):
 
 def _extract_apa_title(reference):
     ym = re.search(r"\((?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)\.\s*", reference)
+    ym = ym or _NON_APA_YEAR_RE.search(reference)
     if not ym:
         return ""
     tail = reference[ym.end():].strip()
+    quoted = re.match(r'[“"](.+?)[”"]', tail)
+    if quoted:
+        return quoted.group(1).rstrip(".").strip()
     m = re.match(r"^(.+?)\.\s", tail)
     return m.group(1).strip() if m else tail.split(".")[0].strip()
 
@@ -1102,10 +1092,13 @@ RULES:
 - Preserve each reference exactly as much as possible.
 - Do not correct APA formatting.
 - Do not invent references.
-- Do not merge or split references.
+- Do not merge distinct entries or split a single entry.
 - Reference may continue across multiple lines.
 - Two references may appear on the same line — split them.
-- Use author + year patterns to identify boundaries.
+- Use author + year patterns to identify boundaries, including APA (2022), Chicago 2022., and undated entries.
+- A repeated-author dash (———.) starts a new entry; preserve it exactly.
+- Ignore running headers, footers, page numbers and section headings.
+- Preserve original capitalization, punctuation and URL spelling.
 - DOI/URL belongs to the preceding reference.
 - Preserve wording as in the source.
 
@@ -2474,7 +2467,12 @@ def extract_pdf_text(uploaded_file):
     cleaned_text = strip_running_headers_footers(full_text)
 
     reference_text, ref_found, post_found = slice_reference_section(cleaned_text)
-    body_text, _ = slice_body_section(cleaned_text)
+    # Use the same accepted heading for both slices.
+    body_text = cleaned_text
+    if ref_found:
+        start = cleaned_text.rfind(reference_text)
+        if start >= 0:
+            body_text = cleaned_text[:start].strip()
 
     return (
         full_text,
@@ -2618,10 +2616,10 @@ def render():
             # ---- HARD STOP: no valid reference section detected ----
             if not ref_found:
                 st.error(
-                    f"{uf.name}: No valid 'References' section could be "
-                    f"identified. The heading may be missing, or the "
-                    f"section contains too few reference entries. "
-                    f"This manuscript cannot be audited."
+                    f"{uf.name}: The automated parser could not reliably identify "
+                    f"a reference section. Non-standard formatting, PDF extraction "
+                    f"issues, or too few detectable entries may be responsible. "
+                    f"Manual verification is recommended; automated audit skipped."
                 )
                 continue
 
